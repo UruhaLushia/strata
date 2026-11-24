@@ -1,0 +1,25 @@
+# Binaries and test artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+
+# Database files
+*.db
+*.db-*
+*.db.lock
+*.db.tmp
+*.db.invtmp
+*.db.invchk
+
+# OS and IDE files
+.DS_Store
+.idea/
+.vscode/
+
+# Dependencies
+vendor/
