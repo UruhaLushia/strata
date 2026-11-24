@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"math"
 	"time"
 )
 
@@ -105,6 +106,10 @@ type sealedBlock struct {
 type resetRule struct {
 	oldEpoch uint64
 	from, to int64
+}
+
+func (r resetRule) isAll() bool {
+	return r.from == math.MinInt64 && r.to == math.MaxInt64
 }
 
 type bucketKey struct {

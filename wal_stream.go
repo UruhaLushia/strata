@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"math"
 )
 
 const (
@@ -14,15 +15,20 @@ const (
 )
 
 type walFrameMeta struct {
-	offset int64
-	length uint32
-	typ    byte
-	hasTS  bool
-	_      [2]byte
-	seq    uint64
-	minTS  int64
-	maxTS  int64
-	kvRev  uint64
+	offset        int64
+	length        uint32
+	typ           byte
+	hasTS         bool
+	series        uint16
+	seq           uint64
+	minTS         int64
+	maxTS         int64
+	kvRev         uint64
+	resetOldEpoch uint64
+}
+
+func (m walFrameMeta) isResetAll() bool {
+	return m.typ == frameReset && m.hasTS && m.minTS == math.MinInt64 && m.maxTS == math.MaxInt64
 }
 
 type walBucketRef struct {
@@ -84,6 +90,8 @@ func scanWALFrameMetas(f *osFile, start, end int64) ([]walFrameMeta, error) {
 		case frameReset:
 			if x, err := decodeReset(payloadBuf); err == nil {
 				m.minTS, m.maxTS, m.hasTS = x.from, x.to, true
+				m.series = x.series
+				m.resetOldEpoch = x.oldEpoch
 			}
 		case frameKVBatch:
 			if rev, _, err := decodeKVBatch(payloadBuf); err == nil {

@@ -11,35 +11,44 @@ func (db *DB) autoCompact() {
 		return
 	}
 	metas, err := scanWALFrameMetas(db.data, int64(db.head.walOffset), db.walPos)
-	target := fineWatermark(db.opts.Now().Unix())
+	nowSec := db.opts.Now().Unix()
 	var size int64
 	resetReady := false
+	var resetAllMaxEpoch map[uint16]uint64
 	for _, s := range db.series {
 		for _, r := range s.rules {
-			if r.to <= target {
+			if !r.isAll() {
+				continue
+			}
+			if resetAllMaxEpoch == nil {
+				resetAllMaxEpoch = make(map[uint16]uint64)
+			}
+			if prev, ok := resetAllMaxEpoch[s.id]; !ok || r.oldEpoch > prev {
+				resetAllMaxEpoch[s.id] = r.oldEpoch
+			}
+		}
+	}
+	if len(resetAllMaxEpoch) > 0 {
+		for _, m := range db.sealed {
+			if maxEp, ok := resetAllMaxEpoch[m.series]; ok && m.epoch <= maxEp {
 				resetReady = true
 				break
 			}
 		}
 	}
 	if err == nil {
+		_, _, _, sealedSeq, _, _ := computeCompactWatermarks(metas, db.head, db.appendSeq, nowSec)
 		for _, m := range metas {
 			if m.seq <= db.head.sealedWalSeq {
 				continue
 			}
-			ok := false
-			switch m.typ {
-			case frameDelta:
-				ok = m.hasTS && m.maxTS < target
-			case frameReset:
-				ok = m.hasTS && m.maxTS <= target
-			case frameKVBatch:
-				ok = m.hasTS
-			}
-			if !ok {
+			if m.seq > sealedSeq {
 				break
 			}
 			size += frameHeader + int64(m.length)
+			if m.typ == frameReset {
+				resetReady = true
+			}
 		}
 	}
 	db.mu.RUnlock()

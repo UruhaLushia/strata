@@ -91,7 +91,7 @@ func processDayWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, daySta
 			if d.end == 0 {
 				continue
 			}
-			if dayStart >= plan.ret1dCutoff || ruleIntersects(s.rules, dayStart, dayStart+86400) {
+			if dayStart >= plan.ret1dCutoff || ruleIntersects(s.rules, dayStart, dayStart+86400, ep) {
 				if err := bw.writeFresh(d); err != nil {
 					return err
 				}
@@ -115,7 +115,7 @@ func processHourWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, hr in
 					return err
 				}
 			}
-			if m.res == resHour && dayEpochs[m.epoch] && !ruleIntersects(s.rules, m.start, m.end()) {
+			if m.res == resHour && dayEpochs[m.epoch] && !ruleIntersects(s.rules, m.start, m.end(), m.epoch) {
 				b, err := loadSealedBlockFromView(plan.sourceView, plan.oldHead.sections[secTSBlocks], m)
 				if err != nil {
 					return err
@@ -148,7 +148,7 @@ func processHourWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, hr in
 		}
 		if m.res == resHour {
 			hk := blockIDKey{s.id, hr, m.epoch}
-			if !rm.hour[hk] && !ruleIntersects(s.rules, m.start, m.end()) {
+			if !rm.hour[hk] && !ruleIntersects(s.rules, m.start, m.end(), m.epoch) {
 				if keepPassthroughMeta(plan, s, m) {
 					if err := bw.writePassthrough(idx, m); err != nil {
 						return err
@@ -259,7 +259,7 @@ func processHourWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, hr in
 		if rm.hour[hk] || (dayEpochs[b.epoch] && !passHourEpoch[b.epoch]) {
 			foldIntoCoarse(hourAcc, b, resHour, hr, 3600, s, preserve)
 		}
-		if !b.passthrough && (b.start >= plan.ret1mCutoff || ruleIntersects(s.rules, b.start, b.end)) {
+		if !b.passthrough && (b.start >= plan.ret1mCutoff || ruleIntersects(s.rules, b.start, b.end, b.epoch)) {
 			freshFine = append(freshFine, b)
 		}
 	}
@@ -277,7 +277,7 @@ func processHourWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, hr in
 			if h.end == 0 {
 				continue
 			}
-			if rm.hour[blockIDKey{s.id, hr, ep}] && (hr >= plan.ret1hCutoff || ruleIntersects(s.rules, hr, hr+3600)) {
+			if rm.hour[blockIDKey{s.id, hr, ep}] && (hr >= plan.ret1hCutoff || ruleIntersects(s.rules, hr, hr+3600, ep)) {
 				if err := bw.writeFresh(h); err != nil {
 					return err
 				}
@@ -310,11 +310,11 @@ func keepPassthroughMeta(plan *compactPlan, s *seriesSnap, m sealedMeta) bool {
 	switch m.res {
 	case resMinuteHR:
 		return !excludedByRuleSlice(s.rules, m.start, m.epoch) &&
-			(m.start >= plan.ret1mCutoff || ruleIntersects(s.rules, m.start, m.end()))
+			(m.start >= plan.ret1mCutoff || ruleIntersects(s.rules, m.start, m.end(), m.epoch))
 	case resHour:
-		return !ruleIntersects(s.rules, m.start, m.end()) && m.start >= plan.ret1hCutoff
+		return !ruleIntersects(s.rules, m.start, m.end(), m.epoch) && m.start >= plan.ret1hCutoff
 	case resDay:
-		return !ruleIntersects(s.rules, m.start, m.end()) && m.start >= plan.ret1dCutoff
+		return !ruleIntersects(s.rules, m.start, m.end(), m.epoch) && m.start >= plan.ret1dCutoff
 	default:
 		return false
 	}

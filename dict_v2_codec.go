@@ -58,15 +58,16 @@ func (s *dictDimCompactSnap) resolveLocal(id uint32) string {
 	return unsafe.String(&s.arena[lo], hi-lo)
 }
 
-func snapshotDictForCompact(db *DB, fineTarget int64) *dictCompactSnap {
+func snapshotDictForCompact(db *DB, fineTarget int64, unsealedResetMinEpoch map[uint16]uint64) *dictCompactSnap {
 	snap := &dictCompactSnap{
 		series: make([]dictSeriesSnap, 0, len(db.series)),
 		dims:   make([]dictDimCompactSnap, 0, len(db.dict.dims)),
 	}
 	for _, s := range db.series {
+		minUnsealed, hasUnsealed := unsealedResetMinEpoch[s.id]
 		var active []resetRule
 		for _, r := range s.rules {
-			if r.to > fineTarget {
+			if (hasUnsealed && r.oldEpoch >= minUnsealed) || (!r.isAll() && r.to > fineTarget) {
 				active = append(active, r)
 			}
 		}

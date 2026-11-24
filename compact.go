@@ -36,6 +36,18 @@ func (db *DB) Compact() error {
 		return err
 	}
 	fineTarget, hourTarget, dayTarget, sealedSeq, sealedKVRev, eligibleFrames := computeCompactWatermarks(metas, oldHead, db.fenceSeq, nowSec)
+	var unsealedResetMinEpoch map[uint16]uint64
+	for _, m := range metas {
+		if m.seq <= sealedSeq || m.typ != frameReset || !m.hasTS {
+			continue
+		}
+		if unsealedResetMinEpoch == nil {
+			unsealedResetMinEpoch = make(map[uint16]uint64)
+		}
+		if prev, ok := unsealedResetMinEpoch[m.series]; !ok || m.resetOldEpoch < prev {
+			unsealedResetMinEpoch[m.series] = m.resetOldEpoch
+		}
+	}
 	walRefs, err := collectWALBucketRefs(source, eligibleFrames)
 	if err != nil {
 		db.mu.Unlock()
@@ -47,7 +59,7 @@ func (db *DB) Compact() error {
 		return err
 	}
 	catalogRaw := encodeKVCatalog(db, sealedKVRev)
-	dictSnap := snapshotDictForCompact(db, fineTarget)
+	dictSnap := snapshotDictForCompact(db, fineTarget, unsealedResetMinEpoch)
 	optional := append([]optionalSection(nil), db.optional...)
 	seriesSnaps := make(map[uint16]*seriesSnap, len(db.series))
 	for id, s := range db.series {

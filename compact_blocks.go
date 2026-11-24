@@ -51,7 +51,7 @@ func sealableFrameMetas(metas []walFrameMeta, sealed uint64, fineTarget int64) (
 		case frameDelta:
 			ok = m.hasTS && m.maxTS < fineTarget
 		case frameReset:
-			ok = m.hasTS && m.maxTS <= fineTarget
+			ok = m.hasTS && (m.isResetAll() || m.maxTS <= fineTarget)
 		case frameKVBatch:
 			ok = m.hasTS
 			if ok && m.kvRev > kvRev {
@@ -131,14 +131,14 @@ func computeRebuildMarks(plan *compactPlan) rebuildMarks {
 		switch m.res {
 		case resHour:
 			existHour[k] = true
-			if ruleIntersects(s.rules, m.start, m.end()) {
+			if ruleIntersects(s.rules, m.start, m.end(), m.epoch) {
 				rm.hour[k] = true
 				rm.dirtyHr[dayWindowKey{m.series, m.start}] = true
 				rm.dirtyDay[dayWindowKey{m.series, dayTS(m.start)}] = true
 			}
 		case resDay:
 			existDay[k] = true
-			if ruleIntersects(s.rules, m.start, m.end()) {
+			if ruleIntersects(s.rules, m.start, m.end(), m.epoch) {
 				rm.day[k] = true
 				rm.dirtyDay[dayWindowKey{m.series, m.start}] = true
 			}
@@ -174,21 +174,21 @@ func computeRebuildMarks(plan *compactPlan) rebuildMarks {
 			}
 			hr, dy := hourTS(m.start), dayTS(m.start)
 			hk := blockIDKey{m.series, hr, m.epoch}
-			if hr < plan.hourTarget && !existHour[hk] && (hr >= plan.ret1hCutoff || ruleIntersects(s.rules, hr, hr+3600)) {
+			if hr < plan.hourTarget && !existHour[hk] && (hr >= plan.ret1hCutoff || ruleIntersects(s.rules, hr, hr+3600, m.epoch)) {
 				rm.hour[hk] = true
 				rm.dirtyHr[dayWindowKey{m.series, hr}] = true
 				rm.dirtyDay[dayWindowKey{m.series, dy}] = true
 			}
 			dk := blockIDKey{m.series, dy, m.epoch}
-			if dy < plan.dayTarget && !existDay[dk] && (dy >= plan.ret1dCutoff || ruleIntersects(s.rules, dy, dy+86400)) {
+			if dy < plan.dayTarget && !existDay[dk] && (dy >= plan.ret1dCutoff || ruleIntersects(s.rules, dy, dy+86400, m.epoch)) {
 				rm.day[dk] = true
 				rm.dirtyDay[dayWindowKey{m.series, dy}] = true
 			}
 		case resHour:
 			dy := dayTS(m.start)
 			dk := blockIDKey{m.series, dy, m.epoch}
-			if dy < plan.dayTarget && !existDay[dk] && !ruleIntersects(s.rules, m.start, m.end()) &&
-				(dy >= plan.ret1dCutoff || ruleIntersects(s.rules, dy, dy+86400)) {
+			if dy < plan.dayTarget && !existDay[dk] && !ruleIntersects(s.rules, m.start, m.end(), m.epoch) &&
+				(dy >= plan.ret1dCutoff || ruleIntersects(s.rules, dy, dy+86400, m.epoch)) {
 				rm.day[dk] = true
 				rm.dirtyDay[dayWindowKey{m.series, dy}] = true
 			}

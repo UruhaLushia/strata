@@ -159,9 +159,9 @@ func sortSealedMetas(b []sealedMeta) {
 	})
 }
 
-func ruleIntersects(r []resetRule, start, end int64) bool {
+func ruleIntersects(r []resetRule, start, end int64, epoch uint64) bool {
 	for _, x := range r {
-		if x.to > start && x.from < end {
+		if epoch <= x.oldEpoch && x.to > start && x.from < end {
 			return true
 		}
 	}
