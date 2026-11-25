@@ -399,7 +399,11 @@ func (s *Series) DictStats() ([]DictDimStats, error) {
 			st.InlineBytes = uint64(len(dimData.arena))
 			if dimData.ext != nil {
 				st.ExternalBytes = dimData.ext.fwdTotalBytes + dimData.ext.sstTotalBytes
-				st.ForwardPages = uint32(len(dimData.ext.fwdPages))
+				for _, p := range dimData.ext.fwdPages {
+					if p.length > 0 {
+						st.ForwardPages++
+					}
+				}
 				st.ReverseBlocks = uint32(len(dimData.ext.sstBlocks))
 			}
 		}

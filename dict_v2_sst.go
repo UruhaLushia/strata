@@ -196,7 +196,7 @@ func encodeFwdPage(vals []string, plainBuf, compBuf *[]byte, enc *zstd.Encoder) 
 	return *compBuf
 }
 
-func writeExtDimMergedSST(tf *osFile, secStart, pos int64, secHash hash.Hash32, enc *zstd.Encoder, oldExt *dictExtDim, tail []dictSSTEntry, overridden map[uint32]string) (int64, []byte, []uint32, []dictPageDesc, error) {
+func writeExtDimMergedSST(tf *osFile, secStart, pos int64, secHash hash.Hash32, enc *zstd.Encoder, oldExt *dictExtDim, tail []dictSSTEntry, overridden map[uint32]string, keepBits []uint64) (int64, []byte, []uint32, []dictPageDesc, error) {
 	slices.SortFunc(tail, func(a, b dictSSTEntry) int {
 		if a.key < b.key {
 			return -1
@@ -221,6 +221,9 @@ func writeExtDimMergedSST(tf *osFile, secStart, pos int64, secHash hash.Hash32, 
 			e, ok, err := stream.next()
 			if err != nil || !ok {
 				return e, ok, err
+			}
+			if keepBits != nil && !bitHas(keepBits, e.id) {
+				continue
 			}
 			if overridden != nil {
 				if _, skip := overridden[e.id]; skip {
@@ -282,19 +285,35 @@ func encodeDictV2Dir(series []dictSeriesSnap, inline []dictDimCompactSnap, ext [
 	for i := range inline {
 		d := &inline[i]
 		maxID := d.nextID - 1
-		var arenaLen uint32
+		var arenaLen, liveCnt uint32
 		for id := uint32(1); id <= maxID; id++ {
-			arenaLen += uint32(len(d.resolveLocal(id)))
+			if d.keepBits != nil && !bitHas(d.keepBits, id) {
+				continue
+			}
+			if ln := uint32(len(d.resolveLocal(id))); ln > 0 {
+				arenaLen += ln
+				liveCnt++
+			}
+		}
+		if d.keepBits == nil {
+			liveCnt = uint32(d.count)
 		}
 		b = binary.LittleEndian.AppendUint16(b, d.key.series)
 		b = append(b, d.key.dim)
 		b = binary.LittleEndian.AppendUint32(b, maxID)
-		b = binary.LittleEndian.AppendUint32(b, uint32(d.count))
+		b = binary.LittleEndian.AppendUint32(b, liveCnt)
 		b = binary.LittleEndian.AppendUint32(b, arenaLen)
 		for id := uint32(1); id <= maxID; id++ {
+			if d.keepBits != nil && !bitHas(d.keepBits, id) {
+				b = binary.AppendUvarint(b, 0)
+				continue
+			}
 			b = binary.AppendUvarint(b, uint64(len(d.resolveLocal(id))))
 		}
 		for id := uint32(1); id <= maxID; id++ {
+			if d.keepBits != nil && !bitHas(d.keepBits, id) {
+				continue
+			}
 			b = append(b, d.resolveLocal(id)...)
 		}
 	}

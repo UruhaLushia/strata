@@ -201,7 +201,7 @@ func (b *invertExternalBuilder) addPassthroughFromInvert(src *osFile, invertDesc
 	return nil
 }
 
-func (b *invertExternalBuilder) writeSection(tf *osFile, pos int64, writeToFinal []uint32, seriesBlocks map[uint16]uint32, enc *zstd.Encoder) (int64, sectionDesc, error) {
+func (b *invertExternalBuilder) writeSection(tf *osFile, pos int64, writeToFinal []uint32, seriesBlocks map[uint16]uint32, enc *zstd.Encoder, onKey func(uint64)) (int64, sectionDesc, error) {
 	sink := &invertChunkSink{chunkPath: b.chunkPath, rawChunk: make([]byte, 0, invertChunkTargetSize), enc: enc}
 	defer sink.close()
 
@@ -226,6 +226,9 @@ func (b *invertExternalBuilder) writeSection(tf *osFile, pos int64, writeToFinal
 			if uint32(len(keyIDs)) >= thresh {
 				isDense = true
 			}
+		}
+		if onKey != nil {
+			onKey(curKey)
 		}
 		rec := encodeInvertRecordAdaptive(curKey, keyIDs, isDense, &sc)
 		keyIDs = keyIDs[:0]

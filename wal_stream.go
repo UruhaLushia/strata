@@ -38,41 +38,44 @@ type walBucketRef struct {
 	epoch    uint64
 }
 
+func readWALFrame(f *osFile, pos, end int64, head *[frameHeader]byte, buf *[]byte) (byte, uint64, int64, error) {
+	if end-pos < frameHeader {
+		return 0, 0, pos, io.ErrUnexpectedEOF
+	}
+	if _, err := f.ReadAt(head[:], pos); err != nil {
+		return 0, 0, pos, err
+	}
+	typ, seq, ln, wantCRC, ok := decodeWALHeader(head, pos, end)
+	if !ok {
+		return 0, 0, pos, errors.New("strata: invalid WAL header")
+	}
+	if cap(*buf) < int(ln) {
+		*buf = make([]byte, ln)
+	} else {
+		*buf = (*buf)[:ln]
+	}
+	if ln > 0 {
+		if _, err := f.ReadAt(*buf, pos+frameHeader); err != nil {
+			return 0, 0, pos, err
+		}
+	}
+	if crc32.Update(crc32.Update(0, castagnoli, head[12:]), castagnoli, *buf) != wantCRC {
+		return 0, 0, pos, errors.New("strata: WAL CRC mismatch")
+	}
+	return typ, seq, pos + frameHeader + int64(ln), nil
+}
+
 func scanWALFrameMetas(f *osFile, start, end int64) ([]walFrameMeta, error) {
 	var metas []walFrameMeta
 	var head [frameHeader]byte
 	var payloadBuf []byte
 	pos := start
 	for pos < end {
-		if end-pos < frameHeader {
-			return nil, io.ErrUnexpectedEOF
-		}
-		if _, err := f.ReadAt(head[:], pos); err != nil {
+		typ, seq, nextPos, err := readWALFrame(f, pos, end, &head, &payloadBuf)
+		if err != nil {
 			return nil, err
 		}
-		typ, seq, ln, wantCRC, ok := decodeWALHeader(&head, pos, end)
-		if !ok {
-			return nil, errors.New("strata: invalid WAL header")
-		}
-		if cap(payloadBuf) < int(ln) {
-			payloadBuf = make([]byte, ln)
-		} else {
-			payloadBuf = payloadBuf[:ln]
-		}
-		if ln > 0 {
-			if _, err := f.ReadAt(payloadBuf, pos+frameHeader); err != nil {
-				return nil, err
-			}
-		}
-		if crc32.Update(crc32.Update(0, castagnoli, head[12:]), castagnoli, payloadBuf) != wantCRC {
-			return nil, errors.New("strata: WAL CRC mismatch")
-		}
-		m := walFrameMeta{
-			offset: pos,
-			length: ln,
-			typ:    typ,
-			seq:    seq,
-		}
+		m := walFrameMeta{offset: pos, length: uint32(len(payloadBuf)), typ: typ, seq: seq}
 		switch m.typ {
 		case frameDelta:
 			minTS, maxTS, cnt, err := scanDeltaBounds(payloadBuf)
@@ -92,7 +95,7 @@ func scanWALFrameMetas(f *osFile, start, end int64) ([]walFrameMeta, error) {
 			}
 		}
 		metas = append(metas, m)
-		pos += frameHeader + int64(ln)
+		pos = nextPos
 	}
 	return metas, nil
 }
@@ -316,6 +319,112 @@ func copyWALRangeStreaming(dst, src *osFile, start, end int64, minSeq uint64, ds
 			return dstPos, errors.New("strata: WAL CRC mismatch")
 		}
 		pos += frameSize
+	}
+	return dstPos, nil
+}
+
+func markTailDeltasLive(src *osFile, tailMetas []walFrameMeta, resetAllSeq map[uint16]uint64, live dictLiveBits) error {
+	var buf []byte
+	for _, m := range tailMetas {
+		var err error
+		buf, err = readWALPayload(src, m, buf)
+		if err != nil {
+			return err
+		}
+		dicts, buckets, err := decodeDelta(buf)
+		if err != nil {
+			return err
+		}
+		for _, de := range dicts {
+			if de.value != "" && m.seq > resetAllSeq[de.series] {
+				live.mark(dictDimKey{series: de.series, dim: de.dim}, de.id)
+			}
+		}
+		for _, b := range buckets {
+			if m.seq <= resetAllSeq[b.series] {
+				continue
+			}
+			for _, row := range b.rows {
+				for dim, tag := range row.tags {
+					if tag != 0 {
+						live.mark(dictDimKey{series: b.series, dim: uint8(dim)}, tag)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func copyWALRangeWithResurrection(dst, src *osFile, start, end int64, minSeq uint64, dstPos int64, snap *dictCompactSnap, live dictLiveBits, pruned map[dictDimKey]bool) (int64, error) {
+	snapDims := make(map[dictDimKey]*dictDimCompactSnap, len(pruned))
+	for i := range snap.dims {
+		if pruned[snap.dims[i].key] {
+			snapDims[snap.dims[i].key] = &snap.dims[i]
+		}
+	}
+	var head [frameHeader]byte
+	var payloadBuf []byte
+	resetSeen := make(map[uint16]bool)
+	for pos := start; pos < end; {
+		typ, seq, nextPos, err := readWALFrame(src, pos, end, &head, &payloadBuf)
+		if err != nil {
+			return dstPos, err
+		}
+		pos = nextPos
+		if seq <= minSeq {
+			continue
+		}
+		if typ == frameReset {
+			if x, err := decodeReset(payloadBuf); err == nil && x.from == math.MinInt64 && x.to == math.MaxInt64 {
+				resetSeen[x.series] = true
+			}
+		} else if typ == frameDelta {
+			dicts, buckets, err := decodeDelta(payloadBuf)
+			if err != nil {
+				return dstPos, err
+			}
+			for _, de := range dicts {
+				if !resetSeen[de.series] {
+					live.mark(dictDimKey{series: de.series, dim: de.dim}, de.id)
+				}
+			}
+			var extra []dictEntry
+			for _, b := range buckets {
+				if resetSeen[b.series] {
+					continue
+				}
+				for _, row := range b.rows {
+					for dim, tag := range row.tags {
+						dk := dictDimKey{series: b.series, dim: uint8(dim)}
+						sd := snapDims[dk]
+						if tag == 0 || sd == nil || tag >= sd.nextID || live.has(dk, tag) {
+							continue
+						}
+						live.mark(dk, tag)
+						if v := sd.resolve(tag); v != "" {
+							extra = append(extra, dictEntry{id: tag, series: b.series, dim: uint8(dim), value: v})
+						}
+					}
+				}
+			}
+			if len(extra) > 0 {
+				if dstPos, err = appendFrame(dst, dstPos, frameDelta, seq, encodeDelta(append(extra, dicts...), buckets)); err != nil {
+					return dstPos, err
+				}
+				continue
+			}
+		}
+		if _, err = dst.WriteAt(head[:], dstPos); err != nil {
+			return dstPos, err
+		}
+		dstPos += frameHeader
+		if len(payloadBuf) > 0 {
+			if _, err = dst.WriteAt(payloadBuf, dstPos); err != nil {
+				return dstPos, err
+			}
+			dstPos += int64(len(payloadBuf))
+		}
 	}
 	return dstPos, nil
 }

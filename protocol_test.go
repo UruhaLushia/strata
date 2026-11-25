@@ -1377,3 +1377,192 @@ func TestBatch1AtomicityAndStartupCleanup(t *testing.T) {
 		}
 	})
 }
+
+func TestDictGCStage2SlidingWindowChurn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dict_gc_stage2.db")
+	clock := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	opts := Options{
+		Now:         func() time.Time { return clock },
+		Retention1m: 2 * time.Hour,
+		Retention1h: 4 * time.Hour,
+		Retention1d: 6 * time.Hour,
+	}
+	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
+	cfg := SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops}
+
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+	s := mustSeries(t, db, 1, cfg)
+
+	const (
+		persistN      = 8
+		churnPerRound = 1800
+		rounds        = 13
+	)
+	var extBytesAtPromo uint64
+	var fileSizeAtPromo int64
+	for r := range rounds {
+		if r > 0 {
+			clock = clock.Add(12 * time.Hour)
+		}
+		ts := clock.Add(-10 * time.Minute)
+		rows := make([]Row, 0, persistN+churnPerRound+1)
+		for j := range persistN {
+			rows = append(rows, Row{
+				Tags:   []string{fmt.Sprintf("2001:db8:ffff::%x", j+1), "persist"},
+				Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f,
+			})
+		}
+		for j := range churnPerRound {
+			rows = append(rows, Row{
+				Tags:   []string{fmt.Sprintf("2001:db8:%x::%x", r+1, j+1), "churn"},
+				Values: [4]int64{1, 1, 1, 1}, Mask: 0x0f,
+			})
+		}
+		rows = append(rows, Row{Tags: []string{"", "empty"}, Values: [4]int64{5, 5, 5, 5}, Mask: 0x0f})
+		sumVal := int64(persistN*10 + churnPerRound + 5)
+		if err := s.Append(ts, Summary{Values: [4]int64{sumVal, 1, 10, 10}, Mask: 0x0f}, rows...); err != nil {
+			t.Fatalf("round %d Append: %v", r, err)
+		}
+		if err := db.Compact(); err != nil {
+			t.Fatalf("round %d Compact: %v", r, err)
+		}
+		st, err := s.DictStats()
+		if err != nil {
+			t.Fatalf("round %d DictStats: %v", r, err)
+		}
+		wantMax := uint32(persistN + (r+1)*churnPerRound)
+		wantLive := uint32(persistN + churnPerRound)
+		if st[0].MaxID != wantMax || st[0].LiveCount != wantLive || st[0].DeadCount != wantMax-wantLive {
+			t.Fatalf("round %d dim0 stats=%+v want max=%d live=%d dead=%d", r, st[0], wantMax, wantLive, wantMax-wantLive)
+		}
+		if st[0].ExternalBytes > 0 && extBytesAtPromo == 0 {
+			extBytesAtPromo = st[0].ExternalBytes
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fileSizeAtPromo = info.Size()
+		}
+	}
+	if extBytesAtPromo == 0 {
+		t.Fatal("expected dim 0 to promote to external mode")
+	}
+
+	// Verify bounded external bytes, bounded .db file size, and explicit length==0 folded forward pages.
+	stFinal, err := s.DictStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoFinal, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stFinal[0].ExternalBytes > extBytesAtPromo*2 || infoFinal.Size() > fileSizeAtPromo*2 {
+		t.Fatalf("churn size did not stabilize: ext=%d (promo=%d) file=%d (promo=%d)",
+			stFinal[0].ExternalBytes, extBytesAtPromo, infoFinal.Size(), fileSizeAtPromo)
+	}
+	checkFolded := func(curDB *DB, curSt DictDimStats) {
+		t.Helper()
+		curDB.mu.RLock()
+		dim := curDB.dict.dims[dictDimKey{series: 1, dim: 0}]
+		var totalPages, folded int
+		if dim != nil && dim.ext != nil {
+			totalPages = len(dim.ext.fwdPages)
+			for _, p := range dim.ext.fwdPages {
+				if p.length == 0 {
+					folded++
+				}
+			}
+		}
+		curDB.mu.RUnlock()
+		if folded < 35 || curSt.ForwardPages != uint32(totalPages-folded) || curSt.ForwardPages > 8 {
+			t.Fatalf("expected folded empty forward pages: total=%d folded=%d livePages=%d", totalPages, folded, curSt.ForwardPages)
+		}
+	}
+	checkFolded(db, stFinal[0])
+
+	// Second idempotent Compact + reopen must preserve folded pages and exact queries.
+	if err := db.Compact(); err != nil {
+		t.Fatalf("second Compact: %v", err)
+	}
+	db = reopenTestDB(t, db, path, opts)
+	s = mustSeries(t, db, 1, cfg)
+	stReopen, err := s.DictStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stReopen[0] != stFinal[0] {
+		t.Fatalf("reopened DictStats mismatch: got=%+v want=%+v", stReopen[0], stFinal[0])
+	}
+	checkFolded(db, stReopen[0])
+
+	for _, tc := range []struct {
+		name string
+		op   TagOp
+		val  string
+		want int64
+	}{
+		{"TagEq persistent", TagEq, "2001:db8:ffff::1", 10},
+		{"TagEq surviving churn", TagEq, fmt.Sprintf("2001:db8:%x::1", rounds), 1},
+		{"TagEq expired tag", TagEq, "2001:db8:1::1", 0},
+		{"TagPrefix persistent", TagPrefix, "2001:db8:ffff::", int64(persistN * 10)},
+		{"TagCIDR persistent", TagCIDR, "2001:db8:ffff::/48", int64(persistN * 10)},
+		{"TagEq empty", TagEq, "", 5},
+	} {
+		if got := queryAggSum(t, s, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: tc.op, Values: []string{tc.val}}}}); got != tc.want {
+			t.Fatalf("%s got=%d want=%d", tc.name, got, tc.want)
+		}
+	}
+	ctx := context.Background()
+	topAgg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, GroupDims: []int{0}, TopK: 10})
+	if err != nil {
+		t.Fatalf("TopK Aggregate: %v", err)
+	}
+	if len(topAgg.Groups) != 1 || len(topAgg.Groups[0]) != 10 || topAgg.Groups[0][0].Summary.Values[0] != 10 || topAgg.Groups[0][8].Tag != "" || topAgg.Groups[0][8].Summary.Values[0] != 5 {
+		topAgg.Release()
+		t.Fatalf("unexpected TopK groups after GC: %+v", topAgg.Groups)
+	}
+	topAgg.Release()
+	if err := readCheckErr(ctx, s, ReadRequest{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagPrefix, Values: []string{"2001:db8:ffff::"}}}, Limit: 20}, func(page *PageResult) error {
+		if len(page.Rows) != persistN {
+			return fmt.Errorf("Read persistent rows=%d want=%d", len(page.Rows), persistN)
+		}
+		for _, r := range page.Rows {
+			if !strings.HasPrefix(r.Tags[0], "2001:db8:ffff::") || r.Tags[1] != "persist" {
+				return fmt.Errorf("unexpected Read row tags: %+v", r.Tags)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-writing a previously GC'd expired tag must allocate a fresh ID and query accurately.
+	prevMax := stReopen[0].MaxID
+	if err := s.AppendSync(clock.Add(-5*time.Minute), Summary{Values: [4]int64{42, 42, 42, 42}, Mask: 0x0f},
+		Row{Tags: []string{"2001:db8:1::1", "reborn"}, Values: [4]int64{42, 42, 42, 42}, Mask: 0x0f},
+	); err != nil {
+		t.Fatal(err)
+	}
+	stReborn, err := s.DictStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stReborn[0].MaxID != prevMax+1 {
+		t.Fatalf("expected fresh ID for re-inserted expired tag: got MaxID=%d want=%d", stReborn[0].MaxID, prevMax+1)
+	}
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if got := queryAggSum(t, s, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"2001:db8:1::1"}}}}); got != 42 {
+		t.Fatalf("re-inserted expired tag sum got=%d want=42", got)
+	}
+}

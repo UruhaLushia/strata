@@ -1021,3 +1021,254 @@ func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
 		t.Fatalf("unexpected final s2 DictStats: err=%v stats=%+v", err, finalStats2)
 	}
 }
+
+func TestDictGCPhaseBConcurrentResurrectionAndResetAll(t *testing.T) {
+	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
+	ctx := context.Background()
+
+	t.Run("PhaseBResurrectionExternalFoldedPage", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "resurrect_ext.db")
+		clock := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+		opts := Options{
+			Now:         func() time.Time { return clock },
+			Retention1m: 2 * time.Hour,
+			Retention1h: 4 * time.Hour,
+			Retention1d: 6 * time.Hour,
+		}
+		cfg := SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops}
+		db, err := Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if db != nil {
+				_ = db.Close()
+			}
+		}()
+		s := mustSeries(t, db, 1, cfg)
+
+		const persistN = 4
+		const deadN = 17000
+		seedTS := clock.Add(-10 * time.Minute)
+		keepRows := make([]Row, persistN)
+		for i := range persistN {
+			keepRows[i] = Row{
+				Tags:   []string{fmt.Sprintf("2001:db8:keep::%d", i+1), "keep"},
+				Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f,
+			}
+		}
+		if err := s.Append(seedTS, Summary{Values: [4]int64{persistN * 10, 10, 10, 10}, Mask: 0x0f}, keepRows...); err != nil {
+			t.Fatal(err)
+		}
+		seedHighCardMinute(t, s, seedTS, deadN, func(i int) []string {
+			return []string{fmt.Sprintf("2001:db8:old::%05d", i+1), "old"}
+		})
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		stInit, err := s.DictStats()
+		if err != nil || stInit[0].ExternalBytes == 0 || stInit[0].MaxID != persistN+deadN {
+			t.Fatalf("expected external dim after seed: err=%v stats=%+v", err, stInit)
+		}
+
+		// Expire all 17,000 old tags and keep only 4 persistent tags.
+		clock = clock.Add(12 * time.Hour)
+		if err := s.Append(clock.Add(-10*time.Minute), Summary{Values: [4]int64{persistN * 10, 10, 10, 10}, Mask: 0x0f}, keepRows...); err != nil {
+			t.Fatal(err)
+		}
+
+		// During Phase B (after pruned SecTSDict with folded pages is written), concurrently
+		// write dead tags that hit the old in-memory dict (newID=false, no dictEntry emitted).
+		var hookErr error
+		db.compactHook = func() {
+			if err := s.AppendSync(clock.Add(-30*time.Second), Summary{Values: [4]int64{66, 11, 33, 33}, Mask: 0x0f},
+				Row{Tags: []string{"2001:db8:old::00042", "res"}, Values: [4]int64{11, 11, 11, 11}, Mask: 0x0f},
+				Row{Tags: []string{"2001:db8:old::05000", "res"}, Values: [4]int64{22, 22, 22, 22}, Mask: 0x0f},
+				Row{Tags: []string{"2001:db8:brandnew::1", "new"}, Values: [4]int64{33, 33, 33, 33}, Mask: 0x0f},
+			); err != nil {
+				hookErr = err
+				return
+			}
+			// Second delta frame reusing the same resurrected ID tests dedup across frames.
+			if err := s.AppendSync(clock.Add(-20*time.Second), Summary{Values: [4]int64{14, 14, 14, 14}, Mask: 0x0f},
+				Row{Tags: []string{"2001:db8:old::00042", "res"}, Values: [4]int64{14, 14, 14, 14}, Mask: 0x0f},
+			); err != nil {
+				hookErr = err
+			}
+		}
+		err = db.Compact()
+		db.compactHook = nil
+		if err != nil {
+			t.Fatalf("Compact with Phase B resurrection: %v", err)
+		}
+		if hookErr != nil {
+			t.Fatalf("compactHook AppendSync failed: %v", hookErr)
+		}
+
+		verify := func(label string, curS *Series) {
+			t.Helper()
+			for _, tc := range []struct {
+				tag  string
+				want int64
+			}{
+				{"2001:db8:old::00042", 25},
+				{"2001:db8:old::05000", 22},
+				{"2001:db8:brandnew::1", 33},
+				{"2001:db8:keep::1", 10},
+				{"2001:db8:old::00043", 0},
+			} {
+				if got := queryAggSum(t, curS, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{tc.tag}}}}); got != tc.want {
+					t.Fatalf("%s tag=%s sum=%d want=%d", label, tc.tag, got, tc.want)
+				}
+			}
+			if err := readCheckErr(ctx, curS, ReadRequest{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"2001:db8:old::05000"}}}, Limit: 10}, func(page *PageResult) error {
+				if len(page.Rows) != 1 || page.Rows[0].Tags[0] != "2001:db8:old::05000" || page.Rows[0].Values[0] != 22 {
+					return fmt.Errorf("unexpected Read #5000: %+v", page.Rows)
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("%s %v", label, err)
+			}
+			if _, scanSum, err := scanCountSumErr(ctx, curS, ScanQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"2001:db8:old::00042"}}}}); err != nil || scanSum != 25 {
+				t.Fatalf("%s Scan #42: err=%v sum=%d want=25", label, err, scanSum)
+			}
+			st, err := curS.DictStats()
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantMax := uint32(persistN + deadN + 1)
+			if st[0].MaxID != wantMax || st[0].LiveCount != 7 || st[0].DeadCount != wantMax-7 {
+				t.Fatalf("%s DictStats dim0=%+v want max=%d live=7 dead=%d", label, st[0], wantMax, wantMax-7)
+			}
+		}
+
+		verify("post-compact", s)
+		db = reopenTestDB(t, db, path, opts)
+		s = mustSeries(t, db, 1, cfg)
+		verify("reopened", s)
+
+		// Follow-up Compact seals the resurrected tail WAL and unfolds the previously folded page cleanly.
+		clock = clock.Add(10 * time.Minute)
+		if err := db.Compact(); err != nil {
+			t.Fatalf("follow-up Compact: %v", err)
+		}
+		db = reopenTestDB(t, db, path, opts)
+		s = mustSeries(t, db, 1, cfg)
+		verify("post-unfold-reopen", s)
+	})
+
+	t.Run("PhaseBConcurrentResetAllIsolation", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "resurrect_resetall.db")
+		clock := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+		opts := Options{
+			Now:         func() time.Time { return clock },
+			Retention1m: 2 * time.Hour,
+			Retention1h: 4 * time.Hour,
+			Retention1d: 6 * time.Hour,
+		}
+		cfg := SeriesConfig{Arity: 1, SummaryOps: ops, RowOps: ops}
+		db, err := Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if db != nil {
+				_ = db.Close()
+			}
+		}()
+		s1 := mustSeries(t, db, 1, cfg)
+		s2 := mustSeries(t, db, 2, cfg)
+
+		const n = 1500
+		seedTS := clock.Add(-10 * time.Minute)
+		seedHighCardMinute(t, s1, seedTS, n, func(i int) []string {
+			return []string{fmt.Sprintf("s1-old-%04d", i+1)}
+		})
+		seedHighCardMinute(t, s2, seedTS, n, func(i int) []string {
+			return []string{fmt.Sprintf("s2-old-%04d", i+1)}
+		})
+		if err := s2.Append(seedTS, Summary{Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
+			Row{Tags: []string{"s2-keep"}, Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Expire all s1 data (triggers full omission liveCnt==0) and all s2-old-* (triggers pruning).
+		clock = clock.Add(12 * time.Hour)
+		if err := s2.Append(clock.Add(-10*time.Minute), Summary{Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
+			Row{Tags: []string{"s2-keep"}, Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		var hookErr error
+		db.compactHook = func() {
+			if err := s1.AppendSync(clock.Add(-40*time.Second), Summary{Values: [4]int64{9, 9, 9, 9}, Mask: 0x0f},
+				Row{Tags: []string{"s1-old-0010"}, Values: [4]int64{9, 9, 9, 9}, Mask: 0x0f},
+			); err != nil {
+				hookErr = err
+				return
+			}
+			if err := s1.ResetAll(); err != nil {
+				hookErr = err
+				return
+			}
+			if err := s1.AppendSync(clock.Add(-30*time.Second), Summary{Values: [4]int64{300, 100, 200, 200}, Mask: 0x0f},
+				Row{Tags: []string{"s1-fresh-a"}, Values: [4]int64{100, 100, 100, 100}, Mask: 0x0f},
+				Row{Tags: []string{"s1-fresh-b"}, Values: [4]int64{200, 200, 200, 200}, Mask: 0x0f},
+			); err != nil {
+				hookErr = err
+				return
+			}
+			if err := s2.AppendSync(clock.Add(-20*time.Second), Summary{Values: [4]int64{55, 55, 55, 55}, Mask: 0x0f},
+				Row{Tags: []string{"s2-old-0010"}, Values: [4]int64{55, 55, 55, 55}, Mask: 0x0f},
+			); err != nil {
+				hookErr = err
+			}
+		}
+		err = db.Compact()
+		db.compactHook = nil
+		if err != nil {
+			t.Fatalf("Compact with concurrent ResetAll: %v", err)
+		}
+		if hookErr != nil {
+			t.Fatalf("compactHook failed: %v", hookErr)
+		}
+
+		db = reopenTestDB(t, db, path, opts)
+		s1 = mustSeries(t, db, 1, cfg)
+		s2 = mustSeries(t, db, 2, cfg)
+
+		for _, tc := range []struct {
+			s    *Series
+			tag  string
+			want int64
+		}{
+			{s1, "s1-fresh-a", 100},
+			{s1, "s1-fresh-b", 200},
+			{s1, "s1-old-0010", 0},
+			{s1, "s1-old-0001", 0},
+			{s2, "s2-keep", 7},
+			{s2, "s2-old-0010", 55},
+		} {
+			if got := queryAggSum(t, tc.s, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{tc.tag}}}}); got != tc.want {
+				t.Fatalf("%s sum=%d want=%d", tc.tag, got, tc.want)
+			}
+		}
+		st1, err := s1.DictStats()
+		if err != nil || st1[0].MaxID != 2 || st1[0].LiveCount != 2 || st1[0].DeadCount != 0 {
+			t.Fatalf("unexpected s1 DictStats after concurrent ResetAll: err=%v stats=%+v", err, st1)
+		}
+		if err := readCheckErr(ctx, s2, ReadRequest{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"s2-old-0010"}}}, Limit: 10}, func(page *PageResult) error {
+			if len(page.Rows) != 1 || page.Rows[0].Tags[0] != "s2-old-0010" || page.Rows[0].Values[0] != 55 {
+				return fmt.Errorf("unexpected s2 Read resurrected rows: %+v", page.Rows)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+}

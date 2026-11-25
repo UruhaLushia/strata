@@ -82,7 +82,7 @@ func (r *dictTagReader) resolveBytes(id uint32) []byte {
 	if r.snap.ext != nil && id < r.snap.tailBase {
 		pageIdx := int(id-1) / dictFwdPageSize
 		slotIdx := int(id-1) % dictFwdPageSize
-		if pageIdx < 0 || pageIdx >= len(r.snap.ext.fwdPages) {
+		if pageIdx < 0 || pageIdx >= len(r.snap.ext.fwdPages) || r.snap.ext.fwdPages[pageIdx].length == 0 {
 			return nil
 		}
 		if pageIdx != r.extPageIdx {

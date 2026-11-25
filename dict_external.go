@@ -47,6 +47,12 @@ func (e *dictExtDim) sstFirstKey(idx int) string {
 }
 
 func (e *dictExtDim) readPageInto(areaStart uint64, desc dictPageDesc, plainBuf *[]byte, dec *zstd.Decoder) ([]byte, error) {
+	if desc.length == 0 {
+		if plainBuf != nil {
+			*plainBuf = (*plainBuf)[:0]
+		}
+		return nil, nil
+	}
 	if e == nil || e.view == nil || e.view.data == nil {
 		return nil, errors.New("strata: missing file view for external dict")
 	}
@@ -130,7 +136,7 @@ func (e *dictExtDim) resolve(id uint32) string {
 	}
 	pageIdx := int(id-1) / dictFwdPageSize
 	slot := int(id-1) % dictFwdPageSize
-	if pageIdx >= len(e.fwdPages) {
+	if pageIdx >= len(e.fwdPages) || e.fwdPages[pageIdx].length == 0 {
 		return ""
 	}
 	ck := dictCacheKey{series: e.series, dim: e.dim, page: uint32(pageIdx)}
@@ -282,6 +288,9 @@ func (e *dictExtDim) matchScanFwd(op TagOp, target string, extra map[uint32]stri
 		putZstdScratch(plainPtr, *plainPtr)
 	}()
 	for pIdx, pDesc := range e.fwdPages {
+		if pDesc.length == 0 {
+			continue
+		}
 		plain, err := e.readPageInto(e.fwdStartOff, pDesc, plainPtr, dec)
 		if err != nil {
 			break

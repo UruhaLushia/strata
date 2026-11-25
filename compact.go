@@ -30,17 +30,33 @@ func (db *DB) Compact() error {
 	}
 	oldHead, source := db.head, db.data
 	db.fenceSeq = db.appendSeq
+	fencePos := db.walPos
 	nowSec := db.opts.Now().Unix()
-	metas, err := scanWALFrameMetas(source, int64(oldHead.walOffset), db.walPos)
+	metas, err := scanWALFrameMetas(source, int64(oldHead.walOffset), fencePos)
 	if err != nil {
 		db.mu.Unlock()
 		return err
 	}
 	fineTarget, hourTarget, dayTarget, sealedSeq, sealedKVRev, eligibleFrames := computeCompactWatermarks(metas, oldHead, db.fenceSeq, nowSec)
 	var unsealedResetMinEpoch map[uint16]uint64
+	var tailMetas []walFrameMeta
+	var tailResetAllSeq map[uint16]uint64
 	for _, m := range metas {
-		if m.seq <= sealedSeq || m.typ != frameReset || !m.hasTS {
+		if m.seq <= sealedSeq {
 			continue
+		}
+		if m.typ == frameDelta {
+			tailMetas = append(tailMetas, m)
+			continue
+		}
+		if m.typ != frameReset || !m.hasTS {
+			continue
+		}
+		if m.isResetAll() {
+			if tailResetAllSeq == nil {
+				tailResetAllSeq = make(map[uint16]uint64)
+			}
+			tailResetAllSeq[m.series] = m.seq
 		}
 		if unsealedResetMinEpoch == nil {
 			unsealedResetMinEpoch = make(map[uint16]uint64)
@@ -86,29 +102,31 @@ func (db *DB) Compact() error {
 	defer releaseView()
 
 	plan := &compactPlan{
-		dbPath:         db.path,
-		oldHead:        oldHead,
-		sourceView:     sourceView,
-		oldSealed:      append([]sealedMeta(nil), db.sealed...),
-		oldInvert:      append([]invertChunkMeta(nil), db.invert...),
-		series:         seriesSnaps,
-		eligibleFrames: eligibleFrames,
-		walRefs:        walRefs,
-		nowSec:         nowSec,
-		fineTarget:     fineTarget,
-		hourTarget:     hourTarget,
-		dayTarget:      dayTarget,
-		ret1mCutoff:    nowSec - int64(db.opts.Retention1m/time.Second),
-		ret1hCutoff:    nowSec - int64(db.opts.Retention1h/time.Second),
-		ret1dCutoff:    nowSec - int64(db.opts.Retention1d/time.Second),
-		kvBlocks:       kvBlocks,
-		catalogRaw:     catalogRaw,
-		kvPassthrough:  kvPass,
-		dictSnap:       dictSnap,
-		optional:       optional,
-		level:          db.opts.CompressionLevel,
-		policy:         db.policy,
-		invertRunBytes: runBytes,
+		dbPath:          db.path,
+		oldHead:         oldHead,
+		sourceView:      sourceView,
+		oldSealed:       append([]sealedMeta(nil), db.sealed...),
+		oldInvert:       append([]invertChunkMeta(nil), db.invert...),
+		series:          seriesSnaps,
+		eligibleFrames:  eligibleFrames,
+		tailMetas:       tailMetas,
+		tailResetAllSeq: tailResetAllSeq,
+		walRefs:         walRefs,
+		nowSec:          nowSec,
+		fineTarget:      fineTarget,
+		hourTarget:      hourTarget,
+		dayTarget:       dayTarget,
+		ret1mCutoff:     nowSec - int64(db.opts.Retention1m/time.Second),
+		ret1hCutoff:     nowSec - int64(db.opts.Retention1h/time.Second),
+		ret1dCutoff:     nowSec - int64(db.opts.Retention1d/time.Second),
+		kvBlocks:        kvBlocks,
+		catalogRaw:      catalogRaw,
+		kvPassthrough:   kvPass,
+		dictSnap:        dictSnap,
+		optional:        optional,
+		level:           db.opts.CompressionLevel,
+		policy:          db.policy,
+		invertRunBytes:  runBytes,
 	}
 	gen, uuid := oldHead.gen+1, oldHead.uuid
 	db.mu.Unlock()
@@ -127,7 +145,7 @@ func (db *DB) Compact() error {
 	if err = writeSupers(tf, superblock{version: 1, gen: gen, walOffset: dataStart, created: oldHead.created, uuid: uuid}); err != nil {
 		return fail(err)
 	}
-	walStart, descs, err := writeCompactFile(tf, plan)
+	walStart, descs, liveBits, prunedDims, err := writeCompactFile(tf, plan)
 	if err != nil {
 		return fail(err)
 	}
@@ -139,10 +157,7 @@ func (db *DB) Compact() error {
 	}
 
 	copyBuf := make([]byte, 64<<10)
-	db.mu.RLock()
-	pass1Pos := db.walPos
-	db.mu.RUnlock()
-	newWal, err := copyWALRangeStreaming(tf, source, int64(oldHead.walOffset), pass1Pos, sealedSeq, walStart, copyBuf)
+	newWal, err := copyWALRangeStreaming(tf, source, int64(oldHead.walOffset), fencePos, sealedSeq, walStart, copyBuf)
 	if err != nil {
 		return fail(err)
 	}
@@ -156,7 +171,11 @@ func (db *DB) Compact() error {
 		return fail(err)
 	}
 	finalSeq, finalPos := db.appendSeq, db.walPos
-	newWal, err = copyWALRangeStreaming(tf, source, pass1Pos, finalPos, sealedSeq, newWal, copyBuf)
+	if len(prunedDims) > 0 && finalPos > fencePos {
+		newWal, err = copyWALRangeWithResurrection(tf, source, fencePos, finalPos, sealedSeq, newWal, plan.dictSnap, liveBits, prunedDims)
+	} else {
+		newWal, err = copyWALRangeStreaming(tf, source, fencePos, finalPos, sealedSeq, newWal, copyBuf)
+	}
 	if err != nil {
 		db.mu.Unlock()
 		return fail(err)

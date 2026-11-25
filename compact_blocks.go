@@ -14,29 +14,31 @@ type dayWindowKey struct {
 }
 
 type compactPlan struct {
-	dbPath         string
-	oldHead        superblock
-	sourceView     *fileView
-	oldSealed      []sealedMeta
-	oldInvert      []invertChunkMeta
-	series         map[uint16]*seriesSnap
-	eligibleFrames []walFrameMeta
-	walRefs        []walBucketRef
-	nowSec         int64
-	fineTarget     int64
-	hourTarget     int64
-	dayTarget      int64
-	ret1mCutoff    int64
-	ret1hCutoff    int64
-	ret1dCutoff    int64
-	kvBlocks       []kvSSTBlock
-	catalogRaw     []byte
-	dictSnap       *dictCompactSnap
-	optional       []optionalSection
-	level          CompressionLevel
-	kvPassthrough  bool
-	policy         memPolicy
-	invertRunBytes int
+	dbPath          string
+	oldHead         superblock
+	sourceView      *fileView
+	oldSealed       []sealedMeta
+	oldInvert       []invertChunkMeta
+	series          map[uint16]*seriesSnap
+	eligibleFrames  []walFrameMeta
+	tailMetas       []walFrameMeta
+	tailResetAllSeq map[uint16]uint64
+	walRefs         []walBucketRef
+	nowSec          int64
+	fineTarget      int64
+	hourTarget      int64
+	dayTarget       int64
+	ret1mCutoff     int64
+	ret1hCutoff     int64
+	ret1dCutoff     int64
+	kvBlocks        []kvSSTBlock
+	catalogRaw      []byte
+	dictSnap        *dictCompactSnap
+	optional        []optionalSection
+	level           CompressionLevel
+	kvPassthrough   bool
+	policy          memPolicy
+	invertRunBytes  int
 }
 
 func sealableFrameMetas(metas []walFrameMeta, sealed uint64, fineTarget int64) (uint64, int, uint64) {
