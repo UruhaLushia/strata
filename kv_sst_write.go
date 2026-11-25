@@ -2,10 +2,89 @@ package strata
 
 import (
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 
 	"github.com/klauspost/compress/zstd"
 )
+
+const (
+	kvFlagTTLChecked uint8 = 1 << 1
+	kvFlagHasLiveTTL uint8 = 1 << 2
+)
+
+func canPassthroughKV(oldHead superblock, sealedKVRev uint64) bool {
+	if sealedKVRev != oldHead.sealedKVRev {
+		return false
+	}
+	sBlk, sBlob, sIdx := oldHead.sections[0], oldHead.sections[1], oldHead.sections[2]
+	if sBlk.length == 0 && sBlob.length == 0 && sIdx.length == 0 {
+		return true
+	}
+	if sIdx.length == 0 || sIdx.kind != secKVSSTIndex {
+		return false
+	}
+	if sIdx.flags&kvFlagTTLChecked == 0 || sIdx.flags&kvFlagHasLiveTTL != 0 {
+		return false
+	}
+	if oldHead.walOffset < dataStart {
+		return false
+	}
+	cur := uint64(dataStart)
+	if sBlob.length > 0 {
+		if sBlob.kind != secKVLargeBlobs || sBlob.offset != cur || sBlob.length > oldHead.walOffset-cur {
+			return false
+		}
+		cur += sBlob.length
+	}
+	if sBlk.length > 0 {
+		if sBlk.kind != secKVSSTBlocks || sBlk.offset != cur || sBlk.length > oldHead.walOffset-cur {
+			return false
+		}
+		cur += sBlk.length
+	}
+	return sIdx.offset == cur && sIdx.length <= oldHead.walOffset-cur
+}
+
+func copyPassthroughKVSections(dst, src *osFile, oldHead superblock) (int64, [3]sectionDesc, sectionDesc, error) {
+	sBlk, sBlob, sIdx := oldHead.sections[0], oldHead.sections[1], oldHead.sections[2]
+	if sBlk.length == 0 && sBlob.length == 0 && sIdx.length == 0 {
+		return int64(dataStart), [3]sectionDesc{}, sectionDesc{}, nil
+	}
+	if src == nil || dst == nil {
+		return 0, [3]sectionDesc{}, sectionDesc{}, errors.New("strata: invalid passthrough KV file")
+	}
+	pos := int64(dataStart)
+	buf := make([]byte, 64<<10)
+	secHash := crc32.New(castagnoli)
+	for _, sec := range [3]sectionDesc{sBlob, sBlk, sIdx} {
+		if sec.length == 0 {
+			continue
+		}
+		if sec.offset != uint64(pos) {
+			return 0, [3]sectionDesc{}, sectionDesc{}, errors.New("strata: invalid passthrough KV section offset")
+		}
+		secHash.Reset()
+		remaining := sec.length
+		for remaining > 0 {
+			n := min(uint64(len(buf)), remaining)
+			chunk := buf[:n]
+			if _, err := src.ReadAt(chunk, pos); err != nil {
+				return 0, [3]sectionDesc{}, sectionDesc{}, err
+			}
+			if _, err := dst.WriteAt(chunk, pos); err != nil {
+				return 0, [3]sectionDesc{}, sectionDesc{}, err
+			}
+			_, _ = secHash.Write(chunk)
+			pos += int64(n)
+			remaining -= n
+		}
+		if secHash.Sum32() != sec.crc {
+			return 0, [3]sectionDesc{}, sectionDesc{}, errors.New("strata: passthrough KV section CRC mismatch")
+		}
+	}
+	return pos, [3]sectionDesc{sBlk, {}, sIdx}, sBlob, nil
+}
 
 func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, enc *zstd.Encoder) (int64, [3]sectionDesc, sectionDesc, error) {
 	var desc [3]sectionDesc
@@ -15,9 +94,13 @@ func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, 
 	}
 	var blobs [][]byte
 	var blobLengths []uint32
+	hasLiveTTL := false
 	for i := range blocks {
 		for j := range blocks[i].entries {
 			e := &blocks[i].entries[j]
+			if e.expiresAtUnixNano != 0 {
+				hasLiveTTL = true
+			}
 			if len(e.value) <= 32<<10 {
 				continue
 			}
@@ -86,6 +169,10 @@ func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, 
 	if _, err := f.WriteAt(index, pos); err != nil {
 		return 0, desc, blobDesc, err
 	}
-	desc[2] = sectionDesc{kind: secKVSSTIndex, count: uint32(len(blocks)), offset: uint64(idxStart), length: uint64(len(index)), rawLen: uint32(len(index)), crc: crc(index)}
+	idxFlags := kvFlagTTLChecked
+	if hasLiveTTL {
+		idxFlags |= kvFlagHasLiveTTL
+	}
+	desc[2] = sectionDesc{kind: secKVSSTIndex, flags: idxFlags, count: uint32(len(blocks)), offset: uint64(idxStart), length: uint64(len(index)), rawLen: uint32(len(index)), crc: crc(index)}
 	return pos + int64(len(index)), desc, blobDesc, nil
 }

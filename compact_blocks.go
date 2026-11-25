@@ -34,6 +34,7 @@ type compactPlan struct {
 	dictSnap       *dictCompactSnap
 	optional       []optionalSection
 	level          CompressionLevel
+	kvPassthrough  bool
 	policy         memPolicy
 	invertRunBytes int
 }

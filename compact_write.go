@@ -231,7 +231,15 @@ func writeCompactFile(tf *osFile, plan *compactPlan) (int64, [12]sectionDesc, er
 	mainEnc := newZstdEncoder(plan.level, plan.policy.zstdEncoderWindow)
 	defer mainEnc.Close()
 
-	pos, kvDesc, blobDesc, err := writeKVSections(tf, int64(dataStart), plan.kvBlocks, plan.catalogRaw, mainEnc)
+	var pos int64
+	var kvDesc [3]sectionDesc
+	var blobDesc sectionDesc
+	var err error
+	if plan.kvPassthrough {
+		pos, kvDesc, blobDesc, err = copyPassthroughKVSections(tf, plan.sourceView.data, plan.oldHead)
+	} else {
+		pos, kvDesc, blobDesc, err = writeKVSections(tf, int64(dataStart), plan.kvBlocks, plan.catalogRaw, mainEnc)
+	}
 	if err != nil {
 		return 0, ds, err
 	}

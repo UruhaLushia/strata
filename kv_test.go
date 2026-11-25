@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -654,4 +655,419 @@ func TestKVScanScanSeqAndLargeBlobs(t *testing.T) {
 		}
 		_ = ro.Close()
 	}
+}
+
+func TestKVSectionPassthrough(t *testing.T) {
+	assertKV := func(t *testing.T, r *Region, key string, want []byte, wantOK bool) {
+		t.Helper()
+		got, ok, err := r.Get(key)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", key, err)
+		}
+		if ok != wantOK {
+			t.Fatalf("Get(%q) ok=%v want=%v", key, ok, wantOK)
+		}
+		if wantOK && !bytes.Equal(got, want) {
+			t.Fatalf("Get(%q) len=%d wantLen=%d", key, len(got), len(want))
+		}
+	}
+	assertTSSum := func(t *testing.T, s *Series, from, to time.Time, want int64) {
+		t.Helper()
+		res, err := s.Aggregate(context.Background(), AggregateQuery{From: from, To: to})
+		if err != nil {
+			t.Fatalf("Aggregate: %v", err)
+		}
+		defer res.Release()
+		if res.Summary.Values[0] != want {
+			t.Fatalf("TS sum=%d want=%d", res.Summary.Values[0], want)
+		}
+	}
+
+	t.Run("UnchangedKVAndLargeBlobWithTS", func(t *testing.T) {
+		now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+		db, series := testDB(t, &now, Options{})
+		path := db.path
+		seriesID, seriesCfg := series.id, series.cfg
+
+		if !canPassthroughKV(db.head, db.head.sealedKVRev) {
+			t.Fatal("expected empty KV passthrough to be allowed")
+		}
+		appendValue(t, series, now.Add(-2*time.Hour), 1)
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[0].length != 0 || db.head.sections[1].length != 0 || db.head.sections[2].length != 0 || db.head.sealedKVRev != 0 {
+			t.Fatalf("unexpected non-empty KV sections: %+v rev=%d", db.head.sections[:3], db.head.sealedKVRev)
+		}
+
+		// Incompressible >64KiB blob exercises multi-chunk 64KiB streaming and zero-relocation blobOffset.
+		blob := make([]byte, 80<<10)
+		x := uint32(0x12345678)
+		for i := range blob {
+			x ^= x << 13
+			x ^= x >> 17
+			x ^= x << 5
+			blob[i] = byte(x)
+		}
+		reg, err := db.Region("kv")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = reg.NewBatch().
+			Put("k1", []byte("v1")).
+			Put("k2", []byte("v2")).
+			Put("big", blob).
+			Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[1].kind != secKVLargeBlobs || db.head.sections[1].length <= 64<<10 ||
+			db.head.sections[0].kind != secKVSSTBlocks || db.head.sections[0].length == 0 ||
+			db.head.sections[2].kind != secKVSSTIndex || db.head.sections[2].length == 0 {
+			t.Fatalf("unexpected KV sections: %+v", db.head.sections[:3])
+		}
+		if db.head.sections[2].flags&kvFlagTTLChecked == 0 || db.head.sections[2].flags&kvFlagHasLiveTTL != 0 {
+			t.Fatalf("unexpected KV index flags=%#x", db.head.sections[2].flags)
+		}
+		if !canPassthroughKV(db.head, db.head.sealedKVRev) {
+			t.Fatal("expected KV passthrough to be eligible")
+		}
+
+		savedSec := [3]sectionDesc{db.head.sections[0], db.head.sections[1], db.head.sections[2]}
+		savedRev := db.head.sealedKVRev
+		savedGen := db.head.gen
+
+		appendValue(t, series, now.Add(-90*time.Minute), 41)
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.gen != savedGen+1 || db.head.sealedKVRev != savedRev {
+			t.Fatalf("gen=%d want=%d rev=%d want=%d", db.head.gen, savedGen+1, db.head.sealedKVRev, savedRev)
+		}
+		if db.head.sections[0] != savedSec[0] || db.head.sections[1] != savedSec[1] || db.head.sections[2] != savedSec[2] {
+			t.Fatalf("passthrough modified KV sections: got=%+v want=%+v", db.head.sections[:3], savedSec)
+		}
+		assertKV(t, reg, "k1", []byte("v1"), true)
+		assertKV(t, reg, "k2", []byte("v2"), true)
+		assertKV(t, reg, "big", blob, true)
+		assertTSSum(t, series, now.Add(-3*time.Hour), now, 42)
+
+		badTmp, err := openData(filepath.Join(t.TempDir(), "bad.tmp"), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		badHead := db.head
+		badHead.sections[1].crc ^= 1
+		if _, _, _, err = copyPassthroughKVSections(badTmp, db.data, badHead); err == nil {
+			_ = badTmp.Close()
+			t.Fatal("expected CRC mismatch error from copyPassthroughKVSections")
+		}
+		_ = badTmp.Close()
+
+		if err = db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := Open(path, Options{Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reopened.Close() }()
+		if reopened.head.sections[0] != savedSec[0] || reopened.head.sections[1] != savedSec[1] || reopened.head.sections[2] != savedSec[2] {
+			t.Fatalf("reopened KV sections mismatch: got=%+v want=%+v", reopened.head.sections[:3], savedSec)
+		}
+		reReg, err := reopened.Region("kv")
+		if err != nil {
+			t.Fatal(err)
+		}
+		reSeries, err := reopened.Series(seriesID, seriesCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertKV(t, reReg, "k1", []byte("v1"), true)
+		assertKV(t, reReg, "k2", []byte("v2"), true)
+		assertKV(t, reReg, "big", blob, true)
+		assertTSSum(t, reSeries, now.Add(-3*time.Hour), now, 42)
+	})
+
+	t.Run("EmptyCatalogPassthrough", func(t *testing.T) {
+		now := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
+		db, series := testDB(t, &now, Options{})
+		defer func() { _ = db.Close() }()
+
+		reg, err := db.Region("cfg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = reg.Put("a", []byte("1")); err != nil {
+			t.Fatal(err)
+		}
+		if err = reg.Clear(); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[0].length != 0 || db.head.sections[1].length != 0 ||
+			db.head.sections[2].kind != secKVSSTIndex || db.head.sections[2].length == 0 {
+			t.Fatalf("expected catalog-only KV sections: %+v", db.head.sections[:3])
+		}
+		if db.head.sections[2].flags&kvFlagTTLChecked == 0 || db.head.sections[2].flags&kvFlagHasLiveTTL != 0 {
+			t.Fatalf("unexpected catalog-only flags=%#x", db.head.sections[2].flags)
+		}
+		if !canPassthroughKV(db.head, db.head.sealedKVRev) {
+			t.Fatal("expected catalog-only KV passthrough to be eligible")
+		}
+
+		savedSec2 := db.head.sections[2]
+		savedGen := db.head.gen
+		appendValue(t, series, now.Add(-2*time.Hour), 9)
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.gen != savedGen+1 || db.head.sections[0].length != 0 || db.head.sections[1].length != 0 || db.head.sections[2] != savedSec2 {
+			t.Fatalf("catalog-only passthrough mismatch: gen=%d sections=%+v want2=%+v", db.head.gen, db.head.sections[:3], savedSec2)
+		}
+		assertKV(t, reg, "a", nil, false)
+		assertTSSum(t, series, now.Add(-3*time.Hour), now, 9)
+	})
+
+	t.Run("LiveTTLAndRecoveryAfterExpiry", func(t *testing.T) {
+		now := time.Date(2026, 5, 12, 12, 0, 0, 0, time.UTC)
+		db, series := testDB(t, &now, Options{})
+		defer func() { _ = db.Close() }()
+
+		reg, err := db.Region("sess")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = reg.NewBatch().
+			Put("keep", []byte("perm")).
+			PutTTL("temp", []byte("ephemeral"), 2*time.Minute).
+			Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[2].flags&kvFlagTTLChecked == 0 || db.head.sections[2].flags&kvFlagHasLiveTTL == 0 {
+			t.Fatalf("expected TTLChecked|HasLiveTTL flags=%#x", db.head.sections[2].flags)
+		}
+		if canPassthroughKV(db.head, db.head.sealedKVRev) {
+			t.Fatal("expected live TTL to disallow passthrough")
+		}
+		assertKV(t, reg, "temp", []byte("ephemeral"), true)
+
+		now = now.Add(5 * time.Minute)
+		appendValue(t, series, now.Add(-2*time.Hour), 5)
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		assertKV(t, reg, "temp", nil, false)
+		assertKV(t, reg, "keep", []byte("perm"), true)
+		if db.head.sections[2].flags&kvFlagTTLChecked == 0 || db.head.sections[2].flags&kvFlagHasLiveTTL != 0 {
+			t.Fatalf("expected expired TTL cleared in flags=%#x", db.head.sections[2].flags)
+		}
+		if !canPassthroughKV(db.head, db.head.sealedKVRev) {
+			t.Fatal("expected passthrough to recover after TTL expiry")
+		}
+
+		savedSec := [3]sectionDesc{db.head.sections[0], db.head.sections[1], db.head.sections[2]}
+		appendValue(t, series, now.Add(-90*time.Minute), 6)
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[0] != savedSec[0] || db.head.sections[1] != savedSec[1] || db.head.sections[2] != savedSec[2] {
+			t.Fatalf("expected passthrough after TTL recovery: got=%+v want=%+v", db.head.sections[:3], savedSec)
+		}
+		assertKV(t, reg, "keep", []byte("perm"), true)
+		assertTSSum(t, series, now.Add(-3*time.Hour), now, 11)
+	})
+
+	t.Run("KVUpdatesAndConcurrentHookBatch", func(t *testing.T) {
+		now := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
+		db, series := testDB(t, &now, Options{})
+		path := db.path
+		seriesID, seriesCfg := series.id, series.cfg
+
+		r1, err := db.Region("r1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		r2, err := db.Region("r2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = db.NewBatch().
+			In(r1).Put("old", []byte("v1")).Put("del", []byte("gone")).
+			In(r2).Put("wipe", []byte("soon")).
+			Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if !canPassthroughKV(db.head, db.head.sealedKVRev) {
+			t.Fatal("expected passthrough after initial KV seal")
+		}
+		rev1 := db.head.sealedKVRev
+		sec1 := [3]sectionDesc{db.head.sections[0], db.head.sections[1], db.head.sections[2]}
+
+		appendValue(t, series, now.Add(-2*time.Hour), 3)
+		db.compactHook = func() {
+			if hookErr := db.NewBatch().
+				In(r1).Put("hot", []byte("during-compact")).Delete("del").
+				In(r2).Clear().
+				Commit(); hookErr != nil {
+				t.Errorf("concurrent KV batch: %v", hookErr)
+			}
+		}
+		err = db.Compact()
+		db.compactHook = nil
+		if err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sealedKVRev != rev1 {
+			t.Fatalf("sealedKVRev changed during passthrough: got=%d want=%d", db.head.sealedKVRev, rev1)
+		}
+		if db.head.sections[0] != sec1[0] || db.head.sections[1] != sec1[1] || db.head.sections[2] != sec1[2] {
+			t.Fatalf("KV sections changed during passthrough: got=%+v want=%+v", db.head.sections[:3], sec1)
+		}
+		assertKV(t, r1, "old", []byte("v1"), true)
+		assertKV(t, r1, "hot", []byte("during-compact"), true)
+		assertKV(t, r1, "del", nil, false)
+		assertKV(t, r2, "wipe", nil, false)
+
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sealedKVRev <= rev1 {
+			t.Fatalf("expected sealedKVRev to advance past %d, got %d", rev1, db.head.sealedKVRev)
+		}
+		assertKV(t, r1, "old", []byte("v1"), true)
+		assertKV(t, r1, "hot", []byte("during-compact"), true)
+		assertKV(t, r1, "del", nil, false)
+		assertKV(t, r2, "wipe", nil, false)
+
+		rev2 := db.head.sealedKVRev
+		if err = r1.Put("old", []byte("v2")); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sealedKVRev <= rev2 {
+			t.Fatalf("expected sealedKVRev to advance after Put: got=%d prev=%d", db.head.sealedKVRev, rev2)
+		}
+		if err = db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := Open(path, Options{Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reopened.Close() }()
+		rr1, err := reopened.Region("r1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rr2, err := reopened.Region("r2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := reopened.Series(seriesID, seriesCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertKV(t, rr1, "old", []byte("v2"), true)
+		assertKV(t, rr1, "hot", []byte("during-compact"), true)
+		assertKV(t, rr1, "del", nil, false)
+		assertKV(t, rr2, "wipe", nil, false)
+		assertTSSum(t, rs, now.Add(-3*time.Hour), now, 3)
+	})
+
+	t.Run("LegacyUnflaggedUpgrade", func(t *testing.T) {
+		now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+		db, series := testDB(t, &now, Options{})
+		path := db.path
+		seriesID, seriesCfg := series.id, series.cfg
+
+		reg, err := db.Region("legacy")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = reg.Put("k", []byte("legacy-val")); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[2].flags&kvFlagTTLChecked == 0 {
+			t.Fatalf("expected kvFlagTTLChecked before clearing, got=%#x", db.head.sections[2].flags)
+		}
+		if err = db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rawF := &osFile{f: f}
+		sb, err := readSuper(rawF)
+		if err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		sb.sections[2].flags = 0
+		if err = writeSupers(rawF, sb); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err = f.Sync(); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err = f.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		db, err = Open(path, Options{Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		if db.head.sections[2].flags != 0 || canPassthroughKV(db.head, db.head.sealedKVRev) {
+			t.Fatalf("expected legacy unflagged DB to reject passthrough: flags=%#x", db.head.sections[2].flags)
+		}
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[2].flags&kvFlagTTLChecked == 0 || db.head.sections[2].flags&kvFlagHasLiveTTL != 0 {
+			t.Fatalf("expected legacy upgrade to set kvFlagTTLChecked, got=%#x", db.head.sections[2].flags)
+		}
+		if !canPassthroughKV(db.head, db.head.sealedKVRev) {
+			t.Fatal("expected passthrough to become eligible after upgrade compact")
+		}
+
+		savedSec := [3]sectionDesc{db.head.sections[0], db.head.sections[1], db.head.sections[2]}
+		reSeries, err := db.Series(seriesID, seriesCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		appendValue(t, reSeries, now.Add(-2*time.Hour), 7)
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[0] != savedSec[0] || db.head.sections[1] != savedSec[1] || db.head.sections[2] != savedSec[2] {
+			t.Fatalf("post-upgrade passthrough modified KV sections: got=%+v want=%+v", db.head.sections[:3], savedSec)
+		}
+		reg, err = db.Region("legacy")
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertKV(t, reg, "k", []byte("legacy-val"), true)
+		assertTSSum(t, reSeries, now.Add(-3*time.Hour), now, 7)
+	})
 }

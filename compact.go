@@ -53,12 +53,17 @@ func (db *DB) Compact() error {
 		db.mu.Unlock()
 		return err
 	}
-	kvBlocks, err := db.buildKVBlocks(sealedKVRev)
-	if err != nil {
-		db.mu.Unlock()
-		return err
+	kvPass := canPassthroughKV(oldHead, sealedKVRev)
+	var kvBlocks []kvSSTBlock
+	var catalogRaw []byte
+	if !kvPass {
+		kvBlocks, err = db.buildKVBlocks(sealedKVRev)
+		if err != nil {
+			db.mu.Unlock()
+			return err
+		}
+		catalogRaw = encodeKVCatalog(db, sealedKVRev)
 	}
-	catalogRaw := encodeKVCatalog(db, sealedKVRev)
 	dictSnap := snapshotDictForCompact(db, fineTarget, unsealedResetMinEpoch)
 	optional := append([]optionalSection(nil), db.optional...)
 	seriesSnaps := make(map[uint16]*seriesSnap, len(db.series))
@@ -97,6 +102,7 @@ func (db *DB) Compact() error {
 		ret1dCutoff:    nowSec - int64(db.opts.Retention1d/time.Second),
 		kvBlocks:       kvBlocks,
 		catalogRaw:     catalogRaw,
+		kvPassthrough:  kvPass,
 		dictSnap:       dictSnap,
 		optional:       optional,
 		level:          db.opts.CompressionLevel,
