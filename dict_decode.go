@@ -6,9 +6,9 @@ import (
 	"errors"
 )
 
-func decodeDictV2(f *osFile, desc sectionDesc, mapped []byte, view *fileView, d *dictionary, series map[uint16]*Series) error {
+func decodeDict(f *osFile, desc sectionDesc, mapped []byte, view *fileView, d *dictionary, series map[uint16]*Series) error {
 	if desc.length < 16 {
-		return errors.New("strata: truncated dict v2 section")
+		return errors.New("strata: truncated dict section")
 	}
 	trRaw, trBuf, err := sectionBlockPooled(f, desc, desc.offset+desc.length-16, 16, mapped)
 	if trBuf != nil {
@@ -17,13 +17,13 @@ func decodeDictV2(f *osFile, desc sectionDesc, mapped []byte, view *fileView, d 
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(trRaw[0:4], dictV2Magic[:]) {
-		return errors.New("strata: invalid dict v2 magic")
+	if !bytes.Equal(trRaw[0:4], dictMagic[:]) {
+		return errors.New("strata: invalid dict magic")
 	}
 	dirCompLen := binary.LittleEndian.Uint32(trRaw[4:8])
 	dirCRC := binary.LittleEndian.Uint32(trRaw[12:16])
 	if uint64(dirCompLen)+16 > desc.length {
-		return errors.New("strata: invalid dict v2 directory length")
+		return errors.New("strata: invalid dict directory length")
 	}
 	dirOff := desc.offset + desc.length - 16 - uint64(dirCompLen)
 	dirComp, dirBuf, err := sectionBlockPooled(f, desc, dirOff, dirCompLen, mapped)
@@ -34,16 +34,16 @@ func decodeDictV2(f *osFile, desc sectionDesc, mapped []byte, view *fileView, d 
 		return err
 	}
 	if crc(dirComp) != dirCRC {
-		return errors.New("strata: dictionary v2 CRC mismatch")
+		return errors.New("strata: dictionary CRC mismatch")
 	}
 	raw, err := zstdDecompress(dirComp)
 	if err != nil {
 		return err
 	}
-	return parseDictV2Dir(raw, desc, view, d, series)
+	return parseDictDir(raw, desc, view, d, series)
 }
 
-func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary, series map[uint16]*Series) error {
+func parseDictDir(raw []byte, desc sectionDesc, view *fileView, d *dictionary, series map[uint16]*Series) error {
 	off := 0
 	sn, err := readDictUvarint(raw, &off)
 	if err != nil {
@@ -52,12 +52,12 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 	for range sn {
 		sid, err := readDictUint16(raw, &off)
 		if err != nil || off >= len(raw) {
-			return errors.New("strata: invalid dict v2 series")
+			return errors.New("strata: invalid dict series")
 		}
 		arity := raw[off]
 		off++
 		if arity < 1 || arity > 8 || off+16 > len(raw) {
-			return errors.New("strata: invalid dict v2 series arity")
+			return errors.New("strata: invalid dict series arity")
 		}
 		var c SeriesConfig
 		c.Arity = int(arity)
@@ -81,7 +81,7 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 		s.cfg, s.resetEpoch = c, epoch
 		rn, err := readDictUvarint(raw, &off)
 		if err != nil || rn > uint64(len(raw)-off)/24 {
-			return errors.New("strata: invalid dict v2 reset rules")
+			return errors.New("strata: invalid dict reset rules")
 		}
 		s.rules = make([]resetRule, rn)
 		for j := range s.rules {
@@ -107,7 +107,7 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 	for range inN {
 		sid, err := readDictUint16(raw, &off)
 		if err != nil || off >= len(raw) {
-			return errors.New("strata: invalid dict v2 inline dim")
+			return errors.New("strata: invalid dict inline dim")
 		}
 		dimIdx := raw[off]
 		off++
@@ -124,20 +124,20 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 			return err
 		}
 		if uint64(maxID) > uint64(len(raw)-off) {
-			return errors.New("strata: invalid dict v2 inline maxID")
+			return errors.New("strata: invalid dict inline maxID")
 		}
 		offs := make([]uint32, int(maxID)+2)
 		var cur uint32
 		for id := uint32(1); id <= maxID; id++ {
 			ln, err := readDictUvarint(raw, &off)
 			if err != nil || uint64(cur)+ln > uint64(arenaLen) {
-				return errors.New("strata: invalid dict v2 inline length")
+				return errors.New("strata: invalid dict inline length")
 			}
 			cur += uint32(ln)
 			offs[id+1] = cur
 		}
 		if cur != arenaLen || int(arenaLen) > len(raw)-off {
-			return errors.New("strata: truncated dict v2 inline arena")
+			return errors.New("strata: truncated dict inline arena")
 		}
 		arena := make([]byte, arenaLen)
 		copy(arena, raw[off:off+int(arenaLen)])
@@ -157,7 +157,7 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 	for range extN {
 		sid, err := readDictUint16(raw, &off)
 		if err != nil || off >= len(raw) {
-			return errors.New("strata: invalid dict v2 ext dim")
+			return errors.New("strata: invalid dict ext dim")
 		}
 		dimIdx := raw[off]
 		off++
@@ -179,7 +179,7 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 		}
 		fwdN, err := readDictUvarint(raw, &off)
 		if err != nil || fwdN > uint64(len(raw)-off) {
-			return errors.New("strata: invalid dict v2 fwd page count")
+			return errors.New("strata: invalid dict fwd page count")
 		}
 		fwdPages := make([]dictPageDesc, fwdN)
 		for j := range fwdPages {
@@ -207,7 +207,7 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 		}
 		sstN, err := readDictUvarint(raw, &off)
 		if err != nil || sstN > uint64(len(raw)-off) {
-			return errors.New("strata: invalid dict v2 sst block count")
+			return errors.New("strata: invalid dict sst block count")
 		}
 		firstArenaLen, err := readDictUint32(raw, &off)
 		if err != nil {
@@ -218,13 +218,13 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 		for j := range int(sstN) {
 			ln, err := readDictUvarint(raw, &off)
 			if err != nil || uint64(fcur)+ln > uint64(firstArenaLen) {
-				return errors.New("strata: invalid dict v2 sst firstKey length")
+				return errors.New("strata: invalid dict sst firstKey length")
 			}
 			fcur += uint32(ln)
 			firstOffs[j+1] = fcur
 		}
 		if fcur != firstArenaLen || int(firstArenaLen) > len(raw)-off {
-			return errors.New("strata: truncated dict v2 sst firstKeys")
+			return errors.New("strata: truncated dict sst firstKeys")
 		}
 		firstArena := make([]byte, firstArenaLen)
 		copy(firstArena, raw[off:off+int(firstArenaLen)])
@@ -272,7 +272,7 @@ func parseDictV2Dir(raw []byte, desc sectionDesc, view *fileView, d *dictionary,
 		}
 	}
 	if off != len(raw) {
-		return errors.New("strata: trailing dict v2 directory bytes")
+		return errors.New("strata: trailing dict directory bytes")
 	}
 	return nil
 }

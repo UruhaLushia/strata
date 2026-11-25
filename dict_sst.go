@@ -261,7 +261,7 @@ func writeExtDimMergedSST(tf *osFile, secStart, pos int64, secHash hash.Hash32, 
 	return w.pos, w.firstArena, w.firstOffs, w.blocks, nil
 }
 
-func encodeDictV2Dir(series []dictSeriesSnap, inline []dictDimCompactSnap, ext []writtenExtDim) []byte {
+func encodeDictDir(series []dictSeriesSnap, inline []dictDimCompactSnap, ext []writtenExtDim) []byte {
 	var b []byte
 	b = binary.AppendUvarint(b, uint64(len(series)))
 	for _, s := range series {

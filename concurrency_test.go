@@ -495,7 +495,7 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 			mutInlineID := db.dict.lookup(9, 2, "app-149")
 			db.mu.RUnlock()
 
-			if dictCodec != 2 || !hasExt0 || !hasExt1 || !inline2OK || mutID == 0 || mutInlineID == 0 {
+			if dictCodec != 1 || !hasExt0 || !hasExt1 || !inline2OK || mutID == 0 || mutInlineID == 0 {
 				t.Fatalf("unexpected dict layout: codec=%d ext0=%t ext1=%t inline2=%t mutID=%d mutInlineID=%d",
 					dictCodec, hasExt0, hasExt1, inline2OK, mutID, mutInlineID)
 			}

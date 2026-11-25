@@ -19,7 +19,7 @@ type dictPageDesc struct {
 }
 
 // dictExtDim holds immutable directory metadata for one high-cardinality external
-// dictionary dimension backed by SecTSDict codec=2.
+// dictionary dimension backed by SecTSDict.
 type dictExtDim struct {
 	series        uint16
 	dim           uint8

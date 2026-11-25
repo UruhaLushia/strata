@@ -9,7 +9,7 @@ const (
 	dictHotSlots       = 4096
 )
 
-var dictV2Magic = [4]byte{'S', 'D', 'T', '2'}
+var dictMagic = [4]byte{'S', 'D', 'T', '1'}
 
 type dictCacheKey struct {
 	series uint16

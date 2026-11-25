@@ -319,14 +319,16 @@ func TestRejectLegacyFormats(t *testing.T) {
 			if head.sections[secTSDict].length == 0 {
 				t.Fatal("expected non-empty SecTSDict")
 			}
-			head.sections[secTSDict].codec = 1
+			head.sections[secTSDict].codec = 2
 			head.gen++
 		})
 
 		ro, err := Open(path, Options{ReadOnly: true, Now: func() time.Time { return clock }})
 		if err == nil {
 			_ = ro.Close()
-			t.Fatal("expected Open to reject SecTSDict codec != 2")
+			t.Fatal("expected Open to reject SecTSDict codec != 1")
+		} else if !strings.Contains(err.Error(), "unsupported dictionary codec") {
+			t.Fatalf("unexpected error for invalid SecTSDict codec: %v", err)
 		}
 	})
 
@@ -725,8 +727,8 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 		if err := db.Compact(); err != nil {
 			t.Fatal(err)
 		}
-		if db.head.sections[secTSDict].codec != 2 {
-			t.Fatalf("expected dict codec=2, got %d", db.head.sections[secTSDict].codec)
+		if db.head.sections[secTSDict].codec != 1 {
+			t.Fatalf("expected dict codec=1, got %d", db.head.sections[secTSDict].codec)
 		}
 
 		s1Before, err := s1.DictStats()

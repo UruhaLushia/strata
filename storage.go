@@ -110,10 +110,10 @@ func (db *DB) loadLocked() error {
 		}
 	}
 	if d := db.head.sections[5]; d.length > 0 {
-		if d.codec != 2 {
+		if d.codec != 1 {
 			return errors.New("strata: unsupported dictionary codec")
 		}
-		if err := decodeDictV2(db.data, d, mapped, db.view, &db.dict, db.series); err != nil {
+		if err := decodeDict(db.data, d, mapped, db.view, &db.dict, db.series); err != nil {
 			return errors.New("strata: decode dictionary: " + err.Error())
 		}
 	}

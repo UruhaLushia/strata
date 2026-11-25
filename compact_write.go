@@ -295,7 +295,7 @@ func writeCompactFile(tf *osFile, plan *compactPlan) (int64, [12]sectionDesc, di
 			}
 		}
 		var dictDesc sectionDesc
-		pos, dictDesc, prunedDims, err = writeDictSectionV2(tf, pos, plan.dictSnap, plan.sourceView, mainEnc, liveBits)
+		pos, dictDesc, prunedDims, err = writeDictSection(tf, pos, plan.dictSnap, plan.sourceView, mainEnc, liveBits)
 		if err != nil {
 			return 0, ds, nil, nil, err
 		}

@@ -193,7 +193,7 @@ type writtenExtDim struct {
 	sstBlocks     []dictPageDesc
 }
 
-func writeDictSectionV2(tf *osFile, pos int64, snap *dictCompactSnap, sourceView *fileView, enc *zstd.Encoder, live dictLiveBits) (int64, sectionDesc, map[dictDimKey]bool, error) {
+func writeDictSection(tf *osFile, pos int64, snap *dictCompactSnap, sourceView *fileView, enc *zstd.Encoder, live dictLiveBits) (int64, sectionDesc, map[dictDimKey]bool, error) {
 	if snap == nil || (len(snap.series) == 0 && len(snap.dims) == 0) {
 		return pos, sectionDesc{}, nil, nil
 	}
@@ -250,7 +250,7 @@ func writeDictSectionV2(tf *osFile, pos int64, snap *dictCompactSnap, sourceView
 		}
 	}
 
-	dirRaw := encodeDictV2Dir(snap.series, inlineDims, extDims)
+	dirRaw := encodeDictDir(snap.series, inlineDims, extDims)
 	dirComp := enc.EncodeAll(dirRaw, nil)
 	if _, err := tf.WriteAt(dirComp, pos); err != nil {
 		return pos, sectionDesc{}, nil, err
@@ -259,7 +259,7 @@ func writeDictSectionV2(tf *osFile, pos int64, snap *dictCompactSnap, sourceView
 	pos += int64(len(dirComp))
 
 	var trailer [16]byte
-	copy(trailer[0:4], dictV2Magic[:])
+	copy(trailer[0:4], dictMagic[:])
 	binary.LittleEndian.PutUint32(trailer[4:8], uint32(len(dirComp)))
 	binary.LittleEndian.PutUint32(trailer[8:12], uint32(len(dirRaw)))
 	binary.LittleEndian.PutUint32(trailer[12:16], crc(dirComp))
@@ -270,7 +270,7 @@ func writeDictSectionV2(tf *osFile, pos int64, snap *dictCompactSnap, sourceView
 	pos += int64(len(trailer))
 
 	desc := sectionDesc{
-		kind: 5, codec: 2, count: 1,
+		kind: 5, codec: 1, count: 1,
 		offset: uint64(secStart), length: uint64(pos - secStart),
 		rawLen: uint32(len(dirRaw)), crc: secHash.Sum32(),
 	}

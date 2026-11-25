@@ -450,8 +450,8 @@ func TestExternalDictThreeTierPriority(t *testing.T) {
 	if err := db.Compact(); err != nil {
 		t.Fatal(err)
 	}
-	if db.head.sections[secTSDict].codec != 2 {
-		t.Fatalf("expected external dict codec=2, got %d", db.head.sections[secTSDict].codec)
+	if db.head.sections[secTSDict].codec != 1 {
+		t.Fatalf("expected external dict codec=1, got %d", db.head.sections[secTSDict].codec)
 	}
 
 	tailRows := make([]Row, 100)
