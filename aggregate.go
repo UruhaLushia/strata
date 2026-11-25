@@ -40,6 +40,10 @@ func (s *Series) aggregateWithDefaultWindow(ctx context.Context, q AggregateQuer
 	// Summary-only fast path: zero dict snapshot, zero file view, zero disk I/O, bypasses querySem.
 	if len(q.GroupDims) == 0 && len(q.Filters) == 0 {
 		db.mu.RLock()
+		if db.closed {
+			db.mu.RUnlock()
+			return nil, errors.New("strata: database is closed")
+		}
 		from, to, emptyWin, winErr := resolveTimeWindow(db, s.id, q.From, q.To, q.Window, q.AllTime, defaultWindow)
 		if winErr != nil {
 			db.mu.RUnlock()

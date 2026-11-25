@@ -7,33 +7,44 @@ import (
 )
 
 const (
-	dictMapThreshold   = 65536
-	dictPendingMaxKeys = 4096
+	dictMapThreshold         = 65536
+	dictSortedMergeThreshold = 64
 )
 
 type dictDim struct {
-	arena     []byte
-	offsets   []uint32
-	extra     map[uint32]string
-	tailBase  uint32
-	nextID    uint32
-	count     int
-	ext       *dictExtDim
-	revMu     sync.RWMutex
-	byKey     map[string]uint32
-	sorted    []uint32
-	pending   map[string]uint32
-	tailByKey map[string]uint32
-	hot       *dictHotCache
+	arena        []byte
+	offsets      []uint32
+	extra        map[uint32]string
+	tailBase     uint32
+	nextID       uint32
+	count        int
+	ext          *dictExtDim
+	revMu        sync.RWMutex
+	byKey        map[string]uint32
+	sorted       []uint32
+	sortedNextID uint32
+	tailByKey    map[string]uint32
+	hot          *dictHotCache
 }
 
 type dictDimSnap struct {
-	arena    []byte
-	offsets  []uint32
-	extra    map[uint32]string
-	tailBase uint32
-	nextID   uint32
-	ext      *dictExtDim
+	arena        []byte
+	offsets      []uint32
+	extra        map[uint32]string
+	tailBase     uint32
+	nextID       uint32
+	count        int
+	ext          *dictExtDim
+	sorted       []uint32
+	sortedNextID uint32
+}
+
+func hasExtraOverride(extra map[uint32]string, id uint32) bool {
+	if extra == nil {
+		return false
+	}
+	_, ok := extra[id]
+	return ok
 }
 
 type dictionary struct {
@@ -64,6 +75,21 @@ func newDictDim() *dictDim {
 	}
 }
 
+func (dim *dictDim) resolveArena(id uint32) string {
+	if dim == nil || id == 0 || id < dim.tailBase {
+		return ""
+	}
+	idx := int(id - dim.tailBase)
+	if idx < 0 || idx+1 >= len(dim.offsets) {
+		return ""
+	}
+	lo, hi := dim.offsets[idx], dim.offsets[idx+1]
+	if lo == hi {
+		return ""
+	}
+	return unsafe.String(&dim.arena[lo], hi-lo)
+}
+
 func (dim *dictDim) resolve(id uint32) string {
 	if dim == nil || id == 0 {
 		return ""
@@ -76,15 +102,22 @@ func (dim *dictDim) resolve(id uint32) string {
 	if dim.ext != nil && id < dim.tailBase {
 		return dim.ext.resolve(id)
 	}
-	idx := int(id - dim.tailBase)
-	if idx < 0 || idx+1 >= len(dim.offsets) {
+	return dim.resolveArena(id)
+}
+
+func (s *dictDimSnap) resolveArena(id uint32) string {
+	if id == 0 || id < s.tailBase {
 		return ""
 	}
-	lo, hi := dim.offsets[idx], dim.offsets[idx+1]
+	idx := int(id - s.tailBase)
+	if idx < 0 || idx+1 >= len(s.offsets) {
+		return ""
+	}
+	lo, hi := s.offsets[idx], s.offsets[idx+1]
 	if lo == hi {
 		return ""
 	}
-	return unsafe.String(&dim.arena[lo], hi-lo)
+	return unsafe.String(&s.arena[lo], hi-lo)
 }
 
 func (s *dictDimSnap) resolve(id uint32) string {
@@ -99,15 +132,7 @@ func (s *dictDimSnap) resolve(id uint32) string {
 	if s.ext != nil && id < s.tailBase {
 		return s.ext.resolve(id)
 	}
-	idx := int(id - s.tailBase)
-	if idx < 0 || idx+1 >= len(s.offsets) {
-		return ""
-	}
-	lo, hi := s.offsets[idx], s.offsets[idx+1]
-	if lo == hi {
-		return ""
-	}
-	return unsafe.String(&s.arena[lo], hi-lo)
+	return s.resolveArena(id)
 }
 
 func (dim *dictDim) appendValue(id uint32, value string) {
@@ -157,9 +182,6 @@ func (dim *dictDim) appendValue(id uint32, value string) {
 
 func (dim *dictDim) ensureReverseLocked() {
 	if dim.sorted != nil {
-		if dim.pending == nil {
-			dim.pending = make(map[string]uint32)
-		}
 		return
 	}
 	if dim.count > dictMapThreshold {
@@ -178,19 +200,40 @@ func (dim *dictDim) ensureReverseLocked() {
 }
 
 func (dim *dictDim) lookupLocked(value string) uint32 {
-	if dim.sorted != nil {
-		if id := dim.pending[value]; id != 0 {
+	for id, v := range dim.extra {
+		if v == value {
 			return id
 		}
+	}
+	if dim.sorted != nil {
 		idx := sort.Search(len(dim.sorted), func(i int) bool {
-			return dim.resolve(dim.sorted[i]) >= value
+			return dim.resolveArena(dim.sorted[i]) >= value
 		})
-		if idx < len(dim.sorted) && dim.resolve(dim.sorted[idx]) == value {
-			return dim.sorted[idx]
+		for i := idx; i < len(dim.sorted); i++ {
+			id := dim.sorted[i]
+			if dim.resolveArena(id) != value {
+				break
+			}
+			if hasExtraOverride(dim.extra, id) {
+				continue
+			}
+			return id
+		}
+		startID := max(dim.sortedNextID, uint32(1))
+		for id := startID; id < dim.nextID; id++ {
+			if hasExtraOverride(dim.extra, id) {
+				continue
+			}
+			if v := dim.resolveArena(id); len(v) == len(value) && v == value {
+				return id
+			}
 		}
 		return 0
 	}
-	return dim.byKey[value]
+	if id := dim.byKey[value]; id != 0 && !hasExtraOverride(dim.extra, id) {
+		return id
+	}
+	return 0
 }
 
 func (dim *dictDim) lookup(value string) uint32 {
@@ -228,6 +271,9 @@ func (d *dictionary) getDim(key dictDimKey) *dictDim {
 }
 
 func (d *dictionary) dimCount(series uint16, dimIdx uint8) int {
+	if d.snapshot && series == d.snapshotSeries && dimIdx < 8 {
+		return d.snapshotDims[dimIdx].count
+	}
 	if d.dims == nil {
 		return 0
 	}
@@ -270,9 +316,8 @@ func (d *dictionary) intern(series uint16, dimIdx uint8, value string) (uint32, 
 	}
 	dim.appendValue(id, value)
 	if dim.sorted != nil {
-		dim.pending[value] = id
-		if len(dim.pending) >= dictPendingMaxKeys {
-			dim.flushPendingIntoSorted()
+		if dim.nextID > dim.sortedNextID && dim.nextID-dim.sortedNextID >= dictSortedMergeThreshold {
+			dim.mergeTailIntoSorted()
 		}
 	} else if dim.count > dictMapThreshold {
 		dim.buildSorted()
@@ -287,29 +332,43 @@ func (d *dictionary) apply(e dictEntry) {
 		return
 	}
 	dim := d.getDim(dictDimKey{series: e.series, dim: e.dim})
+	isNewTail := e.id >= dim.nextID
+	prev := ""
+	if !isNewTail && dim.byKey != nil {
+		prev = dim.resolve(e.id)
+	}
 	dim.appendValue(e.id, e.value)
 	if dim.ext != nil {
-		if dim.tailByKey == nil {
-			dim.tailByKey = make(map[string]uint32)
+		if isNewTail && e.value != "" {
+			if dim.tailByKey == nil {
+				dim.tailByKey = make(map[string]uint32)
+			}
+			dim.tailByKey[e.value] = e.id
 		}
-		dim.tailByKey[e.value] = e.id
 		return
 	}
 	if dim.sorted != nil {
-		dim.pending[e.value] = e.id
-		if len(dim.pending) >= dictPendingMaxKeys {
-			dim.flushPendingIntoSorted()
+		if dim.nextID > dim.sortedNextID && dim.nextID-dim.sortedNextID >= dictSortedMergeThreshold {
+			dim.mergeTailIntoSorted()
 		}
 	} else if dim.byKey != nil {
 		if dim.count > dictMapThreshold {
 			dim.buildSorted()
 		} else {
-			dim.byKey[e.value] = e.id
+			if prev != "" && prev != e.value && dim.byKey[prev] == e.id {
+				delete(dim.byKey, prev)
+			}
+			if e.value != "" {
+				dim.byKey[e.value] = e.id
+			}
 		}
 	}
 }
 
 func (d *dictionary) lookup(series uint16, dimIdx uint8, value string) uint32 {
+	if d.snapshot && series == d.snapshotSeries && dimIdx < 8 {
+		return d.snapshotDims[dimIdx].lookup(value)
+	}
 	if d.dims == nil {
 		return 0
 	}

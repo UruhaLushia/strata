@@ -1,6 +1,7 @@
 package strata
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"slices"
@@ -52,75 +53,147 @@ func readDictInt64(raw []byte, off *int) (int64, error) {
 	return int64(value), err
 }
 
-func (d *dictionary) matchPrefixIDs(series uint16, dimIdx uint8, prefix string, dst []uint32) []uint32 {
-	dim := d.dims[dictDimKey{series: series, dim: dimIdx}]
-	if dim == nil || dim.count == 0 {
-		return dst
+func (s *dictDimSnap) lookup(value string) uint32 {
+	if (s.count == 0 && len(s.extra) == 0) || value == "" {
+		return 0
 	}
-	if dim.ext != nil {
-		dst = dim.ext.matchPrefixSST(prefix, dim.extra, dst)
-		for v, id := range dim.tailByKey {
-			if strings.HasPrefix(v, prefix) {
-				dst = append(dst, id)
+	for id, v := range s.extra {
+		if v == value {
+			return id
+		}
+	}
+	if s.ext != nil {
+		for id := s.tailBase; id < s.nextID; id++ {
+			if hasExtraOverride(s.extra, id) {
+				continue
+			}
+			if v := s.resolveArena(id); len(v) == len(value) && v == value {
+				return id
 			}
 		}
-		for id, v := range dim.extra {
-			if strings.HasPrefix(v, prefix) {
-				dst = append(dst, id)
-			}
+		if id := s.ext.lookupSST(value); id != 0 && !hasExtraOverride(s.extra, id) {
+			return id
 		}
-		return dst
+		return 0
 	}
-	dim.revMu.RLock()
-	if dim.sorted != nil {
-		idx := sort.Search(len(dim.sorted), func(i int) bool {
-			return dim.resolve(dim.sorted[i]) >= prefix
+	if s.sorted != nil {
+		idx := sort.Search(len(s.sorted), func(i int) bool {
+			return s.resolveArena(s.sorted[i]) >= value
 		})
-		for i := idx; i < len(dim.sorted); i++ {
-			id := dim.sorted[i]
-			if !strings.HasPrefix(dim.resolve(id), prefix) {
+		for i := idx; i < len(s.sorted); i++ {
+			id := s.sorted[i]
+			if s.resolveArena(id) != value {
 				break
+			}
+			if hasExtraOverride(s.extra, id) {
+				continue
+			}
+			return id
+		}
+		startID := max(s.sortedNextID, uint32(1))
+		for id := startID; id < s.nextID; id++ {
+			if hasExtraOverride(s.extra, id) {
+				continue
+			}
+			if v := s.resolveArena(id); len(v) == len(value) && v == value {
+				return id
+			}
+		}
+		return 0
+	}
+	for id := uint32(1); id < s.nextID; id++ {
+		if hasExtraOverride(s.extra, id) {
+			continue
+		}
+		if v := s.resolveArena(id); len(v) == len(value) && v == value {
+			return id
+		}
+	}
+	return 0
+}
+
+func (s *dictDimSnap) matchPrefixIDs(prefix string, dst []uint32) []uint32 {
+	if s.count == 0 && len(s.extra) == 0 {
+		return dst
+	}
+	if s.ext != nil {
+		dst = s.ext.matchPrefixSST(prefix, s.extra, dst)
+		for id := s.tailBase; id < s.nextID; id++ {
+			if hasExtraOverride(s.extra, id) {
+				continue
+			}
+			if v := s.resolveArena(id); v != "" && strings.HasPrefix(v, prefix) {
+				dst = append(dst, id)
+			}
+		}
+		for id, v := range s.extra {
+			if v != "" && strings.HasPrefix(v, prefix) {
+				dst = append(dst, id)
+			}
+		}
+		return dst
+	}
+	if s.sorted != nil {
+		idx := sort.Search(len(s.sorted), func(i int) bool {
+			return s.resolveArena(s.sorted[i]) >= prefix
+		})
+		for i := idx; i < len(s.sorted); i++ {
+			id := s.sorted[i]
+			if !strings.HasPrefix(s.resolveArena(id), prefix) {
+				break
+			}
+			if hasExtraOverride(s.extra, id) {
+				continue
 			}
 			dst = append(dst, id)
 		}
-		for v, id := range dim.pending {
-			if strings.HasPrefix(v, prefix) {
+		startID := max(s.sortedNextID, uint32(1))
+		for id := startID; id < s.nextID; id++ {
+			if hasExtraOverride(s.extra, id) {
+				continue
+			}
+			if v := s.resolveArena(id); v != "" && strings.HasPrefix(v, prefix) {
 				dst = append(dst, id)
 			}
 		}
-		dim.revMu.RUnlock()
+		for id, v := range s.extra {
+			if v != "" && strings.HasPrefix(v, prefix) {
+				dst = append(dst, id)
+			}
+		}
 		return dst
 	}
-	dim.revMu.RUnlock()
-	for id := uint32(1); id < dim.nextID; id++ {
-		if v := dim.resolve(id); v != "" && strings.HasPrefix(v, prefix) {
+	for id := uint32(1); id < s.nextID; id++ {
+		if v := s.resolve(id); v != "" && strings.HasPrefix(v, prefix) {
 			dst = append(dst, id)
 		}
 	}
 	return dst
 }
 
-func (d *dictionary) matchScanIDs(series uint16, dimIdx uint8, op TagOp, target string, dst []uint32) []uint32 {
-	dim := d.dims[dictDimKey{series: series, dim: dimIdx}]
-	if dim == nil || dim.count == 0 {
+func (s *dictDimSnap) matchScanIDs(op TagOp, target string, dst []uint32) []uint32 {
+	if s.count == 0 && len(s.extra) == 0 {
 		return dst
 	}
-	if dim.ext != nil {
-		dst = dim.ext.matchScanFwd(op, target, dim.extra, dst)
-		for id := dim.tailBase; id < dim.nextID; id++ {
-			if v := dim.resolve(id); v != "" && tagMatches(op, v, target) {
+	if s.ext != nil {
+		dst = s.ext.matchScanFwd(op, target, s.extra, dst)
+		for id := s.tailBase; id < s.nextID; id++ {
+			if hasExtraOverride(s.extra, id) {
+				continue
+			}
+			if v := s.resolveArena(id); v != "" && tagMatches(op, v, target) {
 				dst = append(dst, id)
 			}
 		}
-		for id, v := range dim.extra {
-			if id < dim.tailBase && v != "" && tagMatches(op, v, target) {
+		for id, v := range s.extra {
+			if v != "" && tagMatches(op, v, target) {
 				dst = append(dst, id)
 			}
 		}
 		return dst
 	}
-	for id := uint32(1); id < dim.nextID; id++ {
-		if v := dim.resolve(id); v != "" && tagMatches(op, v, target) {
+	for id := uint32(1); id < s.nextID; id++ {
+		if v := s.resolve(id); v != "" && tagMatches(op, v, target) {
 			dst = append(dst, id)
 		}
 	}
@@ -145,45 +218,47 @@ func (dim *dictDim) buildSorted() {
 	dim.byKey = nil
 	ids := make([]uint32, 0, dim.count)
 	for id := uint32(1); id < dim.nextID; id++ {
-		if dim.resolve(id) != "" {
+		if dim.resolveArena(id) != "" {
 			ids = append(ids, id)
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		return dim.resolve(ids[i]) < dim.resolve(ids[j])
+	slices.SortFunc(ids, func(a, b uint32) int {
+		return cmp.Compare(dim.resolveArena(a), dim.resolveArena(b))
 	})
 	dim.sorted = ids
-	if dim.pending == nil {
-		dim.pending = make(map[string]uint32)
-	} else {
-		clear(dim.pending)
-	}
+	dim.sortedNextID = dim.nextID
 }
 
-func (dim *dictDim) flushPendingIntoSorted() {
-	if len(dim.pending) == 0 {
+func (dim *dictDim) mergeTailIntoSorted() {
+	if dim.sorted == nil || dim.nextID <= dim.sortedNextID {
 		return
 	}
-	added := make([]uint32, 0, len(dim.pending))
-	for _, id := range dim.pending {
-		added = append(added, id)
-	}
-	sort.Slice(added, func(i, j int) bool {
-		return dim.resolve(added[i]) < dim.resolve(added[j])
-	})
-	merged := make([]uint32, 0, len(dim.sorted)+len(added))
-	i, j := 0, 0
-	for i < len(dim.sorted) && j < len(added) {
-		if dim.resolve(added[j]) < dim.resolve(dim.sorted[i]) {
-			merged = append(merged, added[j])
-			j++
-		} else {
-			merged = append(merged, dim.sorted[i])
-			i++
+	startID := max(dim.sortedNextID, uint32(1))
+	added := make([]uint32, 0, int(dim.nextID-startID))
+	for id := startID; id < dim.nextID; id++ {
+		if dim.resolveArena(id) != "" {
+			added = append(added, id)
 		}
 	}
+	if len(added) == 0 {
+		dim.sortedNextID = dim.nextID
+		return
+	}
+	slices.SortFunc(added, func(a, b uint32) int {
+		return cmp.Compare(dim.resolveArena(a), dim.resolveArena(b))
+	})
+	merged := make([]uint32, 0, len(dim.sorted)+len(added))
+	i := 0
+	for _, id := range added {
+		val := dim.resolveArena(id)
+		pos := sort.Search(len(dim.sorted)-i, func(k int) bool {
+			return dim.resolveArena(dim.sorted[i+k]) >= val
+		})
+		merged = append(merged, dim.sorted[i:i+pos]...)
+		merged = append(merged, id)
+		i += pos
+	}
 	merged = append(merged, dim.sorted[i:]...)
-	merged = append(merged, added[j:]...)
 	dim.sorted = merged
-	clear(dim.pending)
+	dim.sortedNextID = dim.nextID
 }

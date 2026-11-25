@@ -27,8 +27,11 @@ func readInvertChunkFrom(f *osFile, desc sectionDesc, mapped []byte, chunk inver
 	return readInvertChunkFromSlot(f, desc, mapped, chunk, nil)
 }
 
-func (db *DB) readInvertChunkSlot(index int, slot *querySlot) ([]byte, error) {
-	return readInvertChunkFromSlot(db.data, db.head.sections[secTSInvert], db.mappedBytes(), db.invert[index], slot)
+func readInvertChunkFromView(view *fileView, desc sectionDesc, chunk invertChunkMeta, slot *querySlot) ([]byte, error) {
+	if view == nil || view.data == nil {
+		return nil, errors.New("strata: missing file view")
+	}
+	return readInvertChunkFromSlot(view.data, desc, view.mappedBytes(), chunk, slot)
 }
 
 func decodeInvertRecordBody(plain []byte, off *int, k uint64, mode byte, match bool, onPosting func(key uint64, blockID uint32), onDense func(key uint64)) error {

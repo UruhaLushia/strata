@@ -15,10 +15,10 @@ type compiledFilter struct {
 	bits     []uint64
 }
 
-func compileFilters(db *DB, series uint16, filters []Filter) []compiledFilter {
+func compileFiltersSnap(dict dictionary, series uint16, filters []Filter) []compiledFilter {
 	out := make([]compiledFilter, len(filters))
 	for i, filter := range filters {
-		ids := db.matchingTagIDs(series, filter)
+		ids := matchingTagIDsSnap(dict, series, filter)
 		compiled := compiledFilter{dim: filter.Dim, negate: filter.Negate, ids: ids}
 		switch {
 		case len(ids) == 1:

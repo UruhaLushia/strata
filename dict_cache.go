@@ -216,53 +216,46 @@ func (c *dictHotCache) put(value string, id uint32) {
 }
 
 func (dim *dictDim) lookupExt(value string) uint32 {
-	if id := dim.tailByKey[value]; id != 0 {
-		return id
-	}
 	for id, v := range dim.extra {
 		if v == value {
 			return id
 		}
 	}
+	if id := dim.tailByKey[value]; id != 0 && !hasExtraOverride(dim.extra, id) {
+		return id
+	}
 	dim.revMu.RLock()
 	id := dim.hot.get(value)
 	dim.revMu.RUnlock()
-	if id != 0 {
+	if id != 0 && !hasExtraOverride(dim.extra, id) {
 		return id
 	}
-	if id = dim.ext.lookupSST(value); id != 0 {
-		if dim.extra != nil {
-			if v, ok := dim.extra[id]; ok && v != value {
-				return 0
-			}
-		}
+	if id = dim.ext.lookupSST(value); id != 0 && !hasExtraOverride(dim.extra, id) {
 		return id
 	}
 	return 0
 }
 
 func (d *dictionary) internExt(dim *dictDim, value string) (uint32, bool) {
-	if id := dim.tailByKey[value]; id != 0 {
-		return id, false
-	}
 	for id, v := range dim.extra {
 		if v == value {
 			return id, false
 		}
 	}
-	if id := dim.hot.get(value); id != 0 {
+	if id := dim.tailByKey[value]; id != 0 && !hasExtraOverride(dim.extra, id) {
 		return id, false
 	}
-	if id := dim.ext.lookupSST(value); id != 0 {
-		if dim.extra == nil || dim.extra[id] == "" || dim.extra[id] == value {
-			dim.revMu.Lock()
-			if dim.hot == nil {
-				dim.hot = newDictHotCache(d.hotBudget)
-			}
-			dim.hot.put(value, id)
-			dim.revMu.Unlock()
-			return id, false
+	if id := dim.hot.get(value); id != 0 && !hasExtraOverride(dim.extra, id) {
+		return id, false
+	}
+	if id := dim.ext.lookupSST(value); id != 0 && !hasExtraOverride(dim.extra, id) {
+		dim.revMu.Lock()
+		if dim.hot == nil {
+			dim.hot = newDictHotCache(d.hotBudget)
 		}
+		dim.hot.put(value, id)
+		dim.revMu.Unlock()
+		return id, false
 	}
 	id := dim.nextID
 	dim.appendValue(id, value)

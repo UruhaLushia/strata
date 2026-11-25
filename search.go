@@ -90,23 +90,14 @@ func searchBounds(db *DB, series uint16) (int64, int64) {
 	return minTS, maxTS
 }
 
-func (db *DB) seriesSealedCount(series uint16) int {
-	n := 0
-	for key, indexes := range db.sealedByRes {
-		if key.series == series {
-			n += len(indexes)
-		}
-	}
-	return n
-}
+func searchCandidatesSnap(snap *querySnapshot, filters []Filter, compiled []compiledFilter, hasLiveCandidate bool, slot *querySlot) (*blockBitmap, bool, error) {
+	series := snap.series.id
+	seriesBlocks := len(snap.fineAll) + len(snap.hourAll) + len(snap.dayAll)
+	totalSealed := len(snap.sealed)
+	invertSec := snap.head.sections[secTSInvert]
 
-func (db *DB) searchCandidatesCompiled(series uint16, filters []Filter, compiled []compiledFilter, slot *querySlot) (*blockBitmap, uint64, bool, bool, error) {
 	var sealed *blockBitmap
-	var liveMask uint64
-	useLiveMask := !db.livePostingsOverflow && !db.policy.constrained && len(db.live) > 0
 	initializedSealed := false
-	initializedLive := false
-	seriesBlocks := db.seriesSealedCount(series)
 
 	for i, f := range filters {
 		if f.Negate {
@@ -114,15 +105,15 @@ func (db *DB) searchCandidatesCompiled(series uint16, filters []Filter, compiled
 		}
 		ids := compiled[i].ids
 		if len(ids) == 0 {
-			return nil, 0, false, true, nil
+			return nil, true, nil
 		}
-		totalTags := db.dict.dimCount(series, uint8(f.Dim))
+		totalTags := snap.dict.dimCount(series, uint8(f.Dim))
 		if totalTags > 0 && len(ids)*5 >= totalTags*4 {
 			continue
 		}
-		unionBits, denseSealed, err := db.unionInvertBitmap(series, uint8(f.Dim), ids, seriesBlocks, len(db.sealed), slot)
+		unionBits, denseSealed, err := unionInvertBitmapSnap(snap.view, invertSec, snap.invert, series, uint8(f.Dim), ids, seriesBlocks, totalSealed, slot)
 		if err != nil {
-			return nil, 0, false, false, err
+			return nil, false, err
 		}
 		if !denseSealed {
 			if !initializedSealed {
@@ -132,39 +123,25 @@ func (db *DB) searchCandidatesCompiled(series uint16, filters []Filter, compiled
 				sealed.intersect(unionBits)
 			}
 		}
-		if useLiveMask {
-			dk := dictDimKey{series: series, dim: uint8(f.Dim)}
-			if db.liveSkipDims[dk] {
-				useLiveMask = false
-			} else {
-				var unionLive uint64
-				for _, id := range ids {
-					unionLive |= db.livePostings[encodeInvertKey(invertKey{series: series, dim: uint8(f.Dim), tag: id})]
-				}
-				if !initializedLive {
-					liveMask = unionLive
-					initializedLive = true
-				} else {
-					liveMask &= unionLive
-				}
+		if initializedSealed && sealed.count == 0 {
+			if !hasLiveCandidate {
+				return nil, true, nil
 			}
+			break
 		}
-		if initializedSealed && sealed.count == 0 && (len(db.live) == 0 || (useLiveMask && initializedLive && liveMask == 0)) {
-			return nil, 0, false, true, nil
-		}
-	}
-	if !initializedLive {
-		useLiveMask = false
 	}
 	if !initializedSealed {
-		return nil, liveMask, useLiveMask, false, nil
+		if seriesBlocks == 0 && !hasLiveCandidate {
+			return nil, true, nil
+		}
+		return nil, false, nil
 	}
-	return sealed, liveMask, useLiveMask, false, nil
+	return sealed, false, nil
 }
 
-func (db *DB) unionInvertBitmap(series uint16, dim uint8, tags []uint32, seriesBlocks, totalSealed int, slot *querySlot) (*blockBitmap, bool, error) {
+func unionInvertBitmapSnap(view *fileView, invertSec sectionDesc, invert []invertChunkMeta, series uint16, dim uint8, tags []uint32, seriesBlocks, totalSealed int, slot *querySlot) (*blockBitmap, bool, error) {
 	bm := newBlockBitmap(totalSealed)
-	if len(db.invert) == 0 || totalSealed == 0 {
+	if len(invert) == 0 || totalSealed == 0 {
 		return bm, false, nil
 	}
 	threshold := 0
@@ -173,16 +150,16 @@ func (db *DB) unionInvertBitmap(series uint16, dim uint8, tags []uint32, seriesB
 	}
 	prefixKey := uint64(series)<<40 | uint64(dim)<<32
 	for start := 0; start < len(tags); {
-		index := invertChunkIndex(db.invert, prefixKey|uint64(tags[start]))
+		index := invertChunkIndex(invert, prefixKey|uint64(tags[start]))
 		if index < 0 {
 			start++
 			continue
 		}
 		end := start + 1
-		for end < len(tags) && invertChunkIndex(db.invert, prefixKey|uint64(tags[end])) == index {
+		for end < len(tags) && invertChunkIndex(invert, prefixKey|uint64(tags[end])) == index {
 			end++
 		}
-		plain, err := db.readInvertChunkSlot(index, slot)
+		plain, err := readInvertChunkFromView(view, invertSec, invert[index], slot)
 		if err != nil {
 			return nil, false, err
 		}
@@ -203,22 +180,22 @@ func (db *DB) unionInvertBitmap(series uint16, dim uint8, tags []uint32, seriesB
 	return bm, false, nil
 }
 
-func (db *DB) matchingTagIDs(series uint16, f Filter) []uint32 {
-	if f.Dim < 0 || f.Dim >= 8 {
+func matchingTagIDsSnap(d dictionary, series uint16, f Filter) []uint32 {
+	if !d.snapshot || series != d.snapshotSeries || f.Dim < 0 || f.Dim >= 8 {
 		return nil
 	}
-	dimIdx := uint8(f.Dim)
+	dimSnap := &d.snapshotDims[f.Dim]
 	ids := make([]uint32, 0)
 	for _, value := range f.Values {
 		switch f.Op {
 		case TagEq:
-			if id := db.dict.lookup(series, dimIdx, value); id != 0 {
+			if id := dimSnap.lookup(value); id != 0 {
 				ids = append(ids, id)
 			}
 		case TagPrefix:
-			ids = db.dict.matchPrefixIDs(series, dimIdx, value, ids)
+			ids = dimSnap.matchPrefixIDs(value, ids)
 		default:
-			ids = db.dict.matchScanIDs(series, dimIdx, f.Op, value, ids)
+			ids = dimSnap.matchScanIDs(f.Op, value, ids)
 		}
 	}
 	return dedupeUint32(ids)

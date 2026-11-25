@@ -40,81 +40,63 @@ func (p *preparedQuery) release() {
 
 func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts queryOptions, slot *querySlot) (preparedQuery, error) {
 	var pq preparedQuery
-	db.mu.RLock()
-	var planFrom int64
-	if ws.fixed {
-		pq.from, pq.to, planFrom = ws.fixedFrom, ws.fixedTo, ws.fixedPlanFrom
-		if pq.to <= pq.from || planFrom >= pq.to {
-			db.mu.RUnlock()
-			pq.empty = true
-			return pq, nil
-		}
-	} else {
-		var emptyWin bool
-		var err error
-		pq.from, pq.to, emptyWin, err = resolveTimeWindow(db, s.id, ws.from, ws.to, ws.window, ws.allTime, ws.defaultWindow)
-		if err != nil {
-			db.mu.RUnlock()
-			return pq, err
-		}
-		if emptyWin {
-			db.mu.RUnlock()
-			pq.empty = true
-			return pq, nil
-		}
-		planFrom = pq.from
+	snap, planFrom, empty, err := captureQuerySnapshot(db, s, ws, filters)
+	if err != nil {
+		return pq, err
 	}
+	pq.from, pq.to = snap.from, snap.to
+	if empty {
+		pq.empty = true
+		return pq, nil
+	}
+	releaseSnap := true
+	defer func() {
+		if releaseSnap {
+			snap.release()
+		}
+	}()
+
 	pq.qres = queryResult{
 		RequestedFrom: time.Unix(planFrom, 0).UTC(), RequestedTo: time.Unix(pq.to, 0).UTC(),
 		EffectiveFrom: time.Unix(planFrom, 0).UTC(), EffectiveTo: time.Unix(pq.to, 0).UTC(),
 		Exact: true,
 	}
+
 	var sealedBits *blockBitmap
-	var liveMask uint64
-	var useLiveMask bool
 	if len(filters) > 0 {
-		for _, f := range filters {
-			if !f.Negate && (f.Dim < 0 || f.Dim >= s.cfg.Arity) {
-				db.mu.RUnlock()
+		compiled := compileFiltersSnap(snap.dict, snap.series.id, filters)
+		ordered, orderedCompiled := orderCompiledFilters(filters, compiled)
+		for i, f := range ordered {
+			if !f.Negate && len(orderedCompiled[i].ids) == 0 {
 				pq.empty = true
 				return pq, nil
 			}
 		}
-		compiled := compileFilters(db, s.id, filters)
-		ordered, orderedCompiled := orderCompiledFilters(filters, compiled)
-		var empty bool
-		var err error
-		sealedBits, liveMask, useLiveMask, empty, err = db.searchCandidatesCompiled(s.id, ordered, orderedCompiled, slot)
+		hasLiveCandidate := filterLiveCandidates(snap.liveFine, orderedCompiled)
+		var emptyCand bool
+		sealedBits, emptyCand, err = searchCandidatesSnap(&snap, ordered, orderedCompiled, hasLiveCandidate, slot)
 		if err != nil {
-			db.mu.RUnlock()
-			return pq, err
+			return preparedQuery{}, err
 		}
-		if empty {
-			db.mu.RUnlock()
+		if emptyCand {
 			pq.empty = true
 			return pq, nil
 		}
 		pq.compiled = orderedCompiled
 		pq.qres.sparse = true
 	}
-	pq.sources = buildQuerySourcesLocked(db, s, planFrom, pq.to, sealedBits, liveMask, useLiveMask, true)
-	pq.execDB = &DB{dict: dictionarySnapshot(db.dict, s.id), opts: db.opts, policy: db.policy}
-	pq.execSeries = *s
-	pq.execSeries.rules = pq.sources.fine.rules
-	if db.view != nil {
-		pq.view = db.view.acquire()
-		pq.execDB.data, pq.execDB.mapped, pq.execDB.head, pq.execDB.view = pq.view.data, pq.view.mapped, db.head, pq.view
-	} else {
-		pq.execDB.head = db.head
-	}
-	db.mu.RUnlock()
+
+	pq.sources = buildQuerySourcesFromSnap(&snap, planFrom, pq.to, sealedBits)
+	pq.execSeries = snap.series
+	pq.execDB = snap.buildExecDB()
 
 	plans, err := planQuerySlots(&pq.qres, planFrom, pq.to, pq.sources, &pq.execSeries, opts)
 	if err != nil {
-		pq.release()
 		return preparedQuery{}, err
 	}
 	pq.plans = plans
+	pq.view = snap.view
+	releaseSnap = false
 	return pq, nil
 }
 
