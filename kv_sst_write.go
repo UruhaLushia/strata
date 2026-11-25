@@ -160,19 +160,27 @@ func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, 
 		index = binary.LittleEndian.AppendUint64(index, b.maxRev)
 		index = binary.LittleEndian.AppendUint64(index, uint64(pos))
 		index = binary.LittleEndian.AppendUint32(index, uint32(len(b.raw)))
-		index = binary.LittleEndian.AppendUint32(index, uint32(len(b.raw)))
 		index = binary.LittleEndian.AppendUint32(index, crc(b.raw))
 		pos += int64(len(b.raw))
 	}
 	desc[0] = sectionDesc{kind: secKVSSTBlocks, codec: 1, count: uint32(len(blocks)), offset: uint64(start), length: uint64(pos - start), rawLen: rawAllLen, crc: blockHash.Sum32()}
 	idxStart := pos
-	if _, err := f.WriteAt(index, pos); err != nil {
-		return 0, desc, blobDesc, err
-	}
 	idxFlags := kvFlagTTLChecked
 	if hasLiveTTL {
 		idxFlags |= kvFlagHasLiveTTL
 	}
-	desc[2] = sectionDesc{kind: secKVSSTIndex, flags: idxFlags, count: uint32(len(blocks)), offset: uint64(idxStart), length: uint64(len(index)), rawLen: uint32(len(index)), crc: crc(index)}
-	return pos + int64(len(index)), desc, blobDesc, nil
+	out := index
+	var idxCodec uint8
+	if comp := enc.EncodeAll(index, nil); len(comp) < len(index) {
+		out = comp
+		idxCodec = 1
+	}
+	if _, err := f.WriteAt(out, pos); err != nil {
+		return 0, desc, blobDesc, err
+	}
+	desc[2] = sectionDesc{
+		kind: secKVSSTIndex, codec: idxCodec, flags: idxFlags, count: uint32(len(blocks)),
+		offset: uint64(idxStart), length: uint64(len(out)), rawLen: uint32(len(index)), crc: crc(out),
+	}
+	return pos + int64(len(out)), desc, blobDesc, nil
 }

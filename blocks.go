@@ -17,6 +17,7 @@ var (
 )
 
 const streamFlagUnsorted byte = 1
+const tsIndexEntryBytes = 80
 
 func encodeBlockWithEncoder(b sealedBlock, enc *zstd.Encoder) ([]byte, error) {
 	raw := make([]byte, 0, 64+len(b.rows)*73)
@@ -230,26 +231,26 @@ func decodeBlocks(f *osFile, s superblock, mapped []byte) ([]sealedMeta, error) 
 	if idxd.count == 0 || len(idxraw)%int(idxd.count) != 0 {
 		return nil, errors.New("strata: invalid TS index")
 	}
-	if len(idxraw)/int(idxd.count) != 104 {
+	if len(idxraw)/int(idxd.count) != tsIndexEntryBytes {
 		return nil, errors.New("strata: invalid TS index entry size")
 	}
-	out := make([]sealedMeta, 0, len(idxraw)/104)
-	for i := 0; i < len(idxraw); i += 104 {
-		p := idxraw[i : i+104]
+	out := make([]sealedMeta, 0, len(idxraw)/tsIndexEntryBytes)
+	for i := 0; i < len(idxraw); i += tsIndexEntryBytes {
+		p := idxraw[i : i+tsIndexEntryBytes]
 		m := sealedMeta{
-			series:   binary.LittleEndian.Uint16(p),
+			series:   binary.LittleEndian.Uint16(p[0:2]),
 			res:      p[2],
+			mask:     p[3],
+			length:   binary.LittleEndian.Uint32(p[4:8]),
 			start:    int64(binary.LittleEndian.Uint64(p[8:16])),
-			epoch:    binary.LittleEndian.Uint64(p[24:32]),
-			offset:   binary.LittleEndian.Uint64(p[32:40]),
-			length:   binary.LittleEndian.Uint32(p[40:44]),
-			crc:      binary.LittleEndian.Uint32(p[48:52]),
-			order:    binary.LittleEndian.Uint64(p[52:60]),
-			rowCount: binary.LittleEndian.Uint32(p[60:64]),
-			mask:     p[64],
+			epoch:    binary.LittleEndian.Uint64(p[16:24]),
+			offset:   binary.LittleEndian.Uint64(p[24:32]),
+			order:    binary.LittleEndian.Uint64(p[32:40]),
+			crc:      binary.LittleEndian.Uint32(p[40:44]),
+			rowCount: binary.LittleEndian.Uint32(p[44:48]),
 		}
 		for j := range m.values {
-			m.values[j] = int64(binary.LittleEndian.Uint64(p[65+j*8 : 73+j*8]))
+			m.values[j] = int64(binary.LittleEndian.Uint64(p[48+j*8 : 56+j*8]))
 		}
 		out = append(out, m)
 	}

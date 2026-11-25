@@ -151,6 +151,14 @@ func (c *blockColCache) load(idx int) (decodedCol, error) {
 	if int(d.rawLen) != expected {
 		return decodedCol{}, errors.New("strata: invalid column stream payload")
 	}
+	if d.flags&streamFlagRaw != 0 {
+		if end-start != expected {
+			return decodedCol{}, errors.New("strata: invalid column stream length")
+		}
+		col := decodedCol{mode: d.mode, width: d.width, data: c.view.plain[start:end], loaded: true}
+		c.cols[idx], c.cached[idx] = col, true
+		return col, nil
+	}
 	if c.arenaUsed+expected <= c.arenaCap {
 		off := c.arenaUsed
 		dst := c.arena[off : off : off+expected]

@@ -60,7 +60,7 @@ func parseColumnarBlock(raw []byte) (columnarBlockView, error) {
 			view.unsorted = true
 		}
 		view.descs[i] = columnStreamDesc{
-			mode: p[0], width: p[1], value: binary.LittleEndian.Uint64(p[4:12]),
+			mode: p[0], width: p[1], flags: p[2], value: binary.LittleEndian.Uint64(p[4:12]),
 			offset: binary.LittleEndian.Uint32(p[12:16]), length: binary.LittleEndian.Uint32(p[16:20]),
 			rawLen: binary.LittleEndian.Uint32(p[20:24]),
 		}
@@ -83,6 +83,12 @@ func decodeStreamColInto(view columnarBlockView, idx int, slot *querySlot) (deco
 	expected := view.count * int(desc.width)
 	if int(desc.rawLen) != expected {
 		return decodedCol{}, errors.New("strata: invalid column stream payload")
+	}
+	if desc.flags&streamFlagRaw != 0 {
+		if end-start != expected {
+			return decodedCol{}, errors.New("strata: invalid column stream length")
+		}
+		return decodedCol{mode: desc.mode, width: desc.width, data: view.plain[start:end], loaded: true}, nil
 	}
 	plain, err := slot.decodeZstd(view.plain[start:end])
 	if err != nil {

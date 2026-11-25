@@ -200,26 +200,24 @@ func (w *compactBlockWriter) finalizeIndex() ([]byte, uint32, []uint32, map[uint
 	})
 	writeToFinal := make([]uint32, n)
 	seriesBlocks := make(map[uint16]uint32, len(w.passSeriesCount)+4)
-	idx := make([]byte, n*104)
+	idx := make([]byte, n*tsIndexEntryBytes)
 	for finalID, writeID := range order {
 		writeToFinal[writeID] = uint32(finalID)
 		m := w.metas[writeID]
 		seriesBlocks[m.series]++
-		entry := idx[finalID*104 : (finalID+1)*104]
+		entry := idx[finalID*tsIndexEntryBytes : (finalID+1)*tsIndexEntryBytes]
 		binary.LittleEndian.PutUint16(entry[0:2], m.series)
 		entry[2] = m.res
+		entry[3] = normalizeMask(m.mask)
+		binary.LittleEndian.PutUint32(entry[4:8], m.length)
 		binary.LittleEndian.PutUint64(entry[8:16], uint64(m.start))
-		binary.LittleEndian.PutUint64(entry[16:24], uint64(m.end()))
-		binary.LittleEndian.PutUint64(entry[24:32], m.epoch)
-		binary.LittleEndian.PutUint64(entry[32:40], m.offset)
-		binary.LittleEndian.PutUint32(entry[40:44], m.length)
-		binary.LittleEndian.PutUint32(entry[44:48], m.length)
-		binary.LittleEndian.PutUint32(entry[48:52], m.crc)
-		binary.LittleEndian.PutUint64(entry[52:60], m.order)
-		binary.LittleEndian.PutUint32(entry[60:64], m.rowCount)
-		entry[64] = normalizeMask(m.mask)
+		binary.LittleEndian.PutUint64(entry[16:24], m.epoch)
+		binary.LittleEndian.PutUint64(entry[24:32], m.offset)
+		binary.LittleEndian.PutUint64(entry[32:40], m.order)
+		binary.LittleEndian.PutUint32(entry[40:44], m.crc)
+		binary.LittleEndian.PutUint32(entry[44:48], m.rowCount)
 		for j, value := range m.values {
-			binary.LittleEndian.PutUint64(entry[65+j*8:73+j*8], uint64(value))
+			binary.LittleEndian.PutUint64(entry[48+j*8:56+j*8], uint64(value))
 		}
 	}
 	idxData := w.mainEnc.EncodeAll(idx, nil)

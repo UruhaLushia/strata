@@ -8,11 +8,6 @@ import (
 	"math"
 )
 
-const (
-	walRowEncodedBytes   = 8*4 + 4*8 + 1 // 65 bytes per idRow
-	walBucketHeaderFixed = 27 + 8 + 33   // 68 bytes per bucket header
-)
-
 type walFrameMeta struct {
 	offset        int64
 	length        uint32
@@ -103,14 +98,19 @@ func scanWALFrameMetas(f *osFile, start, end int64) ([]walFrameMeta, error) {
 func skipDeltaDicts(raw []byte) (int, error) {
 	off := 0
 	dn, err := readBlockUvarint(raw, &off)
-	if err != nil {
-		return 0, err
+	if err != nil || dn > uint64(len(raw)-off)/4 {
+		return 0, errors.New("strata: invalid delta dictionary")
 	}
 	for range dn {
-		if off+7 > len(raw) {
-			return 0, errors.New("strata: truncated delta dictionary")
+		id, err := readBlockUvarint(raw, &off)
+		if err != nil || id > uint64(^uint32(0)) {
+			return 0, errors.New("strata: invalid delta dictionary")
 		}
-		off += 7
+		sid, err := readBlockUvarint(raw, &off)
+		if err != nil || sid > uint64(^uint16(0)) || off >= len(raw) {
+			return 0, errors.New("strata: invalid delta dictionary")
+		}
+		off++
 		ln, err := readBlockUvarint(raw, &off)
 		if err != nil || ln > uint64(len(raw)-off) {
 			return 0, errors.New("strata: invalid delta dictionary")
@@ -126,27 +126,22 @@ func scanDeltaBounds(raw []byte) (int64, int64, int, error) {
 		return 0, 0, 0, err
 	}
 	bn, err := readBlockUvarint(raw, &off)
-	if err != nil {
-		return 0, 0, 0, err
+	if err != nil || bn > uint64(len(raw)-off)/walDeltaBucketMinBytes {
+		return 0, 0, 0, errors.New("strata: invalid delta bucket")
 	}
 	var minTS, maxTS int64
 	for i := range bn {
-		if off+walBucketHeaderFixed > len(raw) {
-			return 0, 0, 0, errors.New("strata: truncated delta bucket")
+		body, err := nextDeltaBucketBody(raw, &off)
+		if err != nil {
+			return 0, 0, 0, err
 		}
-		ts := int64(binary.LittleEndian.Uint64(raw[off+2 : off+10]))
+		ts := int64(binary.LittleEndian.Uint64(body[2:10]))
 		if i == 0 || ts < minTS {
 			minTS = ts
 		}
 		if i == 0 || ts > maxTS {
 			maxTS = ts
 		}
-		off += walBucketHeaderFixed
-		rn, err := readBlockUvarint(raw, &off)
-		if err != nil || rn > uint64(len(raw)-off)/walRowEncodedBytes {
-			return 0, 0, 0, errors.New("strata: invalid delta rows")
-		}
-		off += int(rn) * walRowEncodedBytes
 	}
 	if off != len(raw) {
 		return 0, 0, 0, errors.New("strata: trailing delta")
@@ -171,23 +166,23 @@ func collectWALBucketRefs(f *osFile, eligible []walFrameMeta) ([]walBucketRef, e
 			return nil, err
 		}
 		bn, err := readBlockUvarint(buf, &off)
-		if err != nil {
-			return nil, err
+		if err != nil || bn > uint64(len(buf)-off)/walDeltaBucketMinBytes {
+			return nil, errors.New("strata: invalid delta bucket")
 		}
 		for range bn {
-			if off+walBucketHeaderFixed > len(buf) {
-				return nil, errors.New("strata: truncated delta bucket")
+			body, err := nextDeltaBucketBody(buf, &off)
+			if err != nil {
+				return nil, err
 			}
-			sid := binary.LittleEndian.Uint16(buf[off : off+2])
-			ts := int64(binary.LittleEndian.Uint64(buf[off+2 : off+10]))
-			epoch := binary.LittleEndian.Uint64(buf[off+10 : off+18])
-			off += walBucketHeaderFixed
-			rn, err := readBlockUvarint(buf, &off)
-			if err != nil || rn > uint64(len(buf)-off)/walRowEncodedBytes {
-				return nil, errors.New("strata: invalid delta rows")
-			}
-			off += int(rn) * walRowEncodedBytes
-			refs = append(refs, walBucketRef{frameIdx: uint32(fi), series: sid, ts: ts, epoch: epoch})
+			refs = append(refs, walBucketRef{
+				frameIdx: uint32(fi),
+				series:   binary.LittleEndian.Uint16(body[0:2]),
+				ts:       int64(binary.LittleEndian.Uint64(body[2:10])),
+				epoch:    binary.LittleEndian.Uint64(body[10:18]),
+			})
+		}
+		if off != len(buf) {
+			return nil, errors.New("strata: trailing delta")
 		}
 	}
 	return refs, nil
@@ -213,61 +208,28 @@ func decodeDeltaForHour(raw []byte, wantSeries uint16, wantHour int64) ([]*bucke
 		return nil, err
 	}
 	bn, err := readBlockUvarint(raw, &off)
-	if err != nil {
-		return nil, err
+	if err != nil || bn > uint64(len(raw)-off)/walDeltaBucketMinBytes {
+		return nil, errors.New("strata: invalid delta bucket")
 	}
 	var out []*bucket
 	for range bn {
-		if off+walBucketHeaderFixed > len(raw) {
-			return nil, errors.New("strata: truncated delta bucket")
+		body, err := nextDeltaBucketBody(raw, &off)
+		if err != nil {
+			return nil, err
 		}
-		sid := binary.LittleEndian.Uint16(raw[off : off+2])
-		ts := int64(binary.LittleEndian.Uint64(raw[off+2 : off+10]))
+		sid := binary.LittleEndian.Uint16(body[0:2])
+		ts := int64(binary.LittleEndian.Uint64(body[2:10]))
 		if sid != wantSeries || hourTS(ts) != wantHour {
-			off += walBucketHeaderFixed
-			rn, err := readBlockUvarint(raw, &off)
-			if err != nil || rn > uint64(len(raw)-off)/walRowEncodedBytes {
-				return nil, errors.New("strata: invalid delta rows")
-			}
-			off += int(rn) * walRowEncodedBytes
 			continue
 		}
-		x := &bucket{
-			series: sid,
-			ts:     ts,
-			epoch:  binary.LittleEndian.Uint64(raw[off+10 : off+18]),
-			order:  binary.LittleEndian.Uint64(raw[off+18 : off+26]),
-			arity:  raw[off+26],
-		}
-		off += 27
-		for j := range 4 {
-			x.summaryOps[j] = MetricOp(raw[off+j])
-			x.rowOps[j] = MetricOp(raw[off+4+j])
-		}
-		off += 8
-		x.summary.Mask = raw[off]
-		off++
-		for j := range 4 {
-			x.summary.Values[j] = int64(binary.LittleEndian.Uint64(raw[off+j*8 : off+(j+1)*8]))
-		}
-		off += 32
-		rn, err := readBlockUvarint(raw, &off)
-		if err != nil || rn > uint64(len(raw)-off)/walRowEncodedBytes {
-			return nil, errors.New("strata: invalid delta rows")
-		}
-		x.rows = make([]idRow, rn)
-		for j := range x.rows {
-			p := raw[off : off+walRowEncodedBytes]
-			for k := range 8 {
-				x.rows[j].tags[k] = binary.LittleEndian.Uint32(p[k*4 : k*4+4])
-			}
-			for k := range 4 {
-				x.rows[j].values[k] = int64(binary.LittleEndian.Uint64(p[32+k*8 : 32+k*8+8]))
-			}
-			x.rows[j].initMask = p[64]
-			off += walRowEncodedBytes
+		x, err := decodeDeltaBucket(body)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, x)
+	}
+	if off != len(raw) {
+		return nil, errors.New("strata: trailing delta")
 	}
 	return out, nil
 }

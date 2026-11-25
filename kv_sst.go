@@ -147,6 +147,19 @@ func (db *DB) loadKVIndex() ([]byte, error) {
 	if crc(raw) != d.crc {
 		return nil, errors.New("strata: KV index CRC mismatch")
 	}
+	switch d.codec {
+	case 0:
+	case 1:
+		raw, err = zstdDecompress(raw)
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) != int(d.rawLen) {
+			return nil, errors.New("strata: invalid KV index length")
+		}
+	default:
+		return nil, errors.New("strata: unsupported KV index codec")
+	}
 	r := bytes.NewReader(raw)
 	catalogLen, err := binary.ReadUvarint(r)
 	if err != nil || catalogLen > uint64(r.Len()) {
@@ -182,9 +195,6 @@ func (db *DB) loadKVIndex() ([]byte, error) {
 			return nil, err
 		}
 		if err = binary.Read(r, binary.LittleEndian, &m.length); err != nil {
-			return nil, err
-		}
-		if err = binary.Read(r, binary.LittleEndian, &m.rawLen); err != nil {
 			return nil, err
 		}
 		if err = binary.Read(r, binary.LittleEndian, &m.crc); err != nil {

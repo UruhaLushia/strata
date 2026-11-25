@@ -3,6 +3,7 @@ package strata
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -406,4 +407,284 @@ func TestSoAScanBatchAndColCacheSelectivityFallback(t *testing.T) {
 			t.Fatalf("Scan parity mismatch for %+v: big=(%d,%d) tight=(%d,%d)", f, c1, v1, c2, v2)
 		}
 	}
+}
+
+func TestColumnarStreamsRawFallback(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 30, 0, 0, time.UTC)
+	ts0 := now.Add(-10 * time.Minute)
+	ts1 := now.Add(-5 * time.Minute)
+	path := filepath.Join(t.TempDir(), "streams-raw.db")
+	opts := Options{Now: func() time.Time { return now }}
+	cfg := SeriesConfig{
+		Arity:      2,
+		SummaryOps: [4]MetricOp{OpSum, OpMin, OpMax, OpLast},
+		RowOps:     [4]MetricOp{OpSum, OpMin, OpMax, OpLast},
+	}
+
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed && db != nil {
+			_ = db.Close()
+		}
+	}()
+	s := mustSeries(t, db, 1, cfg)
+
+	// Pre-intern 255 distinct tags per dim at ts0 (<256 rows -> small block)
+	// so ts1 uses 1-byte modeU8 IDs 1..255 with no dictionary growth.
+	warmRows := make([]Row, 255)
+	for i := range warmRows {
+		warmRows[i] = Row{
+			Tags: []string{"d0-" + strconv.Itoa(100+i), "d1-" + strconv.Itoa(100+i)},
+			Mask: 0x0f,
+		}
+	}
+	if err = s.AppendSync(ts0, Summary{Mask: 0x0f}, warmRows...); err != nil {
+		t.Fatal(err)
+	}
+
+	const rowCount = 523
+	const targetIdx = 271
+	rows := make([]Row, rowCount)
+	var seen [255][255]bool
+	rng := uint64(0x9e3779b97f4a7c15)
+	nextRand := func() uint64 {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		return rng
+	}
+
+	var sumV0, minV1, maxV2, lastV3 int64
+	for i := range rows {
+		var a, b int
+		for {
+			a = int(nextRand() % 255)
+			b = int(nextRand() % 255)
+			if !seen[a][b] {
+				seen[a][b] = true
+				break
+			}
+		}
+		v0 := int64(1 + (i % 97) + int(nextRand()%19))
+		v1 := int64(1000 - i)
+		v2 := int64(2000 + i)
+		v3 := int64(nextRand())
+		rows[i] = Row{
+			Tags:   []string{"d0-" + strconv.Itoa(100+a), "d1-" + strconv.Itoa(100+b)},
+			Values: [4]int64{v0, v1, v2, v3},
+			Mask:   0x0f,
+		}
+		sumV0 += v0
+		if i == 0 || v1 < minV1 {
+			minV1 = v1
+		}
+		if i == 0 || v2 > maxV2 {
+			maxV2 = v2
+		}
+		lastV3 = v3
+	}
+	if err = s.AppendSync(ts1, Summary{Values: [4]int64{sumV0, minV1, maxV2, lastV3}, Mask: 0x0f}, rows...); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	db = reopenTestDB(t, db, path, opts)
+	s = mustSeries(t, db, 1, cfg)
+
+	targetTag0 := rows[targetIdx].Tags[0]
+	targetTag1 := rows[targetIdx].Tags[1]
+	targetRow := rows[targetIdx]
+	var sumForTag0, lastV3Tag0 int64
+	for _, r := range rows {
+		if r.Tags[0] == targetTag0 {
+			sumForTag0 += r.Values[0]
+			lastV3Tag0 = r.Values[3]
+		}
+	}
+
+	var ts1Raw []byte
+	var mapped []byte
+	if db.mapped != nil {
+		mapped = db.mapped.bytes()
+	}
+	for i := range db.sealed {
+		m := &db.sealed[i]
+		if m.series == s.id && m.res == resMinuteHR && m.start == ts1.Unix() {
+			ts1Raw, err = sectionBlock(db.data, db.head.sections[secTSBlocks], m.offset, m.length, mapped)
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if len(ts1Raw) == 0 {
+		t.Fatal("missing compacted ts1 block")
+	}
+	if !bytes.HasPrefix(ts1Raw, blockStreamsMagic[:]) {
+		t.Fatalf("ts1 block missing STR2 magic: %x", ts1Raw[:min(8, len(ts1Raw))])
+	}
+	view, err := parseColumnarBlock(ts1Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.descs[0].flags != streamFlagUnsorted|streamFlagRaw {
+		t.Fatalf("dim0 expected unsorted+raw flags=%#x", view.descs[0].flags)
+	}
+	if view.descs[1].flags&streamFlagRaw == 0 {
+		t.Fatalf("dim1 expected raw flag=%#x", view.descs[1].flags)
+	}
+	if view.descs[11].flags&streamFlagRaw == 0 {
+		t.Fatalf("values[3] expected raw flag=%#x", view.descs[11].flags)
+	}
+	for _, idx := range []int{0, 1, 11} {
+		if view.descs[idx].length != view.descs[idx].rawLen {
+			t.Fatalf("raw stream %d length=%d want rawLen=%d", idx, view.descs[idx].length, view.descs[idx].rawLen)
+		}
+	}
+
+	decoded, err := decodeBlock(ts1Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.rows) != rowCount {
+		t.Fatalf("decoded row count=%d want=%d", len(decoded.rows), rowCount)
+	}
+	if decoded.rows[targetIdx].values != targetRow.Values {
+		t.Fatalf("decoded target row values=%v want=%v", decoded.rows[targetIdx].values, targetRow.Values)
+	}
+
+	// Corrupt rawLen on values[3] descriptor in a copied STR2 block and verify rejection.
+	bad := append([]byte(nil), ts1Raw...)
+	var rawLenLE [4]byte
+	binary.LittleEndian.PutUint32(rawLenLE[:], view.descs[11].rawLen)
+	hdrEnd := min(len(bad), len(blockStreamsMagic)+int(view.descs[0].offset))
+	pos := bytes.LastIndex(bad[:hdrEnd], rawLenLE[:])
+	if pos < 0 {
+		t.Fatalf("failed to locate values[3] rawLen %d in header", view.descs[11].rawLen)
+	}
+	bad[pos] ^= 1
+	if _, err = decodeBlock(bad); err == nil {
+		t.Fatal("expected decodeBlock to reject corrupted rawLen on raw stream")
+	}
+
+	ctx := context.Background()
+	qFrom, qTo := ts1, ts1.Add(time.Minute)
+
+	checkQueries := func(cur *Series, label string) {
+		if got := queryAggSum(t, cur, AggregateQuery{From: qFrom, To: qTo, PreferFine: true}); got != sumV0 {
+			t.Fatalf("%s unfiltered Aggregate sum=%d want=%d", label, got, sumV0)
+		}
+		aggTag0, err := cur.Aggregate(ctx, AggregateQuery{
+			From:       qFrom,
+			To:         qTo,
+			Filters:    []Filter{{Dim: 0, Op: TagEq, Values: []string{targetTag0}}},
+			GroupDims:  []int{0},
+			PreferFine: true,
+		})
+		if err != nil {
+			t.Fatalf("%s dim0 filtered Aggregate: %v", label, err)
+		}
+		gotAgg0, gotAgg3 := aggTag0.Summary.Values[0], aggTag0.Summary.Values[3]
+		aggTag0.Release()
+		if gotAgg0 != sumForTag0 || gotAgg3 != lastV3Tag0 {
+			t.Fatalf("%s dim0 Aggregate got=(%d,%d) want=(%d,%d)", label, gotAgg0, gotAgg3, sumForTag0, lastV3Tag0)
+		}
+
+		exactFilters := []Filter{
+			{Dim: 0, Op: TagEq, Values: []string{targetTag0}},
+			{Dim: 1, Op: TagEq, Values: []string{targetTag1}},
+		}
+		aggPoint, err := cur.Aggregate(ctx, AggregateQuery{
+			From: qFrom, To: qTo, Filters: exactFilters, PreferFine: true,
+		})
+		if err != nil {
+			t.Fatalf("%s point Aggregate: %v", label, err)
+		}
+		gotPoint := aggPoint.Summary
+		aggPoint.Release()
+		if gotPoint.Values != targetRow.Values {
+			t.Fatalf("%s point Aggregate values=%v want=%v", label, gotPoint.Values, targetRow.Values)
+		}
+
+		if err = readCheckErr(ctx, cur, ReadRequest{
+			From: qFrom, To: qTo, Filters: exactFilters, Limit: 10, PreferFine: true,
+		}, func(p *PageResult) error {
+			if len(p.Rows) != 1 || p.Rows[0].Values != targetRow.Values || !slices.Equal(p.Rows[0].Tags, targetRow.Tags) {
+				return fmt.Errorf("%s filtered Read mismatch: %+v", label, p.Rows)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err = readCheckErr(ctx, cur, ReadRequest{
+			From: qFrom, To: qTo, Offset: 200, Limit: 100, PreferFine: true,
+		}, func(p *PageResult) error {
+			got := p.Rows[targetIdx-200]
+			if got.Values != targetRow.Values || !slices.Equal(got.Tags, targetRow.Tags) {
+				return fmt.Errorf("%s light slice Read mismatch: got=%+v want=%+v", label, got, targetRow)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err = readCheckErr(ctx, cur, ReadRequest{
+			From: qFrom, To: qTo, Limit: 600, PreferFine: true,
+		}, func(p *PageResult) error {
+			if len(p.Rows) != rowCount {
+				return fmt.Errorf("%s full Read count=%d want=%d", label, len(p.Rows), rowCount)
+			}
+			if p.Rows[targetIdx].Values != targetRow.Values || !slices.Equal(p.Rows[targetIdx].Tags, targetRow.Tags) {
+				return fmt.Errorf("%s full Read row %d mismatch: got=%+v want=%+v", label, targetIdx, p.Rows[targetIdx], targetRow)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		cnt, scanSum, err := scanCountSumErr(ctx, cur, ScanQuery{
+			From: qFrom, To: qTo, BatchSize: 64, PreferFine: true,
+		})
+		if err != nil || cnt != rowCount || scanSum != sumV0 {
+			t.Fatalf("%s full Scan: cnt=%d want=%d sum=%d want=%d err=%v", label, cnt, rowCount, scanSum, sumV0, err)
+		}
+		var exactCnt int
+		var exactRow Row
+		if err = cur.Scan(ctx, ScanQuery{
+			From: qFrom, To: qTo, Filters: exactFilters, ProjectDims: 0x03, ProjectMetrics: 0x0f, BatchSize: 64, PreferFine: true,
+		}, func(b ScanBatch) error {
+			for i := range b.Len() {
+				exactCnt++
+				exactRow = b.CloneRow(i)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("%s filtered Scan: %v", label, err)
+		}
+		if exactCnt != 1 || exactRow.Values != targetRow.Values || !slices.Equal(exactRow.Tags, targetRow.Tags) {
+			t.Fatalf("%s filtered Scan mismatch: cnt=%d row=%+v want=%+v", label, exactCnt, exactRow, targetRow)
+		}
+	}
+
+	checkQueries(s, "default")
+
+	closed = true
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tightDB, err := Open(path, Options{
+		ReadOnly:      true,
+		Now:           opts.Now,
+		MemoryProfile: MemoryConstrained,
+		MemoryBudget:  MemoryBudget{QueryBytes: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tightDB.Close() }()
+	checkQueries(mustSeries(t, tightDB, 1, cfg), "tight")
 }

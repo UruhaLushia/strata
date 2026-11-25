@@ -38,7 +38,6 @@ type kvSSTMeta struct {
 	maxRev      uint64
 	offset      uint64
 	length      uint32
-	rawLen      uint32
 	crc         uint32
 }
 type kvSSTEntry struct {

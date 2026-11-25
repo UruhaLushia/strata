@@ -19,11 +19,15 @@ const (
 	modeZero
 )
 
-const streamColumnCount = 13
+const (
+	streamColumnCount      = 13
+	streamFlagRaw     byte = 2
+)
 
 type columnStreamDesc struct {
 	mode   byte
 	width  byte
+	flags  byte
 	value  uint64
 	offset uint32
 	length uint32

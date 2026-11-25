@@ -7,6 +7,8 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1036,5 +1038,88 @@ func TestKVPutTTLMaxDuration(t *testing.T) {
 	}
 	if v, ok, err := rr.Get("forever"); err != nil || !ok || string(v) != "alive" {
 		t.Fatalf("reopen Get failed: val=%q ok=%v err=%v", v, ok, err)
+	}
+}
+
+func TestKVSSTIndexCompressionAndCodecError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kv-index-comp.db")
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	opts := Options{Now: func() time.Time { return now }}
+
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := mustRegion(t, db, "idx")
+	if err = r.Put("a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	idxSec := db.head.sections[secKVSSTIndex]
+	if idxSec.kind != secKVSSTIndex || idxSec.count != 1 || idxSec.codec != 0 || idxSec.length != uint64(idxSec.rawLen) {
+		t.Fatalf("tiny KV index should stay uncompressed: %+v", idxSec)
+	}
+
+	db = reopenTestDB(t, db, path, opts)
+	r = mustRegion(t, db, "idx")
+	assertKV(t, r, "a", []byte("1"), true)
+
+	cfg := SeriesConfig{Arity: 2, SummaryOps: [4]MetricOp{OpSum, OpSum, OpSum, OpSum}, RowOps: [4]MetricOp{OpSum, OpSum, OpSum, OpSum}}
+	s := mustSeries(t, db, 1, cfg)
+	prefix := "sst-index-comp-prefix-" + strings.Repeat("p", 24) + "-"
+	const totalKeys = 1000
+	for base := 0; base < totalKeys; base += 250 {
+		b := r.NewBatch()
+		for i := base; i < base+250; i++ {
+			val := bytes.Repeat([]byte{byte('a' + i%26)}, 320)
+			b.Put(prefix+strconv.Itoa(10000+i), val)
+		}
+		if err = b.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	idxSec = db.head.sections[secKVSSTIndex]
+	if idxSec.kind != secKVSSTIndex || idxSec.count < 10 || idxSec.codec != 1 || idxSec.length == 0 || idxSec.length >= uint64(idxSec.rawLen) {
+		t.Fatalf("multi-block KV index should be zstd-compressed: %+v", idxSec)
+	}
+
+	savedSec := idxSec
+	savedGen := db.head.gen
+	appendValue(t, s, now.Add(-2*time.Hour), 77)
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if db.head.gen != savedGen+1 || db.head.sections[secKVSSTIndex] != savedSec {
+		t.Fatalf("KV passthrough altered compressed index: gen=%d want=%d got=%+v want=%+v", db.head.gen, savedGen+1, db.head.sections[secKVSSTIndex], savedSec)
+	}
+
+	db = reopenTestDB(t, db, path, opts)
+	r = mustRegion(t, db, "idx")
+	assertKV(t, r, "a", []byte("1"), true)
+	for _, i := range []int{0, 123, 500, 999} {
+		want := bytes.Repeat([]byte{byte('a' + i%26)}, 320)
+		assertKV(t, r, prefix+strconv.Itoa(10000+i), want, true)
+	}
+	assertTSSum(t, mustSeries(t, db, 1, cfg), now.Add(-3*time.Hour), now, 77)
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	patchSuperblocks(t, path, func(_ *osFile, head *superblock) {
+		head.sections[secKVSSTIndex].codec = 9
+		head.gen++
+	})
+	badDB, err := Open(path, opts)
+	if err == nil {
+		_ = badDB.Close()
+		t.Fatal("expected Open to fail for unsupported KV index codec")
+	}
+	if !strings.Contains(err.Error(), "unsupported KV index codec") {
+		t.Fatalf("unexpected error for unsupported KV index codec: %v", err)
 	}
 }

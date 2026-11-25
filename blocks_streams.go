@@ -40,19 +40,25 @@ func appendColumnarRowsStreams(raw []byte, rows []idRow, enc *zstd.Encoder, unso
 		if len(payloads[i]) == 0 {
 			continue
 		}
-		compressed := enc.EncodeAll(payloads[i], nil)
+		out := enc.EncodeAll(payloads[i], nil)
+		if len(out) >= len(payloads[i]) {
+			out = payloads[i]
+			descs[i].flags |= streamFlagRaw
+		}
 		descs[i].offset = uint32(payloadStart)
-		descs[i].length = uint32(len(compressed))
+		descs[i].length = uint32(len(out))
 		descs[i].rawLen = uint32(len(payloads[i]))
-		raw = append(raw, compressed...)
+		raw = append(raw, out...)
 		payloadStart = len(raw)
 	}
 	for i, d := range descs {
 		p := raw[headerStart+i*24 : headerStart+(i+1)*24]
 		p[0], p[1] = d.mode, d.width
+		flags := d.flags
 		if i == 0 && unsorted {
-			p[2] = streamFlagUnsorted
+			flags |= streamFlagUnsorted
 		}
+		p[2] = flags
 		binary.LittleEndian.PutUint64(p[4:12], d.value)
 		binary.LittleEndian.PutUint32(p[12:16], d.offset)
 		binary.LittleEndian.PutUint32(p[16:20], d.length)
@@ -136,7 +142,7 @@ func decodeColumnarRowsStreams(raw []byte, off *int, b *sealedBlock, count int) 
 	for i := range descs {
 		p := raw[*off+i*24 : *off+(i+1)*24]
 		descs[i] = columnStreamDesc{
-			mode: p[0], width: p[1], value: binary.LittleEndian.Uint64(p[4:12]),
+			mode: p[0], width: p[1], flags: p[2], value: binary.LittleEndian.Uint64(p[4:12]),
 			offset: binary.LittleEndian.Uint32(p[12:16]), length: binary.LittleEndian.Uint32(p[16:20]),
 			rawLen: binary.LittleEndian.Uint32(p[20:24]),
 		}
@@ -147,11 +153,14 @@ func decodeColumnarRowsStreams(raw []byte, off *int, b *sealedBlock, count int) 
 		if d.mode == modeConst || d.mode == modeZero {
 			continue
 		}
+		if d.width == 0 {
+			return errors.New("strata: invalid column stream width")
+		}
 		start, end := int(d.offset), int(d.offset+d.length)
 		if start < dataStart || end < start || end > len(raw) {
 			return errors.New("strata: invalid column stream bounds")
 		}
-		err := decodeColumnStream(raw[start:end], int(d.rawLen), func(plain []byte) error {
+		fill := func(plain []byte) error {
 			if len(plain) != count*int(d.width) {
 				return errors.New("strata: invalid column stream payload")
 			}
@@ -166,7 +175,16 @@ func decodeColumnarRowsStreams(raw []byte, off *int, b *sealedBlock, count int) 
 				}
 			}
 			return nil
-		})
+		}
+		var err error
+		if d.flags&streamFlagRaw != 0 {
+			if int(d.length) != int(d.rawLen) {
+				return errors.New("strata: invalid raw column stream length")
+			}
+			err = fill(raw[start:end])
+		} else {
+			err = decodeColumnStream(raw[start:end], int(d.rawLen), fill)
+		}
 		if err != nil {
 			return err
 		}

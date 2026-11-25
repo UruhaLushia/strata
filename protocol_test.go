@@ -257,53 +257,61 @@ func TestRejectLegacyFormats(t *testing.T) {
 		return path
 	}
 
-	t.Run("Legacy64BIndex", func(t *testing.T) {
-		path := newCompacted(t, "legacy64.db")
-		patchSuperblocks(t, path, func(f *osFile, head *superblock) {
-			idxd := head.sections[secTSIndex]
-			if idxd.count == 0 {
-				t.Fatal("expected non-empty SecTSIndex")
-			}
-			raw, err := sectionRaw(f, idxd, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			raw, err = zstdDecompress(raw)
-			if err != nil {
-				t.Fatal(err)
-			}
-			n := int(idxd.count)
-			legacy := make([]byte, n*64)
-			for i := range n {
-				copy(legacy[i*64:i*64+52], raw[i*104:i*104+52])
-			}
-			enc := newZstdEncoder(CompressionDefault, 64<<10)
-			comp := enc.EncodeAll(legacy, nil)
-			enc.Close()
-			info, err := f.Stat()
-			if err != nil {
-				t.Fatal(err)
-			}
-			off := info.Size()
-			if _, err := f.WriteAt(comp, off); err != nil {
-				t.Fatal(err)
-			}
-			head.sections[secTSIndex].offset = uint64(off)
-			head.sections[secTSIndex].length = uint64(len(comp))
-			head.sections[secTSIndex].rawLen = uint32(len(legacy))
-			head.sections[secTSIndex].crc = crc(comp)
-			head.gen++
-		})
+	for _, tc := range []struct {
+		name      string
+		entrySize int
+	}{
+		{name: "Legacy64BIndex", entrySize: 64},
+		{name: "Legacy104BIndex", entrySize: 104},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newCompacted(t, tc.name+".db")
+			patchSuperblocks(t, path, func(f *osFile, head *superblock) {
+				idxd := head.sections[secTSIndex]
+				if idxd.count == 0 {
+					t.Fatal("expected non-empty SecTSIndex")
+				}
+				raw, err := sectionRaw(f, idxd, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw, err = zstdDecompress(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				n := int(idxd.count)
+				legacy := make([]byte, n*tc.entrySize)
+				for i := range n {
+					copy(legacy[i*tc.entrySize:i*tc.entrySize+52], raw[i*tsIndexEntryBytes:i*tsIndexEntryBytes+52])
+				}
+				enc := newZstdEncoder(CompressionDefault, 64<<10)
+				comp := enc.EncodeAll(legacy, nil)
+				enc.Close()
+				info, err := f.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				off := info.Size()
+				if _, err := f.WriteAt(comp, off); err != nil {
+					t.Fatal(err)
+				}
+				head.sections[secTSIndex].offset = uint64(off)
+				head.sections[secTSIndex].length = uint64(len(comp))
+				head.sections[secTSIndex].rawLen = uint32(len(legacy))
+				head.sections[secTSIndex].crc = crc(comp)
+				head.gen++
+			})
 
-		ro, err := Open(path, Options{ReadOnly: true, Now: func() time.Time { return clock }})
-		if err == nil {
-			_ = ro.Close()
-			t.Fatal("expected Open to reject legacy 64B TS index")
-		}
-		if !strings.Contains(err.Error(), "invalid TS index entry size") {
-			t.Fatalf("unexpected error for legacy 64B TS index: %v", err)
-		}
-	})
+			ro, err := Open(path, Options{ReadOnly: true, Now: func() time.Time { return clock }})
+			if err == nil {
+				_ = ro.Close()
+				t.Fatalf("expected Open to reject legacy %dB TS index", tc.entrySize)
+			}
+			if !strings.Contains(err.Error(), "invalid TS index entry size") {
+				t.Fatalf("unexpected error for legacy %dB TS index: %v", tc.entrySize, err)
+			}
+		})
+	}
 
 	t.Run("LegacyDictCodec", func(t *testing.T) {
 		path := newCompacted(t, "legacy_dict.db")
@@ -1565,4 +1573,211 @@ func TestDictGCStage2SlidingWindowChurn(t *testing.T) {
 	if got := queryAggSum(t, s, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"2001:db8:1::1"}}}}); got != 42 {
 		t.Fatalf("re-inserted expired tag sum got=%d want=42", got)
 	}
+}
+
+func TestCompactWALDeltaAndTSIndex80B(t *testing.T) {
+	t.Run("RoundTripAndMalformed", func(t *testing.T) {
+		dicts := []dictEntry{
+			{id: 1, series: 1, dim: 0, value: "alpha"},
+			{id: 1 << 28, series: 65535, dim: 7, value: "2001:db8::1"},
+			{id: 42, series: 2, dim: 3, value: ""},
+		}
+		baseHour := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC).Unix()
+		sumMasks := []uint8{0x01, 0x05, 0x0a, 0x0f, 0x00}
+		rowMasks := []uint8{0x01, 0x03, 0x06, 0x0c, 0x0f, 0x00}
+		valsPool := [4]int64{math.MinInt64, -1, 0, math.MaxInt64}
+
+		var buckets []*bucket
+		for arity := range 9 {
+			sid := uint16(1 + arity%2)
+			ts := baseHour + int64(arity%2)*3600 + int64(arity)*60
+			sOps := [4]MetricOp{MetricOp(arity % 4), MetricOp((arity + 1) % 4), MetricOp((arity + 2) % 4), MetricOp((arity + 3) % 4)}
+			rOps := [4]MetricOp{MetricOp((arity + 3) % 4), MetricOp((arity + 2) % 4), MetricOp((arity + 1) % 4), MetricOp(arity % 4)}
+			b := &bucket{
+				series: sid, ts: ts, epoch: uint64(arity + 1), order: uint64(100 + arity),
+				arity: uint8(arity), summaryOps: sOps, rowOps: rOps,
+				summary: Summary{Values: [4]int64{valsPool[arity%4], -123456789, 987654321, valsPool[(arity+3)%4]}, Mask: sumMasks[arity%len(sumMasks)]},
+			}
+			for r := range 3 {
+				row := idRow{
+					values:   [4]int64{valsPool[(arity+r)%4], int64(-r * 777), int64(r * 100000), math.MaxInt64 - int64(r)},
+					initMask: rowMasks[(arity+r)%len(rowMasks)],
+				}
+				for d := range 8 {
+					row.tags[d] = uint32((arity+1)*1000 + r*10 + d + 1)
+				}
+				b.rows = append(b.rows, row)
+			}
+			buckets = append(buckets, b)
+		}
+
+		raw := encodeDelta(dicts, buckets)
+		gotDicts, gotBuckets, err := decodeDelta(raw)
+		if err != nil {
+			t.Fatalf("decodeDelta: %v", err)
+		}
+		if len(gotDicts) != len(dicts) || len(gotBuckets) != len(buckets) {
+			t.Fatalf("counts mismatch: dicts=%d/%d buckets=%d/%d", len(gotDicts), len(dicts), len(gotBuckets), len(buckets))
+		}
+		for i, want := range dicts {
+			if gotDicts[i] != want {
+				t.Fatalf("dict[%d] got=%+v want=%+v", i, gotDicts[i], want)
+			}
+		}
+		for i, want := range buckets {
+			got := gotBuckets[i]
+			wantSumMask := normalizeMask(want.summary.Mask)
+			if got.series != want.series || got.ts != want.ts || got.epoch != want.epoch || got.order != want.order ||
+				got.arity != want.arity || got.summaryOps != want.summaryOps || got.rowOps != want.rowOps || got.summary.Mask != wantSumMask {
+				t.Fatalf("bucket[%d] header mismatch: got=%+v want=%+v", i, got, want)
+			}
+			for j := range 4 {
+				wantV := int64(0)
+				if wantSumMask&(1<<j) != 0 {
+					wantV = want.summary.Values[j]
+				}
+				if got.summary.Values[j] != wantV {
+					t.Fatalf("bucket[%d] summary[%d]=%d want=%d", i, j, got.summary.Values[j], wantV)
+				}
+			}
+			if len(got.rows) != len(want.rows) {
+				t.Fatalf("bucket[%d] rows=%d want=%d", i, len(got.rows), len(want.rows))
+			}
+			for r, wr := range want.rows {
+				gr := got.rows[r]
+				wm := normalizeMask(wr.initMask)
+				if gr.initMask != wm {
+					t.Fatalf("bucket[%d] row[%d] mask=%#x want=%#x", i, r, gr.initMask, wm)
+				}
+				for d := range 8 {
+					wt := uint32(0)
+					if d < int(want.arity) {
+						wt = wr.tags[d]
+					}
+					if gr.tags[d] != wt {
+						t.Fatalf("bucket[%d] row[%d] tag[%d]=%d want=%d", i, r, d, gr.tags[d], wt)
+					}
+				}
+				for m := range 4 {
+					wv := int64(0)
+					if wm&(1<<m) != 0 {
+						wv = wr.values[m]
+					}
+					if gr.values[m] != wv {
+						t.Fatalf("bucket[%d] row[%d] val[%d]=%d want=%d", i, r, m, gr.values[m], wv)
+					}
+				}
+			}
+		}
+
+		minTS, maxTS, cnt, err := scanDeltaBounds(raw)
+		if err != nil || cnt != len(buckets) || minTS != buckets[0].ts || maxTS != buckets[len(buckets)-2].ts {
+			t.Fatalf("scanDeltaBounds got=(%d,%d,%d,%v) want=(%d,%d,%d,nil)",
+				minTS, maxTS, cnt, err, buckets[0].ts, buckets[len(buckets)-2].ts, len(buckets))
+		}
+		hour2, err := decodeDeltaForHour(raw, 2, baseHour+3600)
+		if err != nil || len(hour2) != 4 {
+			t.Fatalf("decodeDeltaForHour got len=%d err=%v want=4", len(hour2), err)
+		}
+		for _, hb := range hour2 {
+			if hb.series != 2 || hourTS(hb.ts) != baseHour+3600 {
+				t.Fatalf("decodeDeltaForHour returned mismatched bucket: %+v", hb)
+			}
+		}
+
+		// Truncation, trailing bytes, invalid arity=9, and trailing bytes inside bucket body must fail.
+		for k := 0; k < len(raw); k += max(len(raw)/16, 1) {
+			if _, _, err := decodeDelta(raw[:k]); err == nil {
+				t.Fatalf("expected error on truncated delta[:%d]", k)
+			}
+		}
+		if _, _, err := decodeDelta(raw[:len(raw)-1]); err == nil {
+			t.Fatal("expected error on delta missing last byte")
+		}
+		trailing := append(append([]byte(nil), raw...), 0x00)
+		if _, _, err := decodeDelta(trailing); err == nil {
+			t.Fatal("expected decodeDelta error on trailing byte")
+		}
+		if _, _, _, err := scanDeltaBounds(trailing); err == nil {
+			t.Fatal("expected scanDeltaBounds error on trailing byte")
+		}
+		if _, err := decodeDeltaForHour(trailing, 2, baseHour+3600); err == nil {
+			t.Fatal("expected decodeDeltaForHour error on trailing byte")
+		}
+		badArityRaw := encodeDelta(nil, []*bucket{{
+			series: 1, ts: baseHour, epoch: 1, order: 1, arity: 9,
+			summary: Summary{Values: [4]int64{1}, Mask: 0x01},
+		}})
+		if _, _, err := decodeDelta(badArityRaw); err == nil {
+			t.Fatal("expected decodeDelta error on arity=9")
+		}
+		if _, err := decodeDeltaForHour(badArityRaw, 1, baseHour); err == nil {
+			t.Fatal("expected decodeDeltaForHour error on arity=9")
+		}
+		single := encodeDelta(nil, []*bucket{buckets[2]})
+		blen, bn := binary.Uvarint(single[2:])
+		bodyTrail := append([]byte{0, 1}, binary.AppendUvarint(nil, blen+1)...)
+		bodyTrail = append(bodyTrail, single[2+bn:]...)
+		bodyTrail = append(bodyTrail, 0x00)
+		if _, _, err := decodeDelta(bodyTrail); err == nil {
+			t.Fatal("expected decodeDelta error on trailing bytes inside bucket body")
+		}
+	})
+
+	t.Run("SizeReductionAndTSIndex80B", func(t *testing.T) {
+		const rowCount = 200
+		b := &bucket{
+			series: 1, ts: time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC).Unix(), epoch: 1, order: 1, arity: 2,
+			summary: Summary{Values: [4]int64{100000, 50000}, Mask: 0x03},
+			rows:    make([]idRow, rowCount),
+		}
+		for i := range rowCount {
+			b.rows[i] = idRow{
+				tags:     [8]uint32{uint32(100 + i*17), uint32(1 + i%32)},
+				values:   [4]int64{int64(4096 + i*13), int64(64 + i%256)},
+				initMask: 0x03,
+			}
+		}
+		encoded := encodeDelta(nil, []*bucket{b})
+		legacyRowsBytes := rowCount * 65
+		if len(encoded) >= legacyRowsBytes*35/100 {
+			t.Fatalf("compact delta too large: got=%dB legacyRows=%dB (want >=65%% reduction)", len(encoded), legacyRowsBytes)
+		}
+
+		path := filepath.Join(t.TempDir(), "ts_index_80b.db")
+		clock := time.Date(2026, 10, 1, 14, 0, 0, 0, time.UTC)
+		opts := Options{Now: func() time.Time { return clock }}
+		ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
+		cfg := SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops}
+		db, err := Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if db != nil {
+				_ = db.Close()
+			}
+		}()
+		s := mustSeries(t, db, 1, cfg)
+		for i := range 3 {
+			ts := clock.Add(-time.Duration(i+1) * time.Hour)
+			if err := s.Append(ts, Summary{Values: [4]int64{10, 1, 10, 10}, Mask: 0x0f},
+				Row{Tags: []string{fmt.Sprintf("host-%d", i), "us"}, Values: [4]int64{10, 1, 10, 10}, Mask: 0x0f},
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		idxd := db.head.sections[secTSIndex]
+		if idxd.count == 0 || idxd.rawLen != idxd.count*tsIndexEntryBytes || tsIndexEntryBytes != 80 {
+			t.Fatalf("unexpected SecTSIndex layout: count=%d rawLen=%d entryBytes=%d", idxd.count, idxd.rawLen, tsIndexEntryBytes)
+		}
+		db = reopenTestDB(t, db, path, opts)
+		s = mustSeries(t, db, 1, cfg)
+		if got := queryAggSum(t, s, AggregateQuery{AllTime: true}); got != 30 {
+			t.Fatalf("reopened sum with 80B SecTSIndex got=%d want=30", got)
+		}
+	})
 }

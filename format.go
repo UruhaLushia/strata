@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -160,8 +159,7 @@ type optionalSection struct {
 	slot int
 }
 
-func readUvarint(r *bytes.Reader) (uint64, error) { return binary.ReadUvarint(r) }
-func crc(raw []byte) uint32                       { return crc32.Checksum(raw, castagnoli) }
+func crc(raw []byte) uint32 { return crc32.Checksum(raw, castagnoli) }
 
 func encodeSlot(s superblock) []byte {
 	raw := make([]byte, slotSize)
