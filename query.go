@@ -154,10 +154,8 @@ func resolveTimeWindow(db *DB, seriesID uint16, from, to time.Time, window time.
 	return 0, 0, false, ErrWindowRequired
 }
 
-func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *Series, opts queryOptions) ([]plannedSlot, error) {
+func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *Series, opts queryOptions, onSlot func(chosen sealedMeta, liveIdx int, meta SegmentMeta) error) error {
 	cursor := from
-	est := max(len(sources.days.idx)+min(len(sources.hours.idx), 256)+len(sources.fine.live), 16)
-	plans := make([]plannedSlot, 0, est)
 	fineCursor := blockCursor{src: sources.fine}
 	hourCursor := blockCursor{src: sources.hours}
 	dayCursor := blockCursor{src: sources.days}
@@ -197,7 +195,7 @@ func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 		}
 		if !hasChosen {
 			if coarseCutByRuleCursor(cursor, s, &hourCursor, &dayCursor) {
-				return nil, ErrResetRequiresFineData
+				return ErrResetRequiresFineData
 			}
 			next := fineCursor.nextCandidate(cursor)
 			if next == cursor {
@@ -209,7 +207,7 @@ func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 			}
 			if next > cursor {
 				if opts.RequireExact && !res.sparse {
-					return nil, ErrResolutionTooCoarse
+					return ErrResolutionTooCoarse
 				}
 				if !res.sparse {
 					res.Exact = false
@@ -221,7 +219,7 @@ func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 				continue
 			}
 			if opts.RequireExact && !res.sparse {
-				return nil, ErrResolutionTooCoarse
+				return ErrResolutionTooCoarse
 			}
 			if !res.sparse {
 				res.Exact = false
@@ -237,7 +235,7 @@ func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 		if !exact {
 			res.Exact = false
 			if opts.RequireExact {
-				return nil, ErrResolutionTooCoarse
+				return ErrResolutionTooCoarse
 			}
 		}
 		meta := SegmentMeta{
@@ -262,14 +260,28 @@ func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 				res.EffectiveTo = meta.CoveredTo
 			}
 		}
-		plans = append(plans, plannedSlot{block: chosen, liveIdx: liveIdx, meta: meta})
+		if err := onSlot(chosen, liveIdx, meta); err != nil {
+			return err
+		}
 		cursor = segmentTo
 	}
 	if cursor < to && !res.sparse {
 		if opts.RequireExact {
-			return nil, ErrResolutionTooCoarse
+			return ErrResolutionTooCoarse
 		}
 		res.Exact = false
+	}
+	return nil
+}
+
+func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *Series, opts queryOptions) ([]plannedSlot, error) {
+	est := max(len(sources.days.idx)+min(len(sources.hours.idx), 256)+len(sources.fine.live), 16)
+	plans := make([]plannedSlot, 0, est)
+	if err := walkQuerySlots(res, from, to, sources, s, opts, func(chosen sealedMeta, liveIdx int, meta SegmentMeta) error {
+		plans = append(plans, plannedSlot{block: chosen, liveIdx: liveIdx, meta: meta})
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return plans, nil
 }

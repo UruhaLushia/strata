@@ -281,15 +281,7 @@ func TestConcurrentReadCompactReclaimRace(t *testing.T) {
 
 				deadline := time.Now().Add(40 * time.Millisecond)
 				var stop atomic.Bool
-				errCh := make(chan error, 32)
-				recordErr := func(err error) {
-					if err != nil {
-						select {
-						case errCh <- err:
-						default:
-						}
-					}
-				}
+				errSink := newTestErrSink(32)
 
 				var wg sync.WaitGroup
 				wg.Go(func() {
@@ -306,12 +298,12 @@ func TestConcurrentReadCompactReclaimRace(t *testing.T) {
 							}
 						}
 						if err := s.Append(ts, Summary{Values: [4]int64{30, 1, 35, int64(step * 100)}, Mask: 0x0f}, rows...); err != nil {
-							recordErr(err)
+							errSink.record(err)
 							return
 						}
 						if step%3 == 0 {
 							if err := db.Compact(); err != nil {
-								recordErr(err)
+								errSink.record(err)
 								return
 							}
 						}
@@ -319,47 +311,32 @@ func TestConcurrentReadCompactReclaimRace(t *testing.T) {
 					stop.Store(true)
 				})
 
-				for rID := range 3 {
-					wg.Add(1)
-					go func(id int) {
-						defer wg.Done()
+				for id := range 3 {
+					wg.Go(func() {
 						iter := 0
 						for !stop.Load() {
 							iter++
+							var qErr error
 							switch (iter + id) % 4 {
 							case 0:
-								p, err := s.Read(ctx, ReadRequest{AllTime: true, Limit: 50})
-								if err != nil {
-									recordErr(err)
-									return
-								}
-								p.Release()
+								qErr = readCheckErr(ctx, s, ReadRequest{AllTime: true, Limit: 50}, nil)
 							case 1:
-								if err := s.Scan(ctx, ScanQuery{AllTime: true, BatchSize: 64, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"dom-03"}}}}, func(ScanBatch) error { return nil }); err != nil {
-									recordErr(err)
-									return
-								}
+								qErr = s.Scan(ctx, ScanQuery{AllTime: true, BatchSize: 64, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"dom-03"}}}}, func(ScanBatch) error { return nil })
 							case 2:
-								agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, GroupDims: []int{0}})
-								if err != nil {
-									recordErr(err)
-									return
-								}
-								agg.Release()
+								_, qErr = aggSumErr(ctx, s, AggregateQuery{AllTime: true, GroupDims: []int{0}})
 							case 3:
-								agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, GroupDims: []int{1}, TopK: 15})
-								if err != nil {
-									recordErr(err)
-									return
-								}
-								agg.Release()
+								_, qErr = aggSumErr(ctx, s, AggregateQuery{AllTime: true, GroupDims: []int{1}, TopK: 15})
+							}
+							if qErr != nil {
+								errSink.record(qErr)
+								return
 							}
 							if used, maxB := dictCacheStats(db); maxB > 0 && used > maxB {
-								recordErr(fmt.Errorf("dictPageCache overflow: used=%d max=%d", used, maxB))
+								errSink.record(fmt.Errorf("dictPageCache overflow: used=%d max=%d", used, maxB))
 								return
 							}
 						}
-					}(rID)
+					})
 				}
 
 				wg.Go(func() {
@@ -370,10 +347,7 @@ func TestConcurrentReadCompactReclaimRace(t *testing.T) {
 				})
 
 				wg.Wait()
-				close(errCh)
-				for err := range errCh {
-					t.Fatal(err)
-				}
+				errSink.check(t)
 				client.Reclaim()
 				if used, _ := dictCacheStats(db); used != 0 {
 					t.Fatalf("dictPageCache used=%d after Reclaim, want 0", used)
@@ -429,58 +403,38 @@ func TestInferredSeriesConfigRefreshRace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	errCh := make(chan error, 16)
-	recErr := func(err error) {
-		if err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
-	}
-	wg.Go(func() {
-		<-start
-		for range 20 {
-			recErr(roClient.Refresh())
-		}
-	})
-	for g := range 3 {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			<-start
+	if err := runConcurrentWorkers(4, func(id int) error {
+		if id == 3 {
 			for range 20 {
-				if id == 0 {
-					if _, err := roClient.Series(1, cfg); err != nil {
-						recErr(err)
-						return
-					}
-				}
-				if err := roClient.WithPage(ctx, 1, ReadRequest{AllTime: true, Limit: 10}, nil); err != nil {
-					recErr(err)
-					return
-				}
-				if err := roClient.Scan(ctx, 1, ScanQuery{AllTime: true}, func(ScanBatch) error { return nil }); err != nil {
-					recErr(err)
-					return
-				}
-				if err := roClient.WithAggregate(ctx, 1, AggregateQuery{AllTime: true, GroupDims: []int{0}}, nil); err != nil {
-					recErr(err)
-					return
-				}
-				if err := roClient.WithAggregate(ctx, 1, AggregateQuery{AllTime: true}, nil); err != nil {
-					recErr(err)
-					return
+				if err := roClient.Refresh(); err != nil {
+					return err
 				}
 			}
-		}(g)
-	}
-	close(start)
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
+			return nil
+		}
+		for range 20 {
+			if id == 0 {
+				if _, err := roClient.Series(1, cfg); err != nil {
+					return err
+				}
+			}
+			for _, fn := range []func() error{
+				func() error { return roClient.WithPage(ctx, 1, ReadRequest{AllTime: true, Limit: 10}, nil) },
+				func() error {
+					return roClient.Scan(ctx, 1, ScanQuery{AllTime: true}, func(ScanBatch) error { return nil })
+				},
+				func() error {
+					return roClient.WithAggregate(ctx, 1, AggregateQuery{AllTime: true, GroupDims: []int{0}}, nil)
+				},
+				func() error { return roClient.WithAggregate(ctx, 1, AggregateQuery{AllTime: true}, nil) },
+			} {
+				if err := fn(); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -511,24 +465,18 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 
 			const extCount = 17000
 			seedTS := baseNow.Add(-2 * time.Hour)
-			rows := make([]Row, 0, extCount+1)
-			for i := range extCount {
-				rows = append(rows, Row{
-					Tags: []string{
-						fmt.Sprintf("svc-%05d.prod.local", i),
-						fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff),
-						fmt.Sprintf("app-%03d", i%150),
-					},
-					Values: [4]int64{1, 1, 1, 1},
-					Mask:   0x0f,
-				})
-			}
-			rows = append(rows, Row{
+			seedHighCardMinute(t, s, seedTS, extCount, func(i int) []string {
+				return []string{
+					fmt.Sprintf("svc-%05d.prod.local", i),
+					fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff),
+					fmt.Sprintf("app-%03d", i%150),
+				}
+			})
+			if err := s.Append(seedTS, Summary{Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f}, Row{
 				Tags:   []string{"anchor-beacon.edge.net", "198.51.100.42", "app-anchor"},
 				Values: [4]int64{7, 7, 7, 7},
 				Mask:   0x0f,
-			})
-			if err := s.Append(seedTS, Summary{Values: [4]int64{extCount + 7, 1, 7, 7}, Mask: 0x0f}, rows...); err != nil {
+			}); err != nil {
 				t.Fatal(err)
 			}
 			if err := db.Compact(); err != nil {
@@ -553,17 +501,11 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 			}
 
 			// Trigger lazy sorted index on inline dim 2 before testing extra override against sorted.
-			if agg, err := s.Aggregate(ctx, AggregateQuery{
+			if got := queryAggSum(t, s, AggregateQuery{
 				AllTime: true,
 				Filters: []Filter{{Dim: 2, Op: TagEq, Values: []string{"app-anchor"}}},
-			}); err != nil {
-				t.Fatal(err)
-			} else {
-				got := agg.Summary.Values[0]
-				agg.Release()
-				if got != 7 {
-					t.Fatalf("pre-override inline TagEq got=%d want=7", got)
-				}
+			}); got != 7 {
+				t.Fatalf("pre-override inline TagEq got=%d want=7", got)
 			}
 
 			// Verify 3-tier override priority (extra > tail > ext / extra > sorted) across lock-free filter ops.
@@ -587,13 +529,7 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 				{"inline-override-new-prefix", Filter{Dim: 2, Op: TagPrefix, Values: []string{"app-over"}}, 113},
 				{"inline-override-new-contains", Filter{Dim: 2, Op: TagContains, Values: []string{"override"}}, 113},
 			} {
-				agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, Filters: []Filter{tc.filter}})
-				if err != nil {
-					t.Fatalf("%s: %v", tc.name, err)
-				}
-				got := agg.Summary.Values[0]
-				agg.Release()
-				if got != tc.want {
+				if got := queryAggSum(t, s, AggregateQuery{AllTime: true, Filters: []Filter{tc.filter}}); got != tc.want {
 					t.Fatalf("%s: got sum=%d want=%d", tc.name, got, tc.want)
 				}
 			}
@@ -602,126 +538,94 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 			var filterReads atomic.Int64
 			readersActive := make(chan struct{})
 			var signalActive sync.Once
-			errCh := make(chan error, 32)
+			errSink := newTestErrSink(32)
 			recErr := func(err error) {
 				if err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
+					errSink.record(err)
 					signalActive.Do(func() { close(readersActive) })
 				}
 			}
 
 			var readerWG sync.WaitGroup
-			for rID := range 4 {
-				readerWG.Add(1)
-				go func(id int) {
-					defer readerWG.Done()
+			for id := range 4 {
+				readerWG.Go(func() {
 					defer signalActive.Do(func() { close(readersActive) })
 					iter := 0
 					for !stopReaders.Load() {
 						iter++
 						switch (iter + id) % 6 {
 						case 0:
-							agg, err := s.Aggregate(ctx, AggregateQuery{
+							if got, err := aggSumErr(ctx, s, AggregateQuery{
 								AllTime: true,
 								Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"anchor-beacon"}}},
-							})
-							if err != nil {
+							}); err != nil {
 								recErr(err)
 								return
-							}
-							got := agg.Summary.Values[0]
-							agg.Release()
-							if got != 7 {
+							} else if got != 7 {
 								recErr(fmt.Errorf("TagContains anchor mismatch: got=%d want=7", got))
 								return
 							}
 						case 1:
-							page, err := s.Read(ctx, ReadRequest{
-								AllTime: true,
-								Limit:   10,
+							if err := readCheckErr(ctx, s, ReadRequest{
+								AllTime: true, Limit: 10,
 								Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".edge.net"}}},
-							})
-							if err != nil {
+							}, func(page *PageResult) error {
+								if len(page.Rows) != 1 || page.Rows[0].Tags[0] != "anchor-beacon.edge.net" {
+									return fmt.Errorf("TagSuffix anchor row mismatch")
+								}
+								return nil
+							}); err != nil {
 								recErr(err)
-								return
-							}
-							ok := len(page.Rows) == 1 && page.Rows[0].Tags[0] == "anchor-beacon.edge.net"
-							page.Release()
-							if !ok {
-								recErr(fmt.Errorf("TagSuffix anchor row mismatch"))
 								return
 							}
 						case 2:
-							var matched int
-							var sumV0 int64
-							err := s.Scan(ctx, ScanQuery{
-								AllTime:   true,
-								BatchSize: 32,
-								Filters:   []Filter{{Dim: 1, Op: TagCIDR, Values: []string{"198.51.100.0/24"}}},
-							}, func(b ScanBatch) error {
-								for i := range b.Len() {
-									matched++
-									sumV0 += b.Values(i)[0]
-								}
-								return nil
-							})
-							if err != nil {
+							if matched, sumV0, err := scanCountSumErr(ctx, s, ScanQuery{
+								AllTime: true, BatchSize: 32,
+								Filters: []Filter{{Dim: 1, Op: TagCIDR, Values: []string{"198.51.100.0/24"}}},
+							}); err != nil {
 								recErr(err)
 								return
-							}
-							if matched != 1 || sumV0 != 7 {
+							} else if matched != 1 || sumV0 != 7 {
 								recErr(fmt.Errorf("TagCIDR anchor mismatch: matched=%d sumV0=%d", matched, sumV0))
 								return
 							}
 						case 3:
-							agg, err := s.Aggregate(ctx, AggregateQuery{
+							if got, err := aggSumErr(ctx, s, AggregateQuery{
 								AllTime: true,
 								Filters: []Filter{
 									{Dim: 0, Op: TagPrefix, Values: []string{"svc-0010"}},
 									{Dim: 2, Op: TagEq, Values: []string{"app-anchor"}, Negate: true},
 								},
-							})
-							if err != nil {
+							}); err != nil {
 								recErr(err)
 								return
-							}
-							got := agg.Summary.Values[0]
-							agg.Release()
-							if got != 10 {
+							} else if got != 10 {
 								recErr(fmt.Errorf("TagPrefix+Negate mismatch: got=%d want=10", got))
 								return
 							}
 						case 4:
-							page, err := s.Read(ctx, ReadRequest{
-								AllTime: true,
-								Limit:   10,
+							if err := readCheckErr(ctx, s, ReadRequest{
+								AllTime: true, Limit: 10,
 								Filters: []Filter{{Dim: 2, Op: TagEq, Values: []string{"app-anchor"}}},
-							})
-							if err != nil {
+							}, func(page *PageResult) error {
+								if len(page.Rows) != 1 || page.Rows[0].Values[0] != 7 {
+									return fmt.Errorf("inline TagEq anchor mismatch")
+								}
+								return nil
+							}); err != nil {
 								recErr(err)
-								return
-							}
-							ok := len(page.Rows) == 1 && page.Rows[0].Values[0] == 7
-							page.Release()
-							if !ok {
-								recErr(fmt.Errorf("inline TagEq anchor mismatch"))
 								return
 							}
 						case 5:
 							agg, err := s.Aggregate(ctx, AggregateQuery{
-								AllTime:   true,
-								GroupDims: []int{2},
-								Filters:   []Filter{{Dim: 2, Op: TagPrefix, Values: []string{"app-00"}}},
+								AllTime: true, GroupDims: []int{2},
+								Filters: []Filter{{Dim: 2, Op: TagPrefix, Values: []string{"app-00"}}},
 							})
 							if err != nil {
 								recErr(err)
 								return
 							}
-							gotSum := agg.Summary.Values[0]
-							gotGroups := len(agg.Groups[0])
+							gotSum, gotGroups := agg.Summary.Values[0], len(agg.Groups[0])
 							agg.Release()
 							if gotSum != 1140 || gotGroups != 10 {
 								recErr(fmt.Errorf("inline TagPrefix group mismatch: sum=%d groups=%d", gotSum, gotGroups))
@@ -732,7 +636,7 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 							signalActive.Do(func() { close(readersActive) })
 						}
 					}
-				}(rID)
+				})
 			}
 
 			<-readersActive
@@ -803,11 +707,7 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 			compactWG.Wait()
 			stopReaders.Store(true)
 			readerWG.Wait()
-
-			close(errCh)
-			for err := range errCh {
-				t.Fatal(err)
-			}
+			errSink.check(t)
 			if filterReads.Load() <= readsBeforePhase1 {
 				t.Fatalf("expected concurrent filter reads during writes/compacts: before=%d after=%d",
 					readsBeforePhase1, filterReads.Load())
@@ -825,13 +725,7 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 				{"dyn-cidr", Filter{Dim: 1, Op: TagCIDR, Values: []string{"10.2.0.0/23"}}, (phase1Appends + phase2Appends) * 3},
 				{"anchor-eq", Filter{Dim: 0, Op: TagEq, Values: []string{"anchor-beacon.edge.net"}}, 7},
 			} {
-				agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, Filters: []Filter{tc.filter}})
-				if err != nil {
-					t.Fatalf("%s: %v", tc.name, err)
-				}
-				got := agg.Summary.Values[0]
-				agg.Release()
-				if got != tc.want {
+				if got := queryAggSum(t, s, AggregateQuery{AllTime: true, Filters: []Filter{tc.filter}}); got != tc.want {
 					t.Fatalf("%s: got sum=%d want=%d", tc.name, got, tc.want)
 				}
 			}
@@ -846,26 +740,20 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 			cursorPage.Release()
 
 			var closing atomic.Bool
-			var closeStarted atomic.Int32
-			var closedSeen atomic.Int32
+			var closeStarted, closedSeen atomic.Int32
 			var stopClose atomic.Bool
 			closeReady := make(chan struct{})
 			var sigClose sync.Once
-			closeErrCh := make(chan error, 16)
+			closeErrSink := newTestErrSink(16)
 			recCloseErr := func(err error) {
-				select {
-				case closeErrCh <- err:
-				default:
-				}
+				closeErrSink.record(err)
 				stopClose.Store(true)
 				sigClose.Do(func() { close(closeReady) })
 			}
 
 			var closeWG sync.WaitGroup
-			for g := range 3 {
-				closeWG.Add(1)
-				go func(id int) {
-					defer closeWG.Done()
+			for id := range 3 {
+				closeWG.Go(func() {
 					defer sigClose.Do(func() { close(closeReady) })
 					iter := 0
 					for !stopClose.Load() {
@@ -873,36 +761,13 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 						var qErr error
 						switch (iter + id) % 4 {
 						case 0:
-							agg, err := s.Aggregate(ctx, AggregateQuery{
-								AllTime: true,
-								Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"anchor-beacon"}}},
-							})
-							if err == nil {
-								agg.Release()
-							}
-							qErr = err
+							_, qErr = aggSumErr(ctx, s, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"anchor-beacon"}}}})
 						case 1:
-							page, err := s.Read(ctx, ReadRequest{
-								AllTime: true,
-								Limit:   10,
-								Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".edge.net"}}},
-							})
-							if err == nil {
-								page.Release()
-							}
-							qErr = err
+							qErr = readCheckErr(ctx, s, ReadRequest{AllTime: true, Limit: 10, Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".edge.net"}}}}, nil)
 						case 2:
-							qErr = s.Scan(ctx, ScanQuery{
-								AllTime:   true,
-								BatchSize: 32,
-								Filters:   []Filter{{Dim: 1, Op: TagCIDR, Values: []string{"198.51.100.0/24"}}},
-							}, func(ScanBatch) error { return nil })
+							qErr = s.Scan(ctx, ScanQuery{AllTime: true, BatchSize: 32, Filters: []Filter{{Dim: 1, Op: TagCIDR, Values: []string{"198.51.100.0/24"}}}}, func(ScanBatch) error { return nil })
 						case 3:
-							agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true})
-							if err == nil {
-								agg.Release()
-							}
-							qErr = err
+							_, qErr = aggSumErr(ctx, s, AggregateQuery{AllTime: true})
 						}
 						if qErr != nil {
 							if !closing.Load() {
@@ -919,7 +784,7 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 							sigClose.Do(func() { close(closeReady) })
 						}
 					}
-				}(g)
+				})
 			}
 
 			<-closeReady
@@ -930,10 +795,7 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 				t.Fatal(err)
 			}
 			closeWG.Wait()
-			close(closeErrCh)
-			for err := range closeErrCh {
-				t.Fatal(err)
-			}
+			closeErrSink.check(t)
 
 			if agg, err := s.Aggregate(ctx, AggregateQuery{
 				AllTime: true,
@@ -996,28 +858,12 @@ func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
 
 	const extCount = 17000
 	seedTS := baseNow.Add(-2 * time.Hour)
-	rows1 := make([]Row, extCount)
-	for i := range rows1 {
-		rows1[i] = Row{
-			Tags:   []string{fmt.Sprintf("old-%05d.net", i), fmt.Sprintf("g-%02d", i%10)},
-			Values: [4]int64{1, 1, 1, 1},
-			Mask:   0x0f,
-		}
-	}
-	rows2 := make([]Row, 200)
-	for i := range rows2 {
-		rows2[i] = Row{
-			Tags:   []string{fmt.Sprintf("keep-%03d", i)},
-			Values: [4]int64{1, 1, 1, 1},
-			Mask:   0x0f,
-		}
-	}
-	if err := s1.Append(seedTS, Summary{Values: [4]int64{extCount, 1, 1, 1}, Mask: 0x0f}, rows1...); err != nil {
-		t.Fatal(err)
-	}
-	if err := s2.Append(seedTS, Summary{Values: [4]int64{200, 1, 1, 1}, Mask: 0x0f}, rows2...); err != nil {
-		t.Fatal(err)
-	}
+	seedHighCardMinute(t, s1, seedTS, extCount, func(i int) []string {
+		return []string{fmt.Sprintf("old-%05d.net", i), fmt.Sprintf("g-%02d", i%10)}
+	})
+	seedHighCardMinute(t, s2, seedTS, 200, func(i int) []string {
+		return []string{fmt.Sprintf("keep-%03d", i)}
+	})
 	if err := db.Compact(); err != nil {
 		t.Fatal(err)
 	}
@@ -1030,53 +876,42 @@ func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
 	var reads atomic.Int64
 	readersActive := make(chan struct{})
 	var sigActive sync.Once
-	errCh := make(chan error, 32)
+	errSink := newTestErrSink(32)
 	recErr := func(err error) {
 		if err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
+			errSink.record(err)
 			sigActive.Do(func() { close(readersActive) })
 		}
 	}
 
 	var readerWG sync.WaitGroup
-	for rID := range 3 {
-		readerWG.Add(1)
-		go func(id int) {
-			defer readerWG.Done()
+	for id := range 3 {
+		readerWG.Go(func() {
 			defer sigActive.Do(func() { close(readersActive) })
 			iter := 0
 			for !stopReaders.Load() {
 				iter++
 				switch (iter + id) % 5 {
 				case 0:
-					agg, err := s1.Aggregate(ctx, AggregateQuery{
+					if _, err := aggSumErr(ctx, s1, AggregateQuery{
 						AllTime: true,
 						Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"old-0010"}}},
-					})
-					if err != nil {
+					}); err != nil {
 						recErr(err)
 						return
 					}
-					agg.Release()
 				case 1:
-					page, err := s1.Read(ctx, ReadRequest{
-						AllTime: true,
-						Limit:   10,
+					if err := readCheckErr(ctx, s1, ReadRequest{
+						AllTime: true, Limit: 10,
 						Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".net"}}},
-					})
-					if err != nil {
+					}, nil); err != nil {
 						recErr(err)
 						return
 					}
-					page.Release()
 				case 2:
 					if err := s1.Scan(ctx, ScanQuery{
-						AllTime:   true,
-						BatchSize: 64,
-						Filters:   []Filter{{Dim: 0, Op: TagPrefix, Values: []string{"live-"}}},
+						AllTime: true, BatchSize: 64,
+						Filters: []Filter{{Dim: 0, Op: TagPrefix, Values: []string{"live-"}}},
 					}, func(ScanBatch) error { return nil }); err != nil {
 						recErr(err)
 						return
@@ -1087,17 +922,13 @@ func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
 						return
 					}
 				case 4:
-					agg, err := s2.Aggregate(ctx, AggregateQuery{
+					if got, err := aggSumErr(ctx, s2, AggregateQuery{
 						AllTime: true,
 						Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"keep-042"}}},
-					})
-					if err != nil {
+					}); err != nil {
 						recErr(err)
 						return
-					}
-					got := agg.Summary.Values[0]
-					agg.Release()
-					if got != 1 {
+					} else if got != 1 {
 						recErr(fmt.Errorf("s2 affected by concurrent s1 ResetAll: got=%d want=1", got))
 						return
 					}
@@ -1106,7 +937,7 @@ func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
 					sigActive.Do(func() { close(readersActive) })
 				}
 			}
-		}(rID)
+		})
 	}
 
 	<-readersActive
@@ -1148,11 +979,7 @@ func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
 	mutWG.Wait()
 	stopReaders.Store(true)
 	readerWG.Wait()
-
-	close(errCh)
-	for err := range errCh {
-		t.Fatal(err)
-	}
+	errSink.check(t)
 
 	// Final deterministic marker + full seal Compact verifies dict reclamation and consistency.
 	finalTS := time.Unix(clockSec.Add(60), 0).UTC()
@@ -1166,16 +993,10 @@ func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res1, err := s1.Aggregate(ctx, AggregateQuery{
+	if got1 := queryAggSum(t, s1, AggregateQuery{
 		AllTime: true,
 		Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"final-marker.net"}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got1 := res1.Summary.Values[0]
-	res1.Release()
-	if got1 != 77 {
+	}); got1 != 77 {
 		t.Fatalf("final marker sum got=%d want=77", got1)
 	}
 
@@ -1189,16 +1010,10 @@ func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
 		t.Fatalf("unexpected final s1 DictStats after concurrent ResetAll+Compact: %+v", finalStats1)
 	}
 
-	res2, err := s2.Aggregate(ctx, AggregateQuery{
+	if got2 := queryAggSum(t, s2, AggregateQuery{
 		AllTime: true,
 		Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"keep-042"}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got2 := res2.Summary.Values[0]
-	res2.Release()
-	if got2 != 1 {
+	}); got2 != 1 {
 		t.Fatalf("s2 final sum got=%d want=1", got2)
 	}
 	finalStats2, err := s2.DictStats()

@@ -12,15 +12,11 @@ import (
 var (
 	blockStreamsMagic      = [4]byte{'S', 'T', 'R', '2'}
 	errBlockOutsideSection = errors.New("strata: block outside section")
+	errTruncatedBlock      = errors.New("strata: truncated block")
+	errInvalidBlockVint    = errors.New("strata: invalid block varint")
 )
 
 const streamFlagUnsorted byte = 1
-
-func encodeBlockLevel(b sealedBlock, level CompressionLevel) ([]byte, error) {
-	enc := newZstdEncoder(level, 128<<10)
-	defer enc.Close()
-	return encodeBlockWithEncoder(b, enc)
-}
 
 func encodeBlockWithEncoder(b sealedBlock, enc *zstd.Encoder) ([]byte, error) {
 	raw := make([]byte, 0, 64+len(b.rows)*73)
@@ -161,16 +157,20 @@ func takeBlockBytes(raw []byte, off *int, n int) ([]byte, error) {
 	return field, nil
 }
 
-func readBlockUvarint(raw []byte, off *int) (uint64, error) {
+func readSliceUvarint(raw []byte, off *int, truncErr, invalidErr error) (uint64, error) {
 	if *off >= len(raw) {
-		return 0, errors.New("strata: truncated block")
+		return 0, truncErr
 	}
 	value, n := binary.Uvarint(raw[*off:])
 	if n <= 0 {
-		return 0, errors.New("strata: invalid block varint")
+		return 0, invalidErr
 	}
 	*off += n
 	return value, nil
+}
+
+func readBlockUvarint(raw []byte, off *int) (uint64, error) {
+	return readSliceUvarint(raw, off, errTruncatedBlock, errInvalidBlockVint)
 }
 
 func newZstdEncoder(level CompressionLevel, windowSize int) *zstd.Encoder {
@@ -254,23 +254,6 @@ func decodeBlocks(f *osFile, s superblock, mapped []byte) ([]sealedMeta, error) 
 		out = append(out, m)
 	}
 	return out, nil
-}
-
-func loadSealedBlock(db *DB, b sealedBlock) (sealedBlock, error) {
-	raw, bufPtr, err := sectionBlockPooled(db.data, db.head.sections[3], b.offset, b.length, db.mappedBytes())
-	defer putReadBuf(bufPtr)
-	if err != nil {
-		return sealedBlock{}, err
-	}
-	if crc(raw) != b.crc {
-		return sealedBlock{}, errors.New("strata: block CRC mismatch")
-	}
-	decoded, err := decodeBlock(raw)
-	if err != nil {
-		return sealedBlock{}, err
-	}
-	decoded.offset, decoded.length, decoded.rawLen, decoded.crc = b.offset, b.length, b.rawLen, b.crc
-	return decoded, nil
 }
 
 func sectionBlock(f *osFile, d sectionDesc, off uint64, n uint32, mapped []byte) ([]byte, error) {

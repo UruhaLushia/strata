@@ -2,7 +2,6 @@ package strata
 
 import (
 	"errors"
-	"sort"
 	"sync"
 	"unsafe"
 )
@@ -55,10 +54,6 @@ type dictionary struct {
 	snapshot       bool
 	snapshotSeries uint16
 	snapshotDims   [8]dictDimSnap
-}
-
-func newDict() dictionary {
-	return newDictWithPolicy(memPolicy{dictPageCacheBytes: 256 << 10, dictHotBytes: 256 << 10})
 }
 
 func newDictWithPolicy(p memPolicy) dictionary {
@@ -203,35 +198,23 @@ func (dim *dictDim) ensureReverseLocked() {
 }
 
 func (dim *dictDim) lookupLocked(value string) uint32 {
+	if dim.sorted != nil {
+		snap := dictDimSnap{
+			arena:        dim.arena,
+			offsets:      dim.offsets,
+			extra:        dim.extra,
+			tailBase:     dim.tailBase,
+			nextID:       dim.nextID,
+			count:        dim.count,
+			sorted:       dim.sorted,
+			sortedNextID: dim.sortedNextID,
+		}
+		return snap.lookup(value)
+	}
 	for id, v := range dim.extra {
 		if v == value {
 			return id
 		}
-	}
-	if dim.sorted != nil {
-		idx := sort.Search(len(dim.sorted), func(i int) bool {
-			return dim.resolveArena(dim.sorted[i]) >= value
-		})
-		for i := idx; i < len(dim.sorted); i++ {
-			id := dim.sorted[i]
-			if dim.resolveArena(id) != value {
-				break
-			}
-			if hasExtraOverride(dim.extra, id) {
-				continue
-			}
-			return id
-		}
-		startID := max(dim.sortedNextID, uint32(1))
-		for id := startID; id < dim.nextID; id++ {
-			if hasExtraOverride(dim.extra, id) {
-				continue
-			}
-			if v := dim.resolveArena(id); len(v) == len(value) && v == value {
-				return id
-			}
-		}
-		return 0
 	}
 	if id := dim.byKey[value]; id != 0 && !hasExtraOverride(dim.extra, id) {
 		return id
@@ -244,7 +227,8 @@ func (dim *dictDim) lookup(value string) uint32 {
 		return 0
 	}
 	if dim.ext != nil {
-		return dim.lookupExt(value)
+		id, _ := dim.lookupExt(value)
+		return id
 	}
 	dim.revMu.RLock()
 	if dim.sorted != nil || dim.byKey != nil {

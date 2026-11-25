@@ -268,13 +268,19 @@ func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dic
 			}
 		}
 		comp := encodeFwdPage(vals, plainBuf, compBuf, enc)
+		out := comp
+		rawLen := uint32(len(*plainBuf))
+		if len(comp) >= len(*plainBuf) {
+			out = *plainBuf
+			rawLen = 0
+		}
 		relOff := uint64(pos - fwdAreaStart)
-		if _, err := tf.WriteAt(comp, pos); err != nil {
+		if _, err := tf.WriteAt(out, pos); err != nil {
 			return pos, we, err
 		}
-		_, _ = secHash.Write(comp)
-		pos += int64(len(comp))
-		we.fwdPages = append(we.fwdPages, dictPageDesc{relOff: relOff, length: uint32(len(comp)), rawLen: uint32(len(*plainBuf))})
+		_, _ = secHash.Write(out)
+		pos += int64(len(out))
+		we.fwdPages = append(we.fwdPages, dictPageDesc{relOff: relOff, length: uint32(len(out)), rawLen: rawLen})
 	}
 	we.fwdTotalBytes = uint64(pos - fwdAreaStart)
 

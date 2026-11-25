@@ -141,7 +141,22 @@ func gatherColBytes(dst, src []byte, rows []int32, width int) {
 	}
 }
 
+func resolveBatchCol(cache *blockColCache, cols *[streamColumnCount]decodedCol, idx int) (decodedCol, error) {
+	if cache != nil {
+		return cache.load(idx)
+	}
+	return cols[idx], nil
+}
+
 func fillBatchFromStreamCache(cache *blockColCache, isRange bool, rangeLo int, rows []int32, n, arity int, dimMask, metricMask uint8, slot *querySlot) error {
+	return fillBatch(cache, nil, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
+}
+
+func fillBatchFromCols(cols *[streamColumnCount]decodedCol, isRange bool, rangeLo int, rows []int32, n, arity int, dimMask, metricMask uint8, slot *querySlot) {
+	_ = fillBatch(nil, cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
+}
+
+func fillBatch(cache *blockColCache, cols *[streamColumnCount]decodedCol, isRange bool, rangeLo int, rows []int32, n, arity int, dimMask, metricMask uint8, slot *querySlot) error {
 	slot.ensureBatch(n, arity)
 	for dim := range arity {
 		dst := slot.tagIDs[dim][:n]
@@ -149,7 +164,7 @@ func fillBatchFromStreamCache(cache *blockColCache, isRange bool, rangeLo int, r
 			clear(dst)
 			continue
 		}
-		col, err := cache.load(dim)
+		col, err := resolveBatchCol(cache, cols, dim)
 		if err != nil {
 			return err
 		}
@@ -165,7 +180,7 @@ func fillBatchFromStreamCache(cache *blockColCache, isRange bool, rangeLo int, r
 			clear(dst)
 			continue
 		}
-		col, err := cache.load(8 + m)
+		col, err := resolveBatchCol(cache, cols, 8+m)
 		if err != nil {
 			return err
 		}
@@ -175,7 +190,7 @@ func fillBatchFromStreamCache(cache *blockColCache, isRange bool, rangeLo int, r
 			decodeValIndexed(dst, col, rows)
 		}
 	}
-	mcol, err := cache.load(12)
+	mcol, err := resolveBatchCol(cache, cols, 12)
 	if err != nil {
 		return err
 	}
@@ -185,40 +200,4 @@ func fillBatchFromStreamCache(cache *blockColCache, isRange bool, rangeLo int, r
 		decodeMaskIndexed(slot.masks[:n], mcol, rows)
 	}
 	return nil
-}
-
-func fillBatchFromCols(cols *[streamColumnCount]decodedCol, isRange bool, rangeLo int, rows []int32, n, arity int, dimMask, metricMask uint8, slot *querySlot) {
-	slot.ensureBatch(n, arity)
-	for dim := range arity {
-		dst := slot.tagIDs[dim][:n]
-		if dimMask&(uint8(1)<<dim) == 0 {
-			clear(dst)
-			continue
-		}
-		col := cols[dim]
-		if isRange {
-			decodeTagRange(dst, col, rangeLo)
-		} else {
-			decodeTagIndexed(dst, col, rows)
-		}
-	}
-	for m := range 4 {
-		dst := slot.values[m][:n]
-		if metricMask&(uint8(1)<<m) == 0 {
-			clear(dst)
-			continue
-		}
-		col := cols[8+m]
-		if isRange {
-			decodeValRange(dst, col, rangeLo)
-		} else {
-			decodeValIndexed(dst, col, rows)
-		}
-	}
-	mcol := cols[12]
-	if isRange {
-		decodeMaskRange(slot.masks[:n], mcol, rangeLo)
-	} else {
-		decodeMaskIndexed(slot.masks[:n], mcol, rows)
-	}
 }

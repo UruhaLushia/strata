@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"math"
-	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -659,31 +658,6 @@ func TestKVScanScanSeqAndLargeBlobs(t *testing.T) {
 }
 
 func TestKVSectionPassthrough(t *testing.T) {
-	assertKV := func(t *testing.T, r *Region, key string, want []byte, wantOK bool) {
-		t.Helper()
-		got, ok, err := r.Get(key)
-		if err != nil {
-			t.Fatalf("Get(%q): %v", key, err)
-		}
-		if ok != wantOK {
-			t.Fatalf("Get(%q) ok=%v want=%v", key, ok, wantOK)
-		}
-		if wantOK && !bytes.Equal(got, want) {
-			t.Fatalf("Get(%q) len=%d wantLen=%d", key, len(got), len(want))
-		}
-	}
-	assertTSSum := func(t *testing.T, s *Series, from, to time.Time, want int64) {
-		t.Helper()
-		res, err := s.Aggregate(context.Background(), AggregateQuery{From: from, To: to})
-		if err != nil {
-			t.Fatalf("Aggregate: %v", err)
-		}
-		defer res.Release()
-		if res.Summary.Values[0] != want {
-			t.Fatalf("TS sum=%d want=%d", res.Summary.Values[0], want)
-		}
-	}
-
 	t.Run("UnchangedKVAndLargeBlobWithTS", func(t *testing.T) {
 		now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
 		db, series := testDB(t, &now, Options{})
@@ -767,25 +741,13 @@ func TestKVSectionPassthrough(t *testing.T) {
 		}
 		_ = badTmp.Close()
 
-		if err = db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		reopened, err := Open(path, Options{Now: func() time.Time { return now }})
-		if err != nil {
-			t.Fatal(err)
-		}
+		reopened := reopenTestDB(t, db, path, Options{Now: func() time.Time { return now }})
 		defer func() { _ = reopened.Close() }()
 		if reopened.head.sections[0] != savedSec[0] || reopened.head.sections[1] != savedSec[1] || reopened.head.sections[2] != savedSec[2] {
 			t.Fatalf("reopened KV sections mismatch: got=%+v want=%+v", reopened.head.sections[:3], savedSec)
 		}
-		reReg, err := reopened.Region("kv")
-		if err != nil {
-			t.Fatal(err)
-		}
-		reSeries, err := reopened.Series(seriesID, seriesCfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		reReg := mustRegion(t, reopened, "kv")
+		reSeries := mustSeries(t, reopened, seriesID, seriesCfg)
 		assertKV(t, reReg, "k1", []byte("v1"), true)
 		assertKV(t, reReg, "k2", []byte("v2"), true)
 		assertKV(t, reReg, "big", blob, true)
@@ -961,26 +923,11 @@ func TestKVSectionPassthrough(t *testing.T) {
 		if db.head.sealedKVRev <= rev2 {
 			t.Fatalf("expected sealedKVRev to advance after Put: got=%d prev=%d", db.head.sealedKVRev, rev2)
 		}
-		if err = db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		reopened, err := Open(path, Options{Now: func() time.Time { return now }})
-		if err != nil {
-			t.Fatal(err)
-		}
+		reopened := reopenTestDB(t, db, path, Options{Now: func() time.Time { return now }})
 		defer func() { _ = reopened.Close() }()
-		rr1, err := reopened.Region("r1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		rr2, err := reopened.Region("r2")
-		if err != nil {
-			t.Fatal(err)
-		}
-		rs, err := reopened.Series(seriesID, seriesCfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		rr1 := mustRegion(t, reopened, "r1")
+		rr2 := mustRegion(t, reopened, "r2")
+		rs := mustSeries(t, reopened, seriesID, seriesCfg)
 		assertKV(t, rr1, "old", []byte("v2"), true)
 		assertKV(t, rr1, "hot", []byte("during-compact"), true)
 		assertKV(t, rr1, "del", nil, false)
@@ -1010,34 +957,11 @@ func TestKVSectionPassthrough(t *testing.T) {
 		if err = db.Close(); err != nil {
 			t.Fatal(err)
 		}
+		patchSuperblocks(t, path, func(_ *osFile, sb *superblock) {
+			sb.sections[2].flags = 0
+		})
 
-		f, err := os.OpenFile(path, os.O_RDWR, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		rawF := &osFile{f: f}
-		sb, err := readSuper(rawF)
-		if err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		sb.sections[2].flags = 0
-		if err = writeSupers(rawF, sb); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		if err = f.Sync(); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		if err = f.Close(); err != nil {
-			t.Fatal(err)
-		}
-
-		db, err = Open(path, Options{Now: func() time.Time { return now }})
-		if err != nil {
-			t.Fatal(err)
-		}
+		db = reopenTestDB(t, nil, path, Options{Now: func() time.Time { return now }})
 		defer func() { _ = db.Close() }()
 		if db.head.sections[2].flags != 0 || canPassthroughKV(db.head, db.head.sealedKVRev) {
 			t.Fatalf("expected legacy unflagged DB to reject passthrough: flags=%#x", db.head.sections[2].flags)

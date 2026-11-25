@@ -172,82 +172,69 @@ func parseSmallBlockCols(plain []byte) (int, [streamColumnCount]decodedCol, erro
 	return count, cols, nil
 }
 
+func resolvePageCol(view *columnarBlockView, cols *[streamColumnCount]decodedCol, idx int, slot *querySlot) (decodedCol, error) {
+	if view != nil {
+		return decodeStreamColInto(*view, idx, slot)
+	}
+	return cols[idx], nil
+}
+
 func appendPageFromStream(view columnarBlockView, meta SegmentMeta, d dictionary, series uint16, arity int, isRange bool, rangeLo int, rows []int32, n int, slot *querySlot, page *PageResult) error {
+	return appendPage(&view, nil, meta, d, series, arity, isRange, rangeLo, rows, n, slot, page)
+}
+
+func appendPageFromCols(cols *[streamColumnCount]decodedCol, meta SegmentMeta, d dictionary, series uint16, arity int, isRange bool, rangeLo int, rows []int32, n int, page *PageResult) {
+	_ = appendPage(nil, cols, meta, d, series, arity, isRange, rangeLo, rows, n, nil, page)
+}
+
+func appendPage(view *columnarBlockView, cols *[streamColumnCount]decodedCol, meta SegmentMeta, d dictionary, series uint16, arity int, isRange bool, rangeLo int, rows []int32, n int, slot *querySlot, page *PageResult) error {
 	baseRow := len(page.Rows)
 	tagStart := len(page.tagBuf)
 	page.Rows = page.Rows[:baseRow+n]
 	page.tagBuf = page.tagBuf[:tagStart+n*arity]
+	outRows := page.Rows[baseRow : baseRow+n]
 	for i := range n {
-		page.Rows[baseRow+i] = PageRow{
+		outRows[i] = PageRow{
 			From: meta.CoveredFrom, Resolution: meta.Resolution, Exact: meta.Exact,
 			Tags: page.tagBuf[tagStart+i*arity : tagStart+(i+1)*arity],
 		}
 	}
 	for dim := range arity {
-		col, err := decodeStreamColInto(view, dim, slot)
+		col, err := resolvePageCol(view, cols, dim, slot)
 		if err != nil {
 			return err
 		}
-		if isRange {
-			for i := range n {
-				page.Rows[baseRow+i].Tags[dim] = d.resolve(series, uint8(dim), col.tagAt(rangeLo+i))
+		for i := range n {
+			r := rangeLo + i
+			if !isRange {
+				r = int(rows[i])
 			}
-		} else {
-			for i, r := range rows {
-				page.Rows[baseRow+i].Tags[dim] = d.resolve(series, uint8(dim), col.tagAt(int(r)))
-			}
+			outRows[i].Tags[dim] = d.resolve(series, uint8(dim), col.tagAt(r))
 		}
 	}
 	for m := range 4 {
-		col, err := decodeStreamColInto(view, 8+m, slot)
+		col, err := resolvePageCol(view, cols, 8+m, slot)
 		if err != nil {
 			return err
 		}
-		if isRange {
-			for i := range n {
-				page.Rows[baseRow+i].Values[m] = col.valAt(rangeLo + i)
+		for i := range n {
+			r := rangeLo + i
+			if !isRange {
+				r = int(rows[i])
 			}
-		} else {
-			for i, r := range rows {
-				page.Rows[baseRow+i].Values[m] = col.valAt(int(r))
-			}
+			outRows[i].Values[m] = col.valAt(r)
 		}
 	}
-	mcol, err := decodeStreamColInto(view, 12, slot)
+	mcol, err := resolvePageCol(view, cols, 12, slot)
 	if err != nil {
 		return err
 	}
-	if isRange {
-		for i := range n {
-			page.Rows[baseRow+i].Mask = mcol.maskAt(rangeLo + i)
-		}
-	} else {
-		for i, r := range rows {
-			page.Rows[baseRow+i].Mask = mcol.maskAt(int(r))
-		}
-	}
-	return nil
-}
-
-func appendPageFromCols(cols *[streamColumnCount]decodedCol, meta SegmentMeta, d dictionary, series uint16, arity int, isRange bool, rangeLo int, rows []int32, n int, page *PageResult) {
-	baseRow := len(page.Rows)
-	tagStart := len(page.tagBuf)
-	page.Rows = page.Rows[:baseRow+n]
-	page.tagBuf = page.tagBuf[:tagStart+n*arity]
 	for i := range n {
 		r := rangeLo + i
 		if !isRange {
 			r = int(rows[i])
 		}
-		tags := page.tagBuf[tagStart+i*arity : tagStart+(i+1)*arity]
-		for dim := range arity {
-			tags[dim] = d.resolve(series, uint8(dim), cols[dim].tagAt(r))
-		}
-		page.Rows[baseRow+i] = PageRow{
-			From: meta.CoveredFrom, Resolution: meta.Resolution, Exact: meta.Exact,
-			Tags:   tags,
-			Values: [4]int64{cols[8].valAt(r), cols[9].valAt(r), cols[10].valAt(r), cols[11].valAt(r)},
-			Mask:   cols[12].maskAt(r),
-		}
+		outRows[i].Mask = mcol.maskAt(r)
 	}
+	return nil
 }

@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -43,7 +42,6 @@ func scanWALFrameMetas(f *osFile, start, end int64) ([]walFrameMeta, error) {
 	var metas []walFrameMeta
 	var head [frameHeader]byte
 	var payloadBuf []byte
-	hash := crc32.New(castagnoli)
 	pos := start
 	for pos < end {
 		if end-pos < frameHeader {
@@ -52,12 +50,9 @@ func scanWALFrameMetas(f *osFile, start, end int64) ([]walFrameMeta, error) {
 		if _, err := f.ReadAt(head[:], pos); err != nil {
 			return nil, err
 		}
-		if !bytes.Equal(head[:4], walMagic[:]) {
-			return nil, errors.New("strata: invalid WAL magic")
-		}
-		ln := binary.LittleEndian.Uint32(head[4:8])
-		if ln > 256<<20 || pos+frameHeader+int64(ln) > end {
-			return nil, errors.New("strata: invalid WAL length")
+		typ, seq, ln, wantCRC, ok := decodeWALHeader(&head, pos, end)
+		if !ok {
+			return nil, errors.New("strata: invalid WAL header")
 		}
 		if cap(payloadBuf) < int(ln) {
 			payloadBuf = make([]byte, ln)
@@ -69,17 +64,14 @@ func scanWALFrameMetas(f *osFile, start, end int64) ([]walFrameMeta, error) {
 				return nil, err
 			}
 		}
-		hash.Reset()
-		_, _ = hash.Write(head[12:])
-		_, _ = hash.Write(payloadBuf)
-		if hash.Sum32() != binary.LittleEndian.Uint32(head[8:12]) {
+		if crc32.Update(crc32.Update(0, castagnoli, head[12:]), castagnoli, payloadBuf) != wantCRC {
 			return nil, errors.New("strata: WAL CRC mismatch")
 		}
 		m := walFrameMeta{
 			offset: pos,
 			length: ln,
-			typ:    head[12],
-			seq:    binary.LittleEndian.Uint64(head[13:21]),
+			typ:    typ,
+			seq:    seq,
 		}
 		switch m.typ {
 		case frameDelta:
@@ -282,7 +274,6 @@ func copyWALRangeStreaming(dst, src *osFile, start, end int64, minSeq uint64, ds
 		copyBuf = make([]byte, 64<<10)
 	}
 	var head [frameHeader]byte
-	hash := crc32.New(castagnoli)
 	pos := start
 	for pos < end {
 		if end-pos < frameHeader {
@@ -291,15 +282,11 @@ func copyWALRangeStreaming(dst, src *osFile, start, end int64, minSeq uint64, ds
 		if _, err := src.ReadAt(head[:], pos); err != nil {
 			return dstPos, err
 		}
-		if !bytes.Equal(head[:4], walMagic[:]) {
-			return dstPos, errors.New("strata: invalid WAL magic")
+		_, seq, ln, wantCRC, ok := decodeWALHeader(&head, pos, end)
+		if !ok {
+			return dstPos, errors.New("strata: invalid WAL header")
 		}
-		ln := binary.LittleEndian.Uint32(head[4:8])
 		frameSize := int64(frameHeader) + int64(ln)
-		if ln > 256<<20 || pos+frameSize > end {
-			return dstPos, errors.New("strata: invalid WAL length")
-		}
-		seq := binary.LittleEndian.Uint64(head[13:21])
 		if seq <= minSeq {
 			pos += frameSize
 			continue
@@ -307,8 +294,7 @@ func copyWALRangeStreaming(dst, src *osFile, start, end int64, minSeq uint64, ds
 		if _, err := dst.WriteAt(head[:], dstPos); err != nil {
 			return dstPos, err
 		}
-		hash.Reset()
-		_, _ = hash.Write(head[12:])
+		sum := crc32.Update(0, castagnoli, head[12:])
 		srcOff := pos + frameHeader
 		dstPos += frameHeader
 		rem := int64(ln)
@@ -321,12 +307,12 @@ func copyWALRangeStreaming(dst, src *osFile, start, end int64, minSeq uint64, ds
 			if _, err := dst.WriteAt(chunk, dstPos); err != nil {
 				return dstPos, err
 			}
-			_, _ = hash.Write(chunk)
+			sum = crc32.Update(sum, castagnoli, chunk)
 			srcOff += chunkLen
 			dstPos += chunkLen
 			rem -= chunkLen
 		}
-		if hash.Sum32() != binary.LittleEndian.Uint32(head[8:12]) {
+		if sum != wantCRC {
 			return dstPos, errors.New("strata: WAL CRC mismatch")
 		}
 		pos += frameSize

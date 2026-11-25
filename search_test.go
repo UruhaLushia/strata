@@ -262,7 +262,7 @@ func fullScanFineRows(s *Series, from, to time.Time, allTime bool) ([]Row, error
 		if blockExcludedRules(s.rules, meta.start, meta.end(), meta.epoch) {
 			continue
 		}
-		decoded, err := db.readSealedMeta(meta)
+		decoded, err := loadSealedBlockFromView(db.view, db.head.sections[secTSBlocks], meta)
 		if err != nil {
 			return nil, err
 		}
@@ -558,15 +558,8 @@ func TestEmptyTagFilteringAndWideCursorPagination(t *testing.T) {
 			t.Fatalf("%s Aggregate sum=%d want=%d", tc.name, aggSum, tc.wantSum)
 		}
 
-		var scanCount int
-		var scanSum int64
-		if err := s.Scan(ctx, ScanQuery{From: base, To: now.Add(time.Minute), Filters: tc.filters}, func(b ScanBatch) error {
-			for i := range b.Len() {
-				scanCount++
-				scanSum += b.Values(i)[0]
-			}
-			return nil
-		}); err != nil {
+		scanCount, scanSum, err := scanCountSumErr(ctx, s, ScanQuery{From: base, To: now.Add(time.Minute), Filters: tc.filters})
+		if err != nil {
 			t.Fatalf("%s Scan: %v", tc.name, err)
 		}
 		if scanCount != tc.wantCount || scanSum != tc.wantSum {

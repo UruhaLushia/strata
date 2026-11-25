@@ -53,7 +53,7 @@ func mergeSlot(db *DB, chosen sealedMeta, sources querySources, s *Series) (seal
 			b = *cand.live
 			b.rows = cloneRows(b.rows)
 		} else {
-			b, err = db.readSealedMeta(cand.sealed)
+			b, err = loadSealedBlockFromView(db.view, db.head.sections[secTSBlocks], cand.sealed)
 			if err != nil {
 				return sealedBlock{}, nil, err
 			}

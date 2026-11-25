@@ -215,28 +215,16 @@ func (c *dictHotCache) put(value string, id uint32) {
 	}
 }
 
-func (dim *dictDim) lookupExt(value string) uint32 {
-	for id, v := range dim.extra {
-		if v == value {
-			return id
-		}
+func (dim *dictDim) cacheHot(value string, id uint32, budget int) {
+	dim.revMu.Lock()
+	if dim.hot == nil {
+		dim.hot = newDictHotCache(budget)
 	}
-	if id := dim.tailByKey[value]; id != 0 && !hasExtraOverride(dim.extra, id) {
-		return id
-	}
-	dim.revMu.RLock()
-	id := dim.hot.get(value)
-	dim.revMu.RUnlock()
-	if id != 0 && !hasExtraOverride(dim.extra, id) {
-		return id
-	}
-	if id = dim.ext.lookupSST(value); id != 0 && !hasExtraOverride(dim.extra, id) {
-		return id
-	}
-	return 0
+	dim.hot.put(value, id)
+	dim.revMu.Unlock()
 }
 
-func (d *dictionary) internExt(dim *dictDim, value string) (uint32, bool) {
+func (dim *dictDim) lookupExt(value string) (uint32, bool) {
 	for id, v := range dim.extra {
 		if v == value {
 			return id, false
@@ -245,16 +233,23 @@ func (d *dictionary) internExt(dim *dictDim, value string) (uint32, bool) {
 	if id := dim.tailByKey[value]; id != 0 && !hasExtraOverride(dim.extra, id) {
 		return id, false
 	}
-	if id := dim.hot.get(value); id != 0 && !hasExtraOverride(dim.extra, id) {
+	dim.revMu.RLock()
+	id := dim.hot.get(value)
+	dim.revMu.RUnlock()
+	if id != 0 && !hasExtraOverride(dim.extra, id) {
 		return id, false
 	}
-	if id := dim.ext.lookupSST(value); id != 0 && !hasExtraOverride(dim.extra, id) {
-		dim.revMu.Lock()
-		if dim.hot == nil {
-			dim.hot = newDictHotCache(d.hotBudget)
+	if id = dim.ext.lookupSST(value); id != 0 && !hasExtraOverride(dim.extra, id) {
+		return id, true
+	}
+	return 0, false
+}
+
+func (d *dictionary) internExt(dim *dictDim, value string) (uint32, bool) {
+	if id, fromSST := dim.lookupExt(value); id != 0 {
+		if fromSST {
+			dim.cacheHot(value, id, d.hotBudget)
 		}
-		dim.hot.put(value, id)
-		dim.revMu.Unlock()
 		return id, false
 	}
 	id := dim.nextID
@@ -263,12 +258,7 @@ func (d *dictionary) internExt(dim *dictDim, value string) (uint32, bool) {
 		dim.tailByKey = make(map[string]uint32)
 	}
 	dim.tailByKey[value] = id
-	dim.revMu.Lock()
-	if dim.hot == nil {
-		dim.hot = newDictHotCache(d.hotBudget)
-	}
-	dim.hot.put(value, id)
-	dim.revMu.Unlock()
+	dim.cacheHot(value, id, d.hotBudget)
 	return id, true
 }
 

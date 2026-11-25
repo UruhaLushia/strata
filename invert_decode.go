@@ -149,7 +149,10 @@ func decodeInvertChunkScan(plain []byte, wanted map[uint64]struct{}, onPosting f
 		k := binary.LittleEndian.Uint64(plain[off:])
 		mode := plain[off+8]
 		off += 9
-		match := wanted == nil || hasInvertKey(wanted, k)
+		match := wanted == nil
+		if !match {
+			_, match = wanted[k]
+		}
 		if err := decodeInvertRecordBody(plain, &off, k, mode, match, onPosting, onDense); err != nil {
 			return err
 		}
@@ -191,9 +194,4 @@ func decodeInvertChunkSorted(plain []byte, prefixKey uint64, wantedTags []uint32
 		}
 	}
 	return nil
-}
-
-func hasInvertKey(wanted map[uint64]struct{}, key uint64) bool {
-	_, ok := wanted[key]
-	return ok
 }

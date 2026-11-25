@@ -17,17 +17,6 @@ func excludedByRuleSlice(rules []resetRule, start int64, epoch uint64) bool {
 	return false
 }
 
-func (db *DB) readSealed(b sealedBlock) (sealedBlock, error) {
-	if b.offset == 0 && b.length == 0 {
-		return b, nil
-	}
-	return loadSealedBlock(db, b)
-}
-
-func (db *DB) readSealedMeta(m sealedMeta) (sealedBlock, error) {
-	return db.readSealed(m.toBlock())
-}
-
 func loadSealedBlockFromView(view *fileView, sec sectionDesc, meta sealedMeta) (sealedBlock, error) {
 	if view == nil || view.data == nil {
 		return sealedBlock{}, errors.New("strata: missing source file view")

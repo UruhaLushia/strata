@@ -19,7 +19,6 @@ type invertChunkSink struct {
 	chunkFile  *osFile
 	chunkPos   int64
 	memChunks  []byte
-	memLimit   int
 	dir        []invertChunkDir
 	rawChunk   []byte
 	chunkFirst uint64
@@ -63,11 +62,7 @@ func (s *invertChunkSink) flushChunk() error {
 		first: s.chunkFirst, last: s.chunkLast,
 		length: uint32(len(comp)), crc: crc(comp),
 	})
-	limit := s.memLimit
-	if limit <= 0 {
-		limit = invertMemChunkLimit
-	}
-	if s.chunkFile == nil && len(s.memChunks)+len(comp) > limit {
+	if s.chunkFile == nil && len(s.memChunks)+len(comp) > invertMemChunkLimit {
 		_ = os.Remove(s.chunkPath)
 		f, err := openData(s.chunkPath, false)
 		if err != nil {

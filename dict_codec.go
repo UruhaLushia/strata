@@ -9,16 +9,13 @@ import (
 	"strings"
 )
 
+var (
+	errTruncatedDict   = errors.New("strata: truncated dictionary")
+	errInvalidDictVint = errors.New("strata: invalid dictionary varint")
+)
+
 func readDictUvarint(raw []byte, off *int) (uint64, error) {
-	if *off >= len(raw) {
-		return 0, errors.New("strata: truncated dictionary")
-	}
-	value, n := binary.Uvarint(raw[*off:])
-	if n <= 0 {
-		return 0, errors.New("strata: invalid dictionary varint")
-	}
-	*off += n
-	return value, nil
+	return readSliceUvarint(raw, off, errTruncatedDict, errInvalidDictVint)
 }
 
 func readDictUint16(raw []byte, off *int) (uint16, error) {

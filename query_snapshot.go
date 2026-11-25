@@ -51,10 +51,6 @@ func (s *querySnapshot) buildExecDB() *DB {
 	return execDB
 }
 
-func dictionarySnapshot(d dictionary, series uint16) dictionary {
-	return dictionarySnapshotForQuery(d, series, nil)
-}
-
 func dictionarySnapshotForQuery(d dictionary, series uint16, filters []Filter) dictionary {
 	var wantSorted uint8
 	for _, f := range filters {

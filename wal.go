@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"io"
 )
 
@@ -20,7 +21,6 @@ type walFrame struct {
 	typ     byte
 	seq     uint64
 	payload []byte
-	raw     []byte
 }
 
 func encodeDelta(dicts []dictEntry, buckets []*bucket) []byte {
@@ -220,6 +220,17 @@ func appendFrame(f *osFile, pos int64, typ byte, seq uint64, payload []byte) (in
 	}
 	return pos + int64(n), nil
 }
+func decodeWALHeader(head *[frameHeader]byte, pos, limit int64) (kind uint8, seq uint64, length uint32, wantCRC uint32, ok bool) {
+	if !bytes.Equal(head[:4], walMagic[:]) {
+		return 0, 0, 0, 0, false
+	}
+	ln := binary.LittleEndian.Uint32(head[4:8])
+	if ln > 256<<20 || pos+frameHeader+int64(ln) > limit {
+		return 0, 0, 0, 0, false
+	}
+	return head[12], binary.LittleEndian.Uint64(head[13:21]), ln, binary.LittleEndian.Uint32(head[8:12]), true
+}
+
 func scanWAL(f *osFile, start int64, truncate bool, apply func(walFrame) error) (int64, uint64, error) {
 	info, err := f.Stat()
 	if err != nil {
@@ -228,27 +239,25 @@ func scanWAL(f *osFile, start int64, truncate bool, apply func(walFrame) error) 
 	size := info.Size()
 	pos := start
 	var max uint64
+	var head [frameHeader]byte
 	for pos+frameHeader <= size {
-		head := make([]byte, frameHeader)
-		if _, err = f.ReadAt(head, pos); err != nil {
+		if _, err = f.ReadAt(head[:], pos); err != nil {
 			break
 		}
-		if !bytes.Equal(head[:4], walMagic[:]) {
-			break
-		}
-		ln := binary.LittleEndian.Uint32(head[4:8])
-		if ln > 256<<20 || pos+frameHeader+int64(ln) > size {
+		typ, seq, ln, wantCRC, ok := decodeWALHeader(&head, pos, size)
+		if !ok {
 			break
 		}
 		payload := make([]byte, ln)
-		if _, err = f.ReadAt(payload, pos+frameHeader); err != nil {
+		if ln > 0 {
+			if _, err = f.ReadAt(payload, pos+frameHeader); err != nil {
+				break
+			}
+		}
+		if crc32.Update(crc32.Update(0, castagnoli, head[12:]), castagnoli, payload) != wantCRC {
 			break
 		}
-		check := append(append([]byte(nil), head[12:]...), payload...)
-		if crc(check) != binary.LittleEndian.Uint32(head[8:12]) {
-			break
-		}
-		fr := walFrame{typ: head[12], seq: binary.LittleEndian.Uint64(head[13:21]), payload: payload, raw: append(head, payload...)}
+		fr := walFrame{typ: typ, seq: seq, payload: payload}
 		if fr.seq > max {
 			max = fr.seq
 		}

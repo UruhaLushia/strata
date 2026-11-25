@@ -16,29 +16,6 @@ import (
 	"unsafe"
 )
 
-func testDB(t *testing.T, now *time.Time, extra Options) (*DB, *Series) {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "strata.db")
-	extra.Now = func() time.Time { return *now }
-	db, err := Open(path, extra)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := SeriesConfig{Arity: 2, SummaryOps: [4]MetricOp{OpSum, OpMin, OpMax, OpLast}, RowOps: [4]MetricOp{OpSum, OpMin, OpMax, OpLast}}
-	s, err := db.Series(7, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return db, s
-}
-
-func appendValue(t *testing.T, s *Series, ts time.Time, value int64) {
-	t.Helper()
-	if err := s.AppendSync(ts, Summary{Values: [4]int64{value, value, value, value}}, Row{Tags: []string{"a", "b"}, Values: [4]int64{value, value, value, value}}); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestNoInternalImports(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -118,33 +95,23 @@ func TestOptionalSectionsAndFeatureErrors(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	slot := make([]byte, slotSize)
-	if _, err = f.ReadAt(slot, 0); err != nil {
-		t.Fatal(err)
-	}
 	payload := []byte("future-optional")
-	info, _ := f.Stat()
-	off := info.Size()
-	if _, err = f.WriteAt(payload, off); err != nil {
-		t.Fatal(err)
-	}
-	p := 200 + 7*32
-	binary.LittleEndian.PutUint16(slot[p:p+2], 99)
-	slot[p+3] = 1
-	binary.LittleEndian.PutUint64(slot[p+8:p+16], uint64(off))
-	binary.LittleEndian.PutUint64(slot[p+16:p+24], uint64(len(payload)))
-	binary.LittleEndian.PutUint32(slot[p+24:p+28], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(slot[p+28:p+32], crc(payload))
-	binary.LittleEndian.PutUint32(slot[slotSize-4:], crc(slot[:slotSize-4]))
-	_, _ = f.WriteAt(slot, 0)
-	_, _ = f.WriteAt(slot, slotSize)
-	_ = f.Close()
+	patchSuperSlot(t, path, func(f *os.File, slot []byte) {
+		info, _ := f.Stat()
+		off := info.Size()
+		if _, err := f.WriteAt(payload, off); err != nil {
+			t.Fatal(err)
+		}
+		p := 200 + 7*32
+		binary.LittleEndian.PutUint16(slot[p:p+2], 99)
+		slot[p+3] = 1
+		binary.LittleEndian.PutUint64(slot[p+8:p+16], uint64(off))
+		binary.LittleEndian.PutUint64(slot[p+16:p+24], uint64(len(payload)))
+		binary.LittleEndian.PutUint32(slot[p+24:p+28], uint32(len(payload)))
+		binary.LittleEndian.PutUint32(slot[p+28:p+32], crc(payload))
+	})
 
-	db, err = Open(path, Options{})
+	db, err := Open(path, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,18 +134,9 @@ func TestOptionalSectionsAndFeatureErrors(t *testing.T) {
 
 	// roCompat bit rejects writer; incompat bit rejects reader.
 	patchFeature := func(byteOff int) {
-		rf, err := os.OpenFile(path, os.O_RDWR, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer rf.Close()
-		if _, err = rf.ReadAt(slot, 0); err != nil {
-			t.Fatal(err)
-		}
-		binary.LittleEndian.PutUint32(slot[byteOff:byteOff+4], 1)
-		binary.LittleEndian.PutUint32(slot[slotSize-4:], crc(slot[:slotSize-4]))
-		_, _ = rf.WriteAt(slot, 0)
-		_, _ = rf.WriteAt(slot, slotSize)
+		patchSuperSlot(t, path, func(_ *os.File, slot []byte) {
+			binary.LittleEndian.PutUint32(slot[byteOff:byteOff+4], 1)
+		})
 	}
 	patchFeature(16)
 	if _, err = Open(path, Options{}); err != ErrReadOnlyCompat {
@@ -301,62 +259,41 @@ func TestRejectLegacyFormats(t *testing.T) {
 
 	t.Run("Legacy64BIndex", func(t *testing.T) {
 		path := newCompacted(t, "legacy64.db")
-		f, err := openData(path, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		head, err := readSuper(f)
-		if err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		idxd := head.sections[secTSIndex]
-		if idxd.count == 0 {
-			_ = f.Close()
-			t.Fatal("expected non-empty SecTSIndex")
-		}
-		raw, err := sectionRaw(f, idxd, nil)
-		if err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		raw, err = zstdDecompress(raw)
-		if err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		n := int(idxd.count)
-		legacy := make([]byte, n*64)
-		for i := range n {
-			copy(legacy[i*64:i*64+52], raw[i*104:i*104+52])
-		}
-		enc := newZstdEncoder(CompressionDefault, 64<<10)
-		comp := enc.EncodeAll(legacy, nil)
-		enc.Close()
-		info, err := f.Stat()
-		if err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		off := info.Size()
-		if _, err := f.WriteAt(comp, off); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		head.sections[secTSIndex].offset = uint64(off)
-		head.sections[secTSIndex].length = uint64(len(comp))
-		head.sections[secTSIndex].rawLen = uint32(len(legacy))
-		head.sections[secTSIndex].crc = crc(comp)
-		head.gen++
-		if err := writeSupers(f, head); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		if err := syncData(f); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		_ = f.Close()
+		patchSuperblocks(t, path, func(f *osFile, head *superblock) {
+			idxd := head.sections[secTSIndex]
+			if idxd.count == 0 {
+				t.Fatal("expected non-empty SecTSIndex")
+			}
+			raw, err := sectionRaw(f, idxd, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err = zstdDecompress(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := int(idxd.count)
+			legacy := make([]byte, n*64)
+			for i := range n {
+				copy(legacy[i*64:i*64+52], raw[i*104:i*104+52])
+			}
+			enc := newZstdEncoder(CompressionDefault, 64<<10)
+			comp := enc.EncodeAll(legacy, nil)
+			enc.Close()
+			info, err := f.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			off := info.Size()
+			if _, err := f.WriteAt(comp, off); err != nil {
+				t.Fatal(err)
+			}
+			head.sections[secTSIndex].offset = uint64(off)
+			head.sections[secTSIndex].length = uint64(len(comp))
+			head.sections[secTSIndex].rawLen = uint32(len(legacy))
+			head.sections[secTSIndex].crc = crc(comp)
+			head.gen++
+		})
 
 		ro, err := Open(path, Options{ReadOnly: true, Now: func() time.Time { return clock }})
 		if err == nil {
@@ -370,30 +307,13 @@ func TestRejectLegacyFormats(t *testing.T) {
 
 	t.Run("LegacyDictCodec", func(t *testing.T) {
 		path := newCompacted(t, "legacy_dict.db")
-		f, err := openData(path, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		head, err := readSuper(f)
-		if err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		if head.sections[secTSDict].length == 0 {
-			_ = f.Close()
-			t.Fatal("expected non-empty SecTSDict")
-		}
-		head.sections[secTSDict].codec = 1
-		head.gen++
-		if err := writeSupers(f, head); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		if err := syncData(f); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		_ = f.Close()
+		patchSuperblocks(t, path, func(_ *osFile, head *superblock) {
+			if head.sections[secTSDict].length == 0 {
+				t.Fatal("expected non-empty SecTSDict")
+			}
+			head.sections[secTSDict].codec = 1
+			head.gen++
+		})
 
 		ro, err := Open(path, Options{ReadOnly: true, Now: func() time.Time { return clock }})
 		if err == nil {
@@ -588,42 +508,16 @@ func TestResetAllCompactLifecycle(t *testing.T) {
 
 		checkState := func(curDB *DB, curS *Series) {
 			t.Helper()
-			res, err := curS.Aggregate(context.Background(), AggregateQuery{
-				From: tsOldDay.Add(-time.Hour),
-				To:   now.Add(time.Hour),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			sum := res.Summary.Values[0]
-			res.Release()
-			if sum != 500 {
+			if sum := queryAggSum(t, curS, AggregateQuery{From: tsOldDay.Add(-time.Hour), To: now.Add(time.Hour)}); sum != 500 {
 				t.Fatalf("unexpected Aggregate sum=%d, want 500", sum)
 			}
-			curReg, err := curDB.Region("meta")
-			if err != nil {
-				t.Fatal(err)
-			}
-			val, ok, err := curReg.Get("state")
-			if err != nil || !ok || string(val) != "active" {
-				t.Fatalf("KV mismatch: val=%q ok=%v err=%v", val, ok, err)
-			}
+			assertKV(t, mustRegion(t, curDB, "meta"), "state", []byte("active"), true)
 		}
 		checkState(db, s)
 
 		// Reopen and verify cleaned rules, newEpoch TS, and KV persist.
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		db = nil
-		db, err = Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s, err = db.Series(7, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		db = reopenTestDB(t, db, path, opts)
+		s = mustSeries(t, db, 7, cfg)
 		if len(s.rules) != 0 || s.resetEpoch != 1 {
 			t.Fatalf("unexpected reopened reset state: epoch=%d rules=%+v", s.resetEpoch, s.rules)
 		}
@@ -667,16 +561,7 @@ func TestResetAllCompactLifecycle(t *testing.T) {
 		if after1hMeta.crc != new1hMeta.crc || after1hMeta.order != new1hMeta.order || after1hMeta.values != new1hMeta.values {
 			t.Fatalf("newEpoch 1h block was altered: before=%+v after=%+v", new1hMeta, after1hMeta)
 		}
-		res, err := s.Aggregate(context.Background(), AggregateQuery{
-			From: tsNewHour.Truncate(time.Hour),
-			To:   tsNewHour.Truncate(time.Hour).Add(time.Hour),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		hourSum := res.Summary.Values[0]
-		res.Release()
-		if hourSum != 500 {
+		if hourSum := queryAggSum(t, s, AggregateQuery{From: tsNewHour.Truncate(time.Hour), To: tsNewHour.Truncate(time.Hour).Add(time.Hour)}); hourSum != 500 {
 			t.Fatalf("unexpected 1h sum after 1m retention expiry: %d", hourSum)
 		}
 	})
@@ -695,10 +580,7 @@ func TestResetAllCompactLifecycle(t *testing.T) {
 			}
 		}()
 		cfg := SeriesConfig{Arity: 2, SummaryOps: [4]MetricOp{OpSum, OpMin, OpMax, OpLast}, RowOps: [4]MetricOp{OpSum, OpMin, OpMax, OpLast}}
-		s, err := db.Series(7, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSeries(t, db, 7, cfg)
 
 		hotMin := now.Truncate(time.Minute)
 		appendValue(t, s, now, 111)
@@ -716,13 +598,7 @@ func TestResetAllCompactLifecycle(t *testing.T) {
 		}
 		checkHotSum := func(curS *Series) {
 			t.Helper()
-			res, err := curS.Aggregate(context.Background(), AggregateQuery{From: hotMin, To: hotMin.Add(time.Minute)})
-			if err != nil {
-				t.Fatal(err)
-			}
-			sum := res.Summary.Values[0]
-			res.Release()
-			if sum != 222 {
+			if sum := queryAggSum(t, curS, AggregateQuery{From: hotMin, To: hotMin.Add(time.Minute)}); sum != 222 {
 				t.Fatalf("hot bucket leaked or lost data: sum=%d, want 222", sum)
 			}
 		}
@@ -736,18 +612,8 @@ func TestResetAllCompactLifecycle(t *testing.T) {
 		}
 
 		// Reopen while frameReset is still unsealed: epoch=0 hot bucket must not resurrect.
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		db = nil
-		db, err = Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s, err = db.Series(7, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		db = reopenTestDB(t, db, path, opts)
+		s = mustSeries(t, db, 7, cfg)
 		if s.resetEpoch != 1 || len(s.rules) != 1 {
 			t.Fatalf("unexpected reopened state with unsealed frameReset: epoch=%d rules=%+v", s.resetEpoch, s.rules)
 		}
@@ -767,18 +633,8 @@ func TestResetAllCompactLifecycle(t *testing.T) {
 		}
 		checkHotSum(s)
 
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		db = nil
-		db, err = Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s, err = db.Series(7, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		db = reopenTestDB(t, db, path, opts)
+		s = mustSeries(t, db, 7, cfg)
 		if len(s.rules) != 0 || s.resetEpoch != 1 {
 			t.Fatalf("unexpected reopened state after seal: epoch=%d rules=%+v", s.resetEpoch, s.rules)
 		}
@@ -829,13 +685,7 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 
 	aggSum := func(t *testing.T, s *Series, f Filter) int64 {
 		t.Helper()
-		res, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, Filters: []Filter{f}})
-		if err != nil {
-			t.Fatalf("aggregate %+v: %v", f, err)
-		}
-		got := res.Summary.Values[0]
-		res.Release()
-		return got
+		return queryAggSum(t, s, AggregateQuery{AllTime: true, Filters: []Filter{f}})
 	}
 
 	t.Run("ExternalReclaimIsolationAndRefresh", func(t *testing.T) {
@@ -853,37 +703,17 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 			}
 		}()
 
-		s1, err := db.Series(11, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s2, err := db.Series(22, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s1 := mustSeries(t, db, 11, cfg)
+		s2 := mustSeries(t, db, 22, cfg)
 
 		const extCount = 17000
 		seedTS := now.Add(-2 * time.Hour)
-		rows1 := make([]Row, extCount)
-		rows2 := make([]Row, extCount)
-		for i := range extCount {
-			rows1[i] = Row{
-				Tags:   []string{fmt.Sprintf("s1-old-%05d", i), fmt.Sprintf("grp-%02d", i%20)},
-				Values: [4]int64{1, 1, 1, 1},
-				Mask:   0x0f,
-			}
-			rows2[i] = Row{
-				Tags:   []string{fmt.Sprintf("s2-keep-%05d", i), fmt.Sprintf("cat-%02d", i%20)},
-				Values: [4]int64{1, 1, 1, 1},
-				Mask:   0x0f,
-			}
-		}
-		if err := s1.Append(seedTS, Summary{Values: [4]int64{extCount, 1, 1, 1}, Mask: 0x0f}, rows1...); err != nil {
-			t.Fatal(err)
-		}
-		if err := s2.Append(seedTS, Summary{Values: [4]int64{extCount, 1, 1, 1}, Mask: 0x0f}, rows2...); err != nil {
-			t.Fatal(err)
-		}
+		seedHighCardMinute(t, s1, seedTS, extCount, func(i int) []string {
+			return []string{fmt.Sprintf("s1-old-%05d", i), fmt.Sprintf("grp-%02d", i%20)}
+		})
+		seedHighCardMinute(t, s2, seedTS, extCount, func(i int) []string {
+			return []string{fmt.Sprintf("s2-keep-%05d", i), fmt.Sprintf("cat-%02d", i%20)}
+		})
 		if err := db.Compact(); err != nil {
 			t.Fatal(err)
 		}
@@ -1022,22 +852,9 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 		_ = roDB.Close()
 
 		// Reopen and verify full persistence, isolation, Client.DictStats, and closed-DB error.
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		db = nil
-		db, err = Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s1, err = db.Series(11, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s2, err = db.Series(22, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		db = reopenTestDB(t, db, path, opts)
+		s1 = mustSeries(t, db, 11, cfg)
+		s2 = mustSeries(t, db, 22, cfg)
 		s1Reopen, err := s1.DictStats()
 		if err != nil {
 			t.Fatal(err)
@@ -1135,18 +952,8 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 		verifyClean("post-immediate-compact", s)
 
 		// Reopen while frameReset is still unsealed in tail WAL.
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		db = nil
-		db, err = Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s, err = db.Series(33, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		db = reopenTestDB(t, db, path, opts)
+		s = mustSeries(t, db, 33, cfg)
 		verifyClean("reopened-unsealed", s)
 
 		// Advance clock, seal frameReset, and reopen.
@@ -1159,18 +966,8 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 		}
 		verifyClean("post-seal-compact", s)
 
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		db = nil
-		db, err = Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s, err = db.Series(33, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
+		db = reopenTestDB(t, db, path, opts)
+		s = mustSeries(t, db, 33, cfg)
 		verifyClean("reopened-sealed", s)
 	})
 
@@ -1229,16 +1026,34 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// 1a. Empty post-ResetAll pre-Compact: AllTime + RequireExact must succeed empty with Exact=true.
-		if agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, RequireExact: true}); err != nil {
-			t.Fatalf("empty SummaryOnly AllTime+RequireExact failed: %v", err)
-		} else {
-			if !agg.Exact || agg.Summary.Values[0] != 0 || len(agg.Segments) != 0 {
+		assertEmptyWindow := func(label string, aq AggregateQuery, rq ReadRequest, sq ScanQuery, checkExact bool) {
+			t.Helper()
+			if agg, err := s.Aggregate(ctx, aq); err != nil {
+				t.Fatalf("%s Aggregate failed: %v", label, err)
+			} else {
+				if (checkExact && !agg.Exact) || agg.Summary.Values[0] != 0 || len(agg.Segments) != 0 {
+					agg.Release()
+					t.Fatalf("%s unexpected Aggregate: %+v", label, agg)
+				}
 				agg.Release()
-				t.Fatalf("unexpected empty SummaryOnly result: %+v", agg)
 			}
-			agg.Release()
+			if page, err := s.Read(ctx, rq); err != nil {
+				t.Fatalf("%s Read failed: %v", label, err)
+			} else {
+				if (checkExact && !page.Exact) || len(page.Rows) != 0 {
+					page.Release()
+					t.Fatalf("%s unexpected Read: %+v", label, page)
+				}
+				page.Release()
+			}
+			if cnt, _, err := scanCountSumErr(ctx, s, sq); err != nil || cnt != 0 {
+				t.Fatalf("%s Scan: err=%v rows=%d", label, err, cnt)
+			}
 		}
+
+		// 1a. Empty post-ResetAll pre-Compact: AllTime + RequireExact must succeed empty with Exact=true.
+		assertEmptyWindow("alltime-summary", AggregateQuery{AllTime: true, RequireExact: true},
+			ReadRequest{AllTime: true, RequireExact: true, Limit: 10}, ScanQuery{AllTime: true, RequireExact: true}, true)
 		if agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, RequireExact: true, GroupDims: []int{0}}); err != nil {
 			t.Fatalf("empty grouped Aggregate AllTime+RequireExact failed: %v", err)
 		} else {
@@ -1248,61 +1063,17 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 			}
 			agg.Release()
 		}
-		if agg, err := s.Aggregate(ctx, AggregateQuery{
+		if sum := queryAggSum(t, s, AggregateQuery{
 			AllTime: true, RequireExact: true,
 			Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"old-day"}}},
-		}); err != nil {
-			t.Fatalf("empty filtered Aggregate AllTime+RequireExact failed: %v", err)
-		} else {
-			if !agg.Exact || agg.Summary.Values[0] != 0 {
-				agg.Release()
-				t.Fatalf("unexpected empty filtered result: %+v", agg)
-			}
-			agg.Release()
-		}
-		if page, err := s.Read(ctx, ReadRequest{AllTime: true, RequireExact: true, Limit: 10}); err != nil {
-			t.Fatalf("empty Read AllTime+RequireExact failed: %v", err)
-		} else {
-			if !page.Exact || len(page.Rows) != 0 {
-				page.Release()
-				t.Fatalf("unexpected empty Read result: %+v", page)
-			}
-			page.Release()
-		}
-		emptyScanRows := 0
-		if err := s.Scan(ctx, ScanQuery{AllTime: true, RequireExact: true}, func(b ScanBatch) error {
-			emptyScanRows += b.Len()
-			return nil
-		}); err != nil || emptyScanRows != 0 {
-			t.Fatalf("empty Scan AllTime+RequireExact: err=%v rows=%d", err, emptyScanRows)
+		}); sum != 0 {
+			t.Fatalf("unexpected empty filtered sum=%d", sum)
 		}
 
 		// Explicit range covering old 1d/1h coarse blocks must not raise ErrResetRequiresFineData.
 		spanFrom, spanTo := oldDay.Add(-time.Hour), now.Add(time.Minute)
-		if agg, err := s.Aggregate(ctx, AggregateQuery{From: spanFrom, To: spanTo}); err != nil {
-			t.Fatalf("explicit-window empty SummaryOnly failed: %v", err)
-		} else {
-			if agg.Summary.Values[0] != 0 {
-				agg.Release()
-				t.Fatalf("old coarse data leaked into SummaryOnly: %+v", agg.Summary)
-			}
-			agg.Release()
-		}
-		if page, err := s.Read(ctx, ReadRequest{From: spanFrom, To: spanTo, Limit: 10}); err != nil {
-			t.Fatalf("explicit-window empty Read failed: %v", err)
-		} else {
-			if len(page.Rows) != 0 {
-				page.Release()
-				t.Fatalf("old coarse data leaked into Read: %+v", page.Rows)
-			}
-			page.Release()
-		}
-		if err := s.Scan(ctx, ScanQuery{From: spanFrom, To: spanTo}, func(b ScanBatch) error {
-			emptyScanRows += b.Len()
-			return nil
-		}); err != nil || emptyScanRows != 0 {
-			t.Fatalf("explicit-window empty Scan: err=%v rows=%d", err, emptyScanRows)
-		}
+		assertEmptyWindow("explicit-empty", AggregateQuery{From: spanFrom, To: spanTo},
+			ReadRequest{From: spanFrom, To: spanTo, Limit: 10}, ScanQuery{From: spanFrom, To: spanTo}, false)
 
 		// 1b. Append new post-ResetAll data (still pre-Compact): AllTime+RequireExact sees only new data and new RequestedFrom.
 		newTS := now.Truncate(time.Minute)
@@ -1311,26 +1082,18 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
-		if agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, RequireExact: true}); err != nil {
-			t.Fatalf("post-write SummaryOnly AllTime+RequireExact failed: %v", err)
-		} else {
-			if !agg.Exact || agg.Summary.Values[0] != 99 || !agg.RequestedFrom.Equal(newTS) {
-				agg.Release()
-				t.Fatalf("unexpected post-write SummaryOnly: exact=%v sum=%d reqFrom=%v wantFrom=%v",
-					agg.Exact, agg.Summary.Values[0], agg.RequestedFrom, newTS)
+		for _, aq := range []AggregateQuery{
+			{AllTime: true, RequireExact: true},
+			{AllTime: true, RequireExact: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"fresh-tag"}}}},
+		} {
+			agg, err := s.Aggregate(ctx, aq)
+			if err != nil {
+				t.Fatalf("post-write Aggregate(%+v) failed: %v", aq, err)
 			}
-			agg.Release()
-		}
-		if agg, err := s.Aggregate(ctx, AggregateQuery{
-			AllTime: true, RequireExact: true,
-			Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"fresh-tag"}}},
-		}); err != nil {
-			t.Fatalf("post-write filtered Aggregate AllTime+RequireExact failed: %v", err)
-		} else {
 			if !agg.Exact || agg.Summary.Values[0] != 99 || !agg.RequestedFrom.Equal(newTS) {
 				agg.Release()
-				t.Fatalf("unexpected post-write filtered Aggregate: exact=%v sum=%d reqFrom=%v",
-					agg.Exact, agg.Summary.Values[0], agg.RequestedFrom)
+				t.Fatalf("unexpected post-write Aggregate: exact=%v sum=%d reqFrom=%v wantFrom=%v",
+					agg.Exact, agg.Summary.Values[0], agg.RequestedFrom, newTS)
 			}
 			agg.Release()
 		}
@@ -1343,26 +1106,13 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 			}
 			page.Release()
 		}
-		scanCnt, scanSum := 0, int64(0)
-		if err := s.Scan(ctx, ScanQuery{AllTime: true, RequireExact: true}, func(b ScanBatch) error {
-			for i := range b.Len() {
-				scanCnt++
-				scanSum += b.Values(i)[0]
-			}
-			return nil
-		}); err != nil || scanCnt != 1 || scanSum != 99 {
+		if scanCnt, scanSum, err := scanCountSumErr(ctx, s, ScanQuery{AllTime: true, RequireExact: true}); err != nil || scanCnt != 1 || scanSum != 99 {
 			t.Fatalf("post-write Scan AllTime+RequireExact: err=%v cnt=%d sum=%d", err, scanCnt, scanSum)
 		}
 
 		// Explicit window spanning old 1d/1h sealed blocks + new live bucket must return only new data.
-		if agg, err := s.Aggregate(ctx, AggregateQuery{From: spanFrom, To: newTS.Add(time.Minute)}); err != nil {
-			t.Fatalf("explicit-window post-write SummaryOnly failed: %v", err)
-		} else {
-			if agg.Summary.Values[0] != 99 {
-				agg.Release()
-				t.Fatalf("explicit-window post-write SummaryOnly sum=%d want=99", agg.Summary.Values[0])
-			}
-			agg.Release()
+		if sum := queryAggSum(t, s, AggregateQuery{From: spanFrom, To: newTS.Add(time.Minute)}); sum != 99 {
+			t.Fatalf("explicit-window post-write SummaryOnly sum=%d want=99", sum)
 		}
 		if page, err := s.Read(ctx, ReadRequest{From: spanFrom, To: newTS.Add(time.Minute), Limit: 10}); err != nil {
 			t.Fatalf("explicit-window post-write Read failed: %v", err)
@@ -1373,14 +1123,7 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 			}
 			page.Release()
 		}
-		scanCnt, scanSum = 0, 0
-		if err := s.Scan(ctx, ScanQuery{From: spanFrom, To: newTS.Add(time.Minute)}, func(b ScanBatch) error {
-			for i := range b.Len() {
-				scanCnt++
-				scanSum += b.Values(i)[0]
-			}
-			return nil
-		}); err != nil || scanCnt != 1 || scanSum != 99 {
+		if scanCnt, scanSum, err := scanCountSumErr(ctx, s, ScanQuery{From: spanFrom, To: newTS.Add(time.Minute)}); err != nil || scanCnt != 1 || scanSum != 99 {
 			t.Fatalf("explicit-window post-write Scan: err=%v cnt=%d sum=%d", err, scanCnt, scanSum)
 		}
 
@@ -1461,7 +1204,6 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 }
 
 func TestBatch1AtomicityAndStartupCleanup(t *testing.T) {
-	ctx := context.Background()
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
 	cfg := SeriesConfig{Arity: 1, SummaryOps: ops, RowOps: ops}
@@ -1539,16 +1281,10 @@ func TestBatch1AtomicityAndStartupCleanup(t *testing.T) {
 		if roDB.head.gen != oldGen {
 			t.Fatalf("failed Refresh mutated generation: got=%d want=%d", roDB.head.gen, oldGen)
 		}
-		res, err := roS.Aggregate(ctx, AggregateQuery{
+		if got := queryAggSum(t, roS, AggregateQuery{
 			AllTime: true,
 			Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"k1"}}},
-		})
-		if err != nil {
-			t.Fatalf("query after failed Refresh returned error: %v", err)
-		}
-		got := res.Summary.Values[0]
-		res.Release()
-		if got != 10 {
+		}); got != 10 {
 			t.Fatalf("query after failed Refresh lost data: got=%d want=10", got)
 		}
 	})
@@ -1632,27 +1368,11 @@ func TestBatch1AtomicityAndStartupCleanup(t *testing.T) {
 		if db.appendSeq != origAppend+2 || db.allocatedSeq != origAlloc+2 {
 			t.Fatalf("unexpected seqs after retry: append=%d alloc=%d want=%d", db.appendSeq, db.allocatedSeq, origAppend+2)
 		}
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
+		reopened := reopenTestDB(t, db, path, Options{Now: func() time.Time { return now }})
 		db = nil
-
-		reopened, err := Open(path, Options{Now: func() time.Time { return now }})
-		if err != nil {
-			t.Fatal(err)
-		}
 		defer reopened.Close()
-		rs, err := reopened.Series(1, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		res, err := rs.Aggregate(ctx, AggregateQuery{AllTime: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := res.Summary.Values[0]
-		res.Release()
-		if got != 30 {
+		rs := mustSeries(t, reopened, 1, cfg)
+		if got := queryAggSum(t, rs, AggregateQuery{AllTime: true}); got != 30 {
 			t.Fatalf("reopened sum after Flush rollback+retry got=%d want=30", got)
 		}
 	})
