@@ -2,6 +2,7 @@ package strata
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -46,9 +47,6 @@ func Open(path string, opts Options) (*DB, error) {
 		series:         make(map[uint16]*Series),
 		dict:           newDictWithPolicy(policy),
 		live:           make(map[bucketKey]*bucket),
-		liveSlot:       make(map[bucketKey]uint8),
-		livePostings:   make(map[uint64]uint64),
-		liveSkipDims:   make(map[dictDimKey]bool),
 		pending:        make(map[bucketKey]*bucket),
 		kvCatalog:      make(map[string]uint16),
 		kvRegions:      make(map[uint16]*kvRegion),
@@ -93,11 +91,6 @@ func (db *DB) loadLocked() error {
 	db.series = make(map[uint16]*Series)
 	db.dict = newDictWithPolicy(db.policy)
 	db.live = make(map[bucketKey]*bucket)
-	db.liveOrder = nil
-	db.liveSlot = make(map[bucketKey]uint8)
-	db.livePostings = make(map[uint64]uint64)
-	db.livePostingsOverflow = false
-	db.liveSkipDims = make(map[dictDimKey]bool)
 	db.pending = make(map[bucketKey]*bucket)
 	db.pendingDict = nil
 	db.pendingBytes = 0
@@ -259,6 +252,9 @@ func (db *DB) applyFrame(fr walFrame) error {
 		if s.resetEpoch == x.oldEpoch || s.resetEpoch < x.newEpoch {
 			s.resetEpoch = x.newEpoch
 			s.rules = append(s.rules, resetRule{oldEpoch: x.oldEpoch, from: x.from, to: x.to})
+		}
+		if x.from == math.MinInt64 && x.to == math.MaxInt64 {
+			db.resetSeriesDictAndLiveLocked(x.series, x.oldEpoch)
 		}
 	case frameKVBatch:
 		rev, ops, err := decodeKVBatch(fr.payload)

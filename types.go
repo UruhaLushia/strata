@@ -100,6 +100,17 @@ type GroupRow struct {
 	Summary Summary
 }
 
+type DictDimStats struct {
+	Dim           int
+	MaxID         uint32
+	LiveCount     uint32
+	DeadCount     uint32
+	InlineBytes   uint64
+	ExternalBytes uint64
+	ForwardPages  uint32
+	ReverseBlocks uint32
+}
+
 type SegmentMeta struct {
 	RequestedFrom time.Time
 	RequestedTo   time.Time
@@ -262,11 +273,6 @@ type DB struct {
 	optional              []optionalSection
 	mapped                mapView
 	live                  map[bucketKey]*bucket
-	liveOrder             []bucketKey
-	liveSlot              map[bucketKey]uint8
-	livePostings          map[uint64]uint64
-	livePostingsOverflow  bool
-	liveSkipDims          map[dictDimKey]bool
 	appendSeq             uint64
 	allocatedSeq          uint64
 	durableSeq            uint64

@@ -58,7 +58,7 @@ func (s *Series) aggregateWithDefaultWindow(ctx context.Context, q AggregateQuer
 			db.mu.RUnlock()
 			return out, nil
 		}
-		sources := buildQuerySourcesLocked(db, s, from, to, nil, 0, false, false)
+		sources := buildSummarySourcesLocked(db, s, from, to)
 		execSeries := *s
 		execSeries.rules = sources.fine.rules
 		db.mu.RUnlock()

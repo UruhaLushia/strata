@@ -233,6 +233,14 @@ func (c *Client) WithAggregate(ctx context.Context, seriesID uint16, q Aggregate
 	return fn(res)
 }
 
+func (c *Client) DictStats(seriesID uint16) ([]DictDimStats, error) {
+	s, _, err := c.resolveSeriesAndOpts(seriesID)
+	if err != nil {
+		return nil, err
+	}
+	return s.DictStats()
+}
+
 func (c *Client) Reclaim() {
 	if db, err := c.activeDB(); err == nil {
 		db.reclaim()

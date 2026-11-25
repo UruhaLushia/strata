@@ -62,13 +62,37 @@ func (b *blockBitmap) intersect(other *blockBitmap) {
 }
 
 func searchBounds(db *DB, series uint16) (int64, int64) {
+	var rules []resetRule
+	if s := db.series[series]; s != nil {
+		rules = s.rules
+	}
+	sealedExcluded := func(res byte, b sealedMeta) bool {
+		if len(rules) == 0 {
+			return false
+		}
+		if res == resMinuteHR {
+			return blockExcludedRules(rules, b.start, b.end(), b.epoch)
+		}
+		return blockExcludedByResetAll(rules, b.epoch)
+	}
 	var minTS, maxTS int64
 	for key, indexes := range db.sealedByRes {
 		if key.series != series || len(indexes) == 0 {
 			continue
 		}
-		first := db.sealed[indexes[0]]
-		last := db.sealed[indexes[len(indexes)-1]]
+		lo := 0
+		for lo < len(indexes) && sealedExcluded(key.res, db.sealed[indexes[lo]]) {
+			lo++
+		}
+		if lo == len(indexes) {
+			continue
+		}
+		hi := len(indexes) - 1
+		for hi > lo && sealedExcluded(key.res, db.sealed[indexes[hi]]) {
+			hi--
+		}
+		first := db.sealed[indexes[lo]]
+		last := db.sealed[indexes[hi]]
 		if minTS == 0 || first.start < minTS {
 			minTS = first.start
 		}
@@ -78,6 +102,9 @@ func searchBounds(db *DB, series uint16) (int64, int64) {
 	}
 	for k, b := range db.live {
 		if k.series != series {
+			continue
+		}
+		if len(rules) > 0 && blockExcludedRules(rules, b.ts, b.ts+60, b.epoch) {
 			continue
 		}
 		if minTS == 0 || b.ts < minTS {

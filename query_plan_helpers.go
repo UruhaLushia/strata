@@ -27,8 +27,23 @@ func blockExcludedRules(rules []resetRule, start, end int64, epoch uint64) bool 
 	return false
 }
 
+func blockExcludedByResetAll(rules []resetRule, epoch uint64) bool {
+	for _, r := range rules {
+		if r.isAll() && epoch <= r.oldEpoch {
+			return true
+		}
+	}
+	return false
+}
+
 func (src *blockSource) excluded(b *sealedMeta) bool {
-	return src.filterFine && len(src.rules) > 0 && blockExcludedRules(src.rules, b.start, b.end(), b.epoch)
+	if len(src.rules) == 0 {
+		return false
+	}
+	if src.filterFine {
+		return blockExcludedRules(src.rules, b.start, b.end(), b.epoch)
+	}
+	return blockExcludedByResetAll(src.rules, b.epoch)
 }
 
 func (src *blockSource) isCandidate(pos uint32) bool {
@@ -237,7 +252,8 @@ func coarseCutByRuleCursor(cursor int64, s *Series, hours, days *blockCursor) bo
 			if b.start > cursor {
 				break
 			}
-			if (preFiltered || c.src.isCandidate(pos)) && b.end() > cursor && metaCutByRule(*b, s) {
+			if (preFiltered || c.src.isCandidate(pos)) && b.end() > cursor &&
+				!blockExcludedByResetAll(s.rules, b.epoch) && metaCutByRule(*b, s) {
 				return true
 			}
 		}

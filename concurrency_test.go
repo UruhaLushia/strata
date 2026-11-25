@@ -967,3 +967,242 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 		})
 	}
 }
+
+func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
+	ctx := context.Background()
+	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
+	baseNow := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+
+	var clockSec atomic.Int64
+	clockSec.Store(baseNow.Unix())
+
+	db, err := Open(filepath.Join(t.TempDir(), "reset-all-race.db"), Options{
+		Now:     func() time.Time { return time.Unix(clockSec.Load(), 0).UTC() },
+		UseMmap: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s1, err := db.Series(1, SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := db.Series(2, SeriesConfig{Arity: 1, SummaryOps: ops, RowOps: ops})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const extCount = 17000
+	seedTS := baseNow.Add(-2 * time.Hour)
+	rows1 := make([]Row, extCount)
+	for i := range rows1 {
+		rows1[i] = Row{
+			Tags:   []string{fmt.Sprintf("old-%05d.net", i), fmt.Sprintf("g-%02d", i%10)},
+			Values: [4]int64{1, 1, 1, 1},
+			Mask:   0x0f,
+		}
+	}
+	rows2 := make([]Row, 200)
+	for i := range rows2 {
+		rows2[i] = Row{
+			Tags:   []string{fmt.Sprintf("keep-%03d", i)},
+			Values: [4]int64{1, 1, 1, 1},
+			Mask:   0x0f,
+		}
+	}
+	if err := s1.Append(seedTS, Summary{Values: [4]int64{extCount, 1, 1, 1}, Mask: 0x0f}, rows1...); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Append(seedTS, Summary{Values: [4]int64{200, 1, 1, 1}, Mask: 0x0f}, rows2...); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	initStats, err := s1.DictStats()
+	if err != nil || len(initStats) != 2 || initStats[0].ExternalBytes == 0 {
+		t.Fatalf("expected external dict on s1 before concurrent ResetAll: err=%v stats=%+v", err, initStats)
+	}
+
+	var stopReaders atomic.Bool
+	var reads atomic.Int64
+	readersActive := make(chan struct{})
+	var sigActive sync.Once
+	errCh := make(chan error, 32)
+	recErr := func(err error) {
+		if err != nil {
+			select {
+			case errCh <- err:
+			default:
+			}
+			sigActive.Do(func() { close(readersActive) })
+		}
+	}
+
+	var readerWG sync.WaitGroup
+	for rID := range 3 {
+		readerWG.Add(1)
+		go func(id int) {
+			defer readerWG.Done()
+			defer sigActive.Do(func() { close(readersActive) })
+			iter := 0
+			for !stopReaders.Load() {
+				iter++
+				switch (iter + id) % 5 {
+				case 0:
+					agg, err := s1.Aggregate(ctx, AggregateQuery{
+						AllTime: true,
+						Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"old-0010"}}},
+					})
+					if err != nil {
+						recErr(err)
+						return
+					}
+					agg.Release()
+				case 1:
+					page, err := s1.Read(ctx, ReadRequest{
+						AllTime: true,
+						Limit:   10,
+						Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".net"}}},
+					})
+					if err != nil {
+						recErr(err)
+						return
+					}
+					page.Release()
+				case 2:
+					if err := s1.Scan(ctx, ScanQuery{
+						AllTime:   true,
+						BatchSize: 64,
+						Filters:   []Filter{{Dim: 0, Op: TagPrefix, Values: []string{"live-"}}},
+					}, func(ScanBatch) error { return nil }); err != nil {
+						recErr(err)
+						return
+					}
+				case 3:
+					if _, err := s1.DictStats(); err != nil {
+						recErr(err)
+						return
+					}
+				case 4:
+					agg, err := s2.Aggregate(ctx, AggregateQuery{
+						AllTime: true,
+						Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"keep-042"}}},
+					})
+					if err != nil {
+						recErr(err)
+						return
+					}
+					got := agg.Summary.Values[0]
+					agg.Release()
+					if got != 1 {
+						recErr(fmt.Errorf("s2 affected by concurrent s1 ResetAll: got=%d want=1", got))
+						return
+					}
+				}
+				if reads.Add(1) >= 2 {
+					sigActive.Do(func() { close(readersActive) })
+				}
+			}
+		}(rID)
+	}
+
+	<-readersActive
+
+	var mutWG sync.WaitGroup
+	mutWG.Go(func() {
+		for step := range 60 {
+			ts := time.Unix(clockSec.Add(60), 0).UTC()
+			row := Row{
+				Tags:   []string{fmt.Sprintf("live-%03d.net", step), fmt.Sprintf("g-%02d", step%10)},
+				Values: [4]int64{2, 2, 2, 2},
+				Mask:   0x0f,
+			}
+			if err := s1.Append(ts, Summary{Values: [4]int64{2, 2, 2, 2}, Mask: 0x0f}, row); err != nil {
+				recErr(err)
+				return
+			}
+		}
+	})
+	mutWG.Go(func() {
+		for range 3 {
+			runtime.Gosched()
+			if err := s1.ResetAll(); err != nil {
+				recErr(err)
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	})
+	mutWG.Go(func() {
+		for range 2 {
+			if err := db.Compact(); err != nil {
+				recErr(err)
+				return
+			}
+		}
+	})
+
+	mutWG.Wait()
+	stopReaders.Store(true)
+	readerWG.Wait()
+
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	// Final deterministic marker + full seal Compact verifies dict reclamation and consistency.
+	finalTS := time.Unix(clockSec.Add(60), 0).UTC()
+	if err := s1.AppendSync(finalTS, Summary{Values: [4]int64{77, 77, 77, 77}, Mask: 0x0f},
+		Row{Tags: []string{"final-marker.net", "final-g"}, Values: [4]int64{77, 77, 77, 77}, Mask: 0x0f},
+	); err != nil {
+		t.Fatal(err)
+	}
+	clockSec.Add(10 * 60)
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	res1, err := s1.Aggregate(ctx, AggregateQuery{
+		AllTime: true,
+		Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"final-marker.net"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got1 := res1.Summary.Values[0]
+	res1.Release()
+	if got1 != 77 {
+		t.Fatalf("final marker sum got=%d want=77", got1)
+	}
+
+	finalStats1, err := s1.DictStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finalStats1) != 2 || finalStats1[0].ExternalBytes != 0 || finalStats1[0].ForwardPages != 0 ||
+		finalStats1[0].ReverseBlocks != 0 || finalStats1[0].MaxID == 0 || finalStats1[0].MaxID >= 1000 ||
+		finalStats1[0].LiveCount != finalStats1[0].MaxID || finalStats1[0].DeadCount != 0 {
+		t.Fatalf("unexpected final s1 DictStats after concurrent ResetAll+Compact: %+v", finalStats1)
+	}
+
+	res2, err := s2.Aggregate(ctx, AggregateQuery{
+		AllTime: true,
+		Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"keep-042"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2 := res2.Summary.Values[0]
+	res2.Release()
+	if got2 != 1 {
+		t.Fatalf("s2 final sum got=%d want=1", got2)
+	}
+	finalStats2, err := s2.DictStats()
+	if err != nil || len(finalStats2) != 1 || finalStats2[0].MaxID != 200 || finalStats2[0].LiveCount != 200 {
+		t.Fatalf("unexpected final s2 DictStats: err=%v stats=%+v", err, finalStats2)
+	}
+}

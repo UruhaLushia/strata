@@ -3,6 +3,7 @@ package strata
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -817,6 +818,644 @@ func TestResetAllCompactLifecycle(t *testing.T) {
 		db2.autoCompact()
 		if db2.head.gen != genBefore2 {
 			t.Fatalf("autoCompact spun when ResetCurrentDay blocked at r.to: gen %d -> %d", genBefore2, db2.head.gen)
+		}
+	})
+}
+
+func TestResetAllDictRotationAndStats(t *testing.T) {
+	ctx := context.Background()
+	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
+	cfg := SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops}
+
+	aggSum := func(t *testing.T, s *Series, f Filter) int64 {
+		t.Helper()
+		res, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, Filters: []Filter{f}})
+		if err != nil {
+			t.Fatalf("aggregate %+v: %v", f, err)
+		}
+		got := res.Summary.Values[0]
+		res.Release()
+		return got
+	}
+
+	t.Run("ExternalReclaimIsolationAndRefresh", func(t *testing.T) {
+		now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+		opts := Options{Now: func() time.Time { return now }}
+		path := filepath.Join(t.TempDir(), "reset_dict_rotation.db")
+
+		db, err := Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if db != nil {
+				_ = db.Close()
+			}
+		}()
+
+		s1, err := db.Series(11, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2, err := db.Series(22, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		const extCount = 17000
+		seedTS := now.Add(-2 * time.Hour)
+		rows1 := make([]Row, extCount)
+		rows2 := make([]Row, extCount)
+		for i := range extCount {
+			rows1[i] = Row{
+				Tags:   []string{fmt.Sprintf("s1-old-%05d", i), fmt.Sprintf("grp-%02d", i%20)},
+				Values: [4]int64{1, 1, 1, 1},
+				Mask:   0x0f,
+			}
+			rows2[i] = Row{
+				Tags:   []string{fmt.Sprintf("s2-keep-%05d", i), fmt.Sprintf("cat-%02d", i%20)},
+				Values: [4]int64{1, 1, 1, 1},
+				Mask:   0x0f,
+			}
+		}
+		if err := s1.Append(seedTS, Summary{Values: [4]int64{extCount, 1, 1, 1}, Mask: 0x0f}, rows1...); err != nil {
+			t.Fatal(err)
+		}
+		if err := s2.Append(seedTS, Summary{Values: [4]int64{extCount, 1, 1, 1}, Mask: 0x0f}, rows2...); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if db.head.sections[secTSDict].codec != 2 {
+			t.Fatalf("expected dict codec=2, got %d", db.head.sections[secTSDict].codec)
+		}
+
+		s1Before, err := s1.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(s1Before) != 2 || s1Before[0].Dim != 0 || s1Before[0].MaxID != extCount || s1Before[0].LiveCount != extCount ||
+			s1Before[0].DeadCount != 0 || s1Before[0].ExternalBytes == 0 || s1Before[0].ForwardPages == 0 || s1Before[0].ReverseBlocks == 0 {
+			t.Fatalf("unexpected s1 pre-reset DictStats: %+v", s1Before)
+		}
+		s2Before, err := s2.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(s2Before) != 2 || s2Before[0].MaxID != extCount || s2Before[0].ExternalBytes == 0 {
+			t.Fatalf("unexpected s2 pre-reset DictStats: %+v", s2Before)
+		}
+		fiBefore, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dictSecBefore := db.head.sections[secTSDict].length
+
+		roDB, err := Open(path, Options{ReadOnly: true, Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roDB.Close()
+		roS1, err := roDB.Series(11, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		roS2, err := roDB.Series(22, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s1.ResetAll(); err != nil {
+			t.Fatal(err)
+		}
+		s1Empty, err := s1.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for d, st := range s1Empty {
+			if st != (DictDimStats{Dim: d}) {
+				t.Fatalf("expected zeroed DictStats immediately after ResetAll, dim=%d got=%+v", d, st)
+			}
+		}
+
+		newRows := []Row{
+			{Tags: []string{"s1-new-a", "new-grp"}, Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f},
+			{Tags: []string{"s1-new-b", "new-grp"}, Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f},
+			{Tags: []string{"s1-new-c", "new-grp"}, Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f},
+		}
+		if err := s1.AppendSync(now.Add(-5*time.Minute), Summary{Values: [4]int64{30, 10, 10, 10}, Mask: 0x0f}, newRows...); err != nil {
+			t.Fatal(err)
+		}
+		s1PostWrite, err := s1.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s1PostWrite[0].MaxID != 3 || s1PostWrite[0].LiveCount != 3 || s1PostWrite[0].DeadCount != 0 ||
+			s1PostWrite[0].InlineBytes == 0 || s1PostWrite[0].ExternalBytes != 0 || s1PostWrite[0].ForwardPages != 0 ||
+			s1PostWrite[1].MaxID != 1 || s1PostWrite[1].LiveCount != 1 {
+			t.Fatalf("unexpected s1 DictStats after post-reset writes: %+v", s1PostWrite)
+		}
+
+		// Incremental read-only Refresh across ResetAll + post-reset WAL delta frames.
+		if err := roDB.Refresh(); err != nil {
+			t.Fatal(err)
+		}
+		roS1Stats, err := roS1.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if roS1Stats[0].MaxID != 3 || roS1Stats[0].LiveCount != 3 || roS1Stats[0].ExternalBytes != 0 {
+			t.Fatalf("unexpected roS1 DictStats after incremental Refresh: %+v", roS1Stats)
+		}
+		if got := aggSum(t, roS1, Filter{Dim: 0, Op: TagEq, Values: []string{"s1-new-b"}}); got != 10 {
+			t.Fatalf("roS1 post-reset TagEq got=%d want=10", got)
+		}
+		if got := aggSum(t, roS1, Filter{Dim: 0, Op: TagEq, Values: []string{"s1-old-00001"}}); got != 0 {
+			t.Fatalf("roS1 pre-reset tag leaked after Refresh: got=%d want=0", got)
+		}
+		if got := aggSum(t, roS2, Filter{Dim: 0, Op: TagEq, Values: []string{"s2-keep-00042"}}); got != 1 {
+			t.Fatalf("roS2 damaged after s1 ResetAll Refresh: got=%d want=1", got)
+		}
+
+		// Advance clock and Compact to physically reclaim s1's old external dictionary and blocks.
+		now = now.Add(10 * time.Minute)
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+
+		s1After, err := s1.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s1After[0].MaxID != 3 || s1After[0].LiveCount != 3 || s1After[0].ExternalBytes != 0 ||
+			s1After[0].ForwardPages != 0 || s1After[0].ReverseBlocks != 0 || s1After[1].MaxID != 1 {
+			t.Fatalf("unexpected s1 DictStats after Compact: %+v", s1After)
+		}
+		s2After, err := s2.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s2After[0] != s2Before[0] || s2After[1] != s2Before[1] {
+			t.Fatalf("s2 DictStats changed after s1 ResetAll+Compact: before=%+v after=%+v", s2Before, s2After)
+		}
+		fiAfter, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dictSecAfter := db.head.sections[secTSDict].length
+		if fiAfter.Size() >= fiBefore.Size() || dictSecAfter >= dictSecBefore {
+			t.Fatalf("expected physical reclamation: file %d -> %d, dictSec %d -> %d",
+				fiBefore.Size(), fiAfter.Size(), dictSecBefore, dictSecAfter)
+		}
+
+		// Read-only Refresh across generation swap.
+		if err := roDB.Refresh(); err != nil {
+			t.Fatal(err)
+		}
+		if got := aggSum(t, roS1, Filter{Dim: 0, Op: TagPrefix, Values: []string{"s1-new-"}}); got != 30 {
+			t.Fatalf("roS1 post-compact TagPrefix got=%d want=30", got)
+		}
+		if got := aggSum(t, roS2, Filter{Dim: 0, Op: TagEq, Values: []string{"s2-keep-16999"}}); got != 1 {
+			t.Fatalf("roS2 post-compact TagEq got=%d want=1", got)
+		}
+		_ = roDB.Close()
+
+		// Reopen and verify full persistence, isolation, Client.DictStats, and closed-DB error.
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db = nil
+		db, err = Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s1, err = db.Series(11, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2, err = db.Series(22, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s1Reopen, err := s1.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2Reopen, err := s2.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s1Reopen[0] != s1After[0] || s1Reopen[1] != s1After[1] || s2Reopen[0] != s2Before[0] || s2Reopen[1] != s2Before[1] {
+			t.Fatalf("reopened DictStats mismatch: s1=%+v s2=%+v", s1Reopen, s2Reopen)
+		}
+		if got := aggSum(t, s1, Filter{Dim: 0, Op: TagPrefix, Values: []string{"s1-new-"}}); got != 30 {
+			t.Fatalf("reopened s1 sum got=%d want=30", got)
+		}
+		if got := aggSum(t, s1, Filter{Dim: 0, Op: TagEq, Values: []string{"s1-old-00001"}}); got != 0 {
+			t.Fatalf("reopened s1 old tag resurrected: got=%d want=0", got)
+		}
+		if got := aggSum(t, s2, Filter{Dim: 0, Op: TagPrefix, Values: []string{"s2-keep-0010"}}); got != 10 {
+			t.Fatalf("reopened s2 sum got=%d want=10", got)
+		}
+
+		client := NewClient(db, ClientOptions{})
+		cStats, err := client.DictStats(11)
+		if err != nil || len(cStats) != 2 || cStats[0] != s1Reopen[0] || cStats[1] != s1Reopen[1] {
+			t.Fatalf("Client.DictStats mismatch: err=%v got=%+v want=%+v", err, cStats, s1Reopen)
+		}
+		_ = client.Close()
+
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db = nil
+		if _, err := s1.DictStats(); err == nil {
+			t.Fatal("expected error from Series.DictStats on closed DB")
+		}
+	})
+
+	t.Run("UnsealedHotFrameBlocksResetAllCompact", func(t *testing.T) {
+		now := time.Date(2026, 7, 2, 10, 0, 15, 0, time.UTC)
+		opts := Options{Now: func() time.Time { return now }}
+		path := filepath.Join(t.TempDir(), "reset_unsealed_dict.db")
+
+		db, err := Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if db != nil {
+				_ = db.Close()
+			}
+		}()
+		s, err := db.Series(33, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		hotOld := make([]Row, 50)
+		for i := range hotOld {
+			hotOld[i] = Row{Tags: []string{fmt.Sprintf("hot-old-%03d", i), "g-old"}, Values: [4]int64{5, 5, 5, 5}, Mask: 0x0f}
+		}
+		if err := s.AppendSync(now, Summary{Values: [4]int64{250, 5, 5, 5}, Mask: 0x0f}, hotOld...); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ResetAll(); err != nil {
+			t.Fatal(err)
+		}
+		hotNew := []Row{
+			{Tags: []string{"hot-new-0", "g-new"}, Values: [4]int64{100, 100, 100, 100}, Mask: 0x0f},
+			{Tags: []string{"hot-new-1", "g-new"}, Values: [4]int64{100, 100, 100, 100}, Mask: 0x0f},
+		}
+		if err := s.AppendSync(now.Add(5*time.Second), Summary{Values: [4]int64{200, 100, 100, 100}, Mask: 0x0f}, hotNew...); err != nil {
+			t.Fatal(err)
+		}
+
+		// Immediate Compact while epoch=0 hot delta blocks frameReset sealing in tail WAL.
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		verifyClean := func(label string, curS *Series) {
+			t.Helper()
+			st, err := curS.DictStats()
+			if err != nil {
+				t.Fatalf("%s DictStats: %v", label, err)
+			}
+			if len(st) != 2 || st[0].MaxID != 2 || st[0].LiveCount != 2 || st[0].DeadCount != 0 || st[1].MaxID != 1 || st[1].LiveCount != 1 {
+				t.Fatalf("%s epoch=0 dict leaked into s: %+v", label, st)
+			}
+			if got := aggSum(t, curS, Filter{Dim: 0, Op: TagPrefix, Values: []string{"hot-old-"}}); got != 0 {
+				t.Fatalf("%s hot-old leaked: got=%d want=0", label, got)
+			}
+			if got := aggSum(t, curS, Filter{Dim: 0, Op: TagPrefix, Values: []string{"hot-new-"}}); got != 200 {
+				t.Fatalf("%s hot-new mismatch: got=%d want=200", label, got)
+			}
+		}
+		verifyClean("post-immediate-compact", s)
+
+		// Reopen while frameReset is still unsealed in tail WAL.
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db = nil
+		db, err = Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err = db.Series(33, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		verifyClean("reopened-unsealed", s)
+
+		// Advance clock, seal frameReset, and reopen.
+		now = now.Add(5 * time.Minute)
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if len(s.rules) != 0 {
+			t.Fatalf("expected empty rules after sealing frameReset, got %+v", s.rules)
+		}
+		verifyClean("post-seal-compact", s)
+
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db = nil
+		db, err = Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err = db.Series(33, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		verifyClean("reopened-sealed", s)
+	})
+
+	t.Run("PreCompactCoarseBlocksAndArityIsolation", func(t *testing.T) {
+		now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+		db, err := Open(filepath.Join(t.TempDir(), "reset_precompact_coarse.db"), Options{
+			Now:         func() time.Time { return now },
+			Retention1m: 14 * 24 * time.Hour,
+			Retention1h: 90 * 24 * time.Hour,
+			Retention1d: 365 * 24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		s, err := db.Series(44, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldDay := now.Add(-72 * time.Hour)
+		oldHour := now.Add(-2 * time.Hour)
+		if err := s.Append(oldDay, Summary{Values: [4]int64{11, 11, 11, 11}, Mask: 0x0f},
+			Row{Tags: []string{"old-day", "g"}, Values: [4]int64{11, 11, 11, 11}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Append(oldHour, Summary{Values: [4]int64{22, 22, 22, 22}, Mask: 0x0f},
+			Row{Tags: []string{"old-hour", "g"}, Values: [4]int64{22, 22, 22, 22}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		var has1m, has1h, has1d bool
+		for _, m := range db.sealed {
+			if m.series != 44 {
+				continue
+			}
+			switch m.res {
+			case resMinuteHR:
+				has1m = true
+			case resHour:
+				has1h = true
+			case resDay:
+				has1d = true
+			}
+		}
+		if !has1m || !has1h || !has1d {
+			t.Fatalf("expected 1m/1h/1d sealed blocks before ResetAll, got 1m=%v 1h=%v 1d=%v", has1m, has1h, has1d)
+		}
+
+		// ResetAll without Compact: old 1h/1d blocks stay on disk until next Compact.
+		if err := s.ResetAll(); err != nil {
+			t.Fatal(err)
+		}
+
+		// 1a. Empty post-ResetAll pre-Compact: AllTime + RequireExact must succeed empty with Exact=true.
+		if agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, RequireExact: true}); err != nil {
+			t.Fatalf("empty SummaryOnly AllTime+RequireExact failed: %v", err)
+		} else {
+			if !agg.Exact || agg.Summary.Values[0] != 0 || len(agg.Segments) != 0 {
+				agg.Release()
+				t.Fatalf("unexpected empty SummaryOnly result: %+v", agg)
+			}
+			agg.Release()
+		}
+		if agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, RequireExact: true, GroupDims: []int{0}}); err != nil {
+			t.Fatalf("empty grouped Aggregate AllTime+RequireExact failed: %v", err)
+		} else {
+			if !agg.Exact || len(agg.Groups) != 1 || len(agg.Groups[0]) != 0 {
+				agg.Release()
+				t.Fatalf("unexpected empty grouped result: %+v", agg)
+			}
+			agg.Release()
+		}
+		if agg, err := s.Aggregate(ctx, AggregateQuery{
+			AllTime: true, RequireExact: true,
+			Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"old-day"}}},
+		}); err != nil {
+			t.Fatalf("empty filtered Aggregate AllTime+RequireExact failed: %v", err)
+		} else {
+			if !agg.Exact || agg.Summary.Values[0] != 0 {
+				agg.Release()
+				t.Fatalf("unexpected empty filtered result: %+v", agg)
+			}
+			agg.Release()
+		}
+		if page, err := s.Read(ctx, ReadRequest{AllTime: true, RequireExact: true, Limit: 10}); err != nil {
+			t.Fatalf("empty Read AllTime+RequireExact failed: %v", err)
+		} else {
+			if !page.Exact || len(page.Rows) != 0 {
+				page.Release()
+				t.Fatalf("unexpected empty Read result: %+v", page)
+			}
+			page.Release()
+		}
+		emptyScanRows := 0
+		if err := s.Scan(ctx, ScanQuery{AllTime: true, RequireExact: true}, func(b ScanBatch) error {
+			emptyScanRows += b.Len()
+			return nil
+		}); err != nil || emptyScanRows != 0 {
+			t.Fatalf("empty Scan AllTime+RequireExact: err=%v rows=%d", err, emptyScanRows)
+		}
+
+		// Explicit range covering old 1d/1h coarse blocks must not raise ErrResetRequiresFineData.
+		spanFrom, spanTo := oldDay.Add(-time.Hour), now.Add(time.Minute)
+		if agg, err := s.Aggregate(ctx, AggregateQuery{From: spanFrom, To: spanTo}); err != nil {
+			t.Fatalf("explicit-window empty SummaryOnly failed: %v", err)
+		} else {
+			if agg.Summary.Values[0] != 0 {
+				agg.Release()
+				t.Fatalf("old coarse data leaked into SummaryOnly: %+v", agg.Summary)
+			}
+			agg.Release()
+		}
+		if page, err := s.Read(ctx, ReadRequest{From: spanFrom, To: spanTo, Limit: 10}); err != nil {
+			t.Fatalf("explicit-window empty Read failed: %v", err)
+		} else {
+			if len(page.Rows) != 0 {
+				page.Release()
+				t.Fatalf("old coarse data leaked into Read: %+v", page.Rows)
+			}
+			page.Release()
+		}
+		if err := s.Scan(ctx, ScanQuery{From: spanFrom, To: spanTo}, func(b ScanBatch) error {
+			emptyScanRows += b.Len()
+			return nil
+		}); err != nil || emptyScanRows != 0 {
+			t.Fatalf("explicit-window empty Scan: err=%v rows=%d", err, emptyScanRows)
+		}
+
+		// 1b. Append new post-ResetAll data (still pre-Compact): AllTime+RequireExact sees only new data and new RequestedFrom.
+		newTS := now.Truncate(time.Minute)
+		if err := s.Append(newTS, Summary{Values: [4]int64{99, 99, 99, 99}, Mask: 0x0f},
+			Row{Tags: []string{"fresh-tag", "g-fresh"}, Values: [4]int64{99, 99, 99, 99}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true, RequireExact: true}); err != nil {
+			t.Fatalf("post-write SummaryOnly AllTime+RequireExact failed: %v", err)
+		} else {
+			if !agg.Exact || agg.Summary.Values[0] != 99 || !agg.RequestedFrom.Equal(newTS) {
+				agg.Release()
+				t.Fatalf("unexpected post-write SummaryOnly: exact=%v sum=%d reqFrom=%v wantFrom=%v",
+					agg.Exact, agg.Summary.Values[0], agg.RequestedFrom, newTS)
+			}
+			agg.Release()
+		}
+		if agg, err := s.Aggregate(ctx, AggregateQuery{
+			AllTime: true, RequireExact: true,
+			Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"fresh-tag"}}},
+		}); err != nil {
+			t.Fatalf("post-write filtered Aggregate AllTime+RequireExact failed: %v", err)
+		} else {
+			if !agg.Exact || agg.Summary.Values[0] != 99 || !agg.RequestedFrom.Equal(newTS) {
+				agg.Release()
+				t.Fatalf("unexpected post-write filtered Aggregate: exact=%v sum=%d reqFrom=%v",
+					agg.Exact, agg.Summary.Values[0], agg.RequestedFrom)
+			}
+			agg.Release()
+		}
+		if page, err := s.Read(ctx, ReadRequest{AllTime: true, RequireExact: true, Limit: 10}); err != nil {
+			t.Fatalf("post-write Read AllTime+RequireExact failed: %v", err)
+		} else {
+			if !page.Exact || len(page.Rows) != 1 || page.Rows[0].Tags[0] != "fresh-tag" || page.Rows[0].Values[0] != 99 || !page.RequestedFrom.Equal(newTS) {
+				page.Release()
+				t.Fatalf("unexpected post-write Read: exact=%v reqFrom=%v rows=%+v", page.Exact, page.RequestedFrom, page.Rows)
+			}
+			page.Release()
+		}
+		scanCnt, scanSum := 0, int64(0)
+		if err := s.Scan(ctx, ScanQuery{AllTime: true, RequireExact: true}, func(b ScanBatch) error {
+			for i := range b.Len() {
+				scanCnt++
+				scanSum += b.Values(i)[0]
+			}
+			return nil
+		}); err != nil || scanCnt != 1 || scanSum != 99 {
+			t.Fatalf("post-write Scan AllTime+RequireExact: err=%v cnt=%d sum=%d", err, scanCnt, scanSum)
+		}
+
+		// Explicit window spanning old 1d/1h sealed blocks + new live bucket must return only new data.
+		if agg, err := s.Aggregate(ctx, AggregateQuery{From: spanFrom, To: newTS.Add(time.Minute)}); err != nil {
+			t.Fatalf("explicit-window post-write SummaryOnly failed: %v", err)
+		} else {
+			if agg.Summary.Values[0] != 99 {
+				agg.Release()
+				t.Fatalf("explicit-window post-write SummaryOnly sum=%d want=99", agg.Summary.Values[0])
+			}
+			agg.Release()
+		}
+		if page, err := s.Read(ctx, ReadRequest{From: spanFrom, To: newTS.Add(time.Minute), Limit: 10}); err != nil {
+			t.Fatalf("explicit-window post-write Read failed: %v", err)
+		} else {
+			if len(page.Rows) != 1 || page.Rows[0].Tags[0] != "fresh-tag" {
+				page.Release()
+				t.Fatalf("explicit-window post-write Read rows=%+v", page.Rows)
+			}
+			page.Release()
+		}
+		scanCnt, scanSum = 0, 0
+		if err := s.Scan(ctx, ScanQuery{From: spanFrom, To: newTS.Add(time.Minute)}, func(b ScanBatch) error {
+			for i := range b.Len() {
+				scanCnt++
+				scanSum += b.Values(i)[0]
+			}
+			return nil
+		}); err != nil || scanCnt != 1 || scanSum != 99 {
+			t.Fatalf("explicit-window post-write Scan: err=%v cnt=%d sum=%d", err, scanCnt, scanSum)
+		}
+
+		// 2. Append row arity mismatch must not leak prior rows' tags into db.dict or db.pendingDict.
+		statsBefore, err := s.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pendingDictBefore := len(db.pendingDict)
+		if err := s.Append(newTS, Summary{Values: [4]int64{3}, Mask: 0x0f},
+			Row{Tags: []string{"must-not-leak-0", "must-not-leak-1"}, Values: [4]int64{1}, Mask: 0x0f},
+			Row{Tags: []string{"wrong-arity"}, Values: [4]int64{2}, Mask: 0x0f},
+		); err == nil {
+			t.Fatal("expected error on row arity mismatch")
+		}
+		statsAfter, err := s.DictStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statsAfter[0] != statsBefore[0] || statsAfter[1] != statsBefore[1] || len(db.pendingDict) != pendingDictBefore {
+			t.Fatalf("arity-mismatch Append leaked dict state: before=%+v after=%+v pendingDict=%d->%d",
+				statsBefore, statsAfter, pendingDictBefore, len(db.pendingDict))
+		}
+
+		// 3. ResetCurrentDay with expired 1m fine data and surviving 1h coarse block must still return ErrResetRequiresFineData.
+		nowDay := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+		dbDay, err := Open(filepath.Join(t.TempDir(), "reset_day_coarse.db"), Options{
+			Now:         func() time.Time { return nowDay },
+			Retention1m: time.Hour,
+			Retention1h: 24 * time.Hour,
+			Retention1d: 7 * 24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbDay.Close()
+		sDay, err := dbDay.Series(55, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		todayEarly := time.Date(2026, 7, 6, 2, 0, 0, 0, time.UTC)
+		if err := sDay.Append(todayEarly, Summary{Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
+			Row{Tags: []string{"early", "g"}, Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := dbDay.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		var day1m, day1h int
+		for _, m := range dbDay.sealed {
+			switch m.res {
+			case resMinuteHR:
+				day1m++
+			case resHour:
+				day1h++
+			}
+		}
+		if day1m != 0 || day1h != 1 {
+			t.Fatalf("expected expired 1m and surviving 1h block, got 1m=%d 1h=%d", day1m, day1h)
+		}
+		if err := sDay.ResetCurrentDay(time.UTC); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sDay.Aggregate(ctx, AggregateQuery{From: todayEarly, To: nowDay}); err != ErrResetRequiresFineData {
+			t.Fatalf("ResetCurrentDay SummaryOnly window: got %v want ErrResetRequiresFineData", err)
+		}
+		if _, err := sDay.Aggregate(ctx, AggregateQuery{AllTime: true}); err != ErrResetRequiresFineData {
+			t.Fatalf("ResetCurrentDay SummaryOnly AllTime: got %v want ErrResetRequiresFineData", err)
+		}
+		if _, err := sDay.Read(ctx, ReadRequest{From: todayEarly, To: nowDay, Limit: 10}); err != ErrResetRequiresFineData {
+			t.Fatalf("ResetCurrentDay Read: got %v want ErrResetRequiresFineData", err)
+		}
+		if err := sDay.Scan(ctx, ScanQuery{From: todayEarly, To: nowDay}, func(ScanBatch) error { return nil }); err != ErrResetRequiresFineData {
+			t.Fatalf("ResetCurrentDay Scan: got %v want ErrResetRequiresFineData", err)
 		}
 	})
 }

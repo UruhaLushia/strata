@@ -27,6 +27,11 @@ func (s *Series) append(ts time.Time, summary Summary, rows []Row, syncNow bool)
 	if !db.writer {
 		return ErrReadOnly
 	}
+	for _, row := range rows {
+		if len(row.Tags) != s.cfg.Arity {
+			return errors.New("strata: row arity mismatch")
+		}
+	}
 	summary = summary.normalized()
 	db.order++
 	delta := &bucket{
@@ -40,9 +45,6 @@ func (s *Series) append(ts time.Time, summary Summary, rows []Row, syncNow bool)
 	var addedBytes int64 = 128
 	for _, row := range rows {
 		row = row.normalized()
-		if len(row.Tags) != s.cfg.Arity {
-			return errors.New("strata: row arity mismatch")
-		}
 		var r idRow
 		r.initMask = row.Mask
 		for j, tag := range row.Tags {
@@ -158,6 +160,23 @@ func (s *Series) resetLocked(from, to int64) error {
 	for k := range db.pending {
 		if k.series == s.id {
 			delete(db.pending, k)
+		}
+	}
+	if from == math.MinInt64 && to == math.MaxInt64 {
+		db.resetSeriesDictAndLiveLocked(s.id, old)
+		if len(db.pendingDict) > 0 {
+			kept := db.pendingDict[:0]
+			for _, e := range db.pendingDict {
+				if e.series != s.id {
+					kept = append(kept, e)
+				}
+			}
+			clear(db.pendingDict[len(kept):])
+			db.pendingDict = kept
+		}
+		if len(db.pending) == 0 && len(db.pendingDict) == 0 {
+			db.pendingDict = nil
+			db.pendingBytes = 0
 		}
 	}
 	return nil

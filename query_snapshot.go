@@ -207,30 +207,17 @@ func buildQuerySourcesFromSnap(snap *querySnapshot, from, to int64, sealedBits *
 	)
 }
 
-func buildQuerySourcesLocked(db *DB, s *Series, from, to int64, sealedBits *blockBitmap, liveMask uint64, useLiveMask, needLiveRows bool) querySources {
+func buildSummarySourcesLocked(db *DB, s *Series, from, to int64) querySources {
 	rules := slices.Clone(s.rules)
 	var liveFine []sealedBlock
 	for key, b := range db.live {
 		if key.series != s.id || b.ts+60 <= from || b.ts >= to || blockExcludedRules(rules, b.ts, b.ts+60, b.epoch) {
 			continue
 		}
-		cand := true
-		if useLiveMask {
-			if slot, ok := db.liveSlot[key]; ok {
-				cand = (liveMask & (uint64(1) << slot)) != 0
-			} else {
-				cand = false
-			}
-		}
-		var rows []idRow
-		if needLiveRows && cand {
-			rows = cloneRows(b.rows)
-		}
 		liveFine = append(liveFine, sealedBlock{
 			series: s.id, res: resMinuteHR, start: b.ts, end: b.ts + 60,
 			epoch: b.epoch, order: b.order, summary: b.summary,
-			rowCount: uint32(len(b.rows)), rows: rows,
-			candidate: cand,
+			rowCount: uint32(len(b.rows)), candidate: true,
 		})
 	}
 	if len(liveFine) > 1 {
@@ -241,7 +228,7 @@ func buildQuerySourcesLocked(db *DB, s *Series, from, to int64, sealedBits *bloc
 		db.sealedByRes[sealedResKey{series: s.id, res: resMinuteHR}],
 		db.sealedByRes[sealedResKey{series: s.id, res: resHour}],
 		db.sealedByRes[sealedResKey{series: s.id, res: resDay}],
-		rules, from, to, sealedBits, liveFine,
+		rules, from, to, nil, liveFine,
 	)
 }
 
@@ -277,9 +264,13 @@ func buildSealedQuerySources(sealed []sealedMeta, seriesID uint16, fineAll, hour
 							fineCand = append(fineCand, pos)
 						}
 					case resHour:
-						hourCand = append(hourCand, pos)
+						if !blockExcludedByResetAll(rules, b.epoch) {
+							hourCand = append(hourCand, pos)
+						}
 					case resDay:
-						dayCand = append(dayCand, pos)
+						if !blockExcludedByResetAll(rules, b.epoch) {
+							dayCand = append(dayCand, pos)
+						}
 					}
 				}
 			}

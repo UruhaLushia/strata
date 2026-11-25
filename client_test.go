@@ -324,3 +324,45 @@ func TestMemoryProfileBudgetAndCtxCancel(t *testing.T) {
 		t.Fatalf("expected DeadlineExceeded on saturated semaphore, got %v", err)
 	}
 }
+
+func TestClientDictStats(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	c, err := OpenClient(filepath.Join(t.TempDir(), "client-stats.db"), ClientOptions{
+		DB: Options{Now: func() time.Time { return now }},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if _, err := c.DictStats(99); !errors.Is(err, errSeriesUnregistered) {
+		t.Fatalf("expected errSeriesUnregistered, got %v", err)
+	}
+	s, err := c.RegisterSeries(1, SeriesConfig{Arity: 2, SummaryOps: [4]MetricOp{OpSum}, RowOps: [4]MetricOp{OpSum}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendSync(now.Add(-time.Hour), Summary{Values: [4]int64{3}},
+		Row{Tags: []string{"alpha", "x"}, Values: [4]int64{1}},
+		Row{Tags: []string{"beta", "x"}, Values: [4]int64{2}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.DictStats(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := s.DictStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] || got[0].MaxID != 2 || got[0].LiveCount != 2 || got[1].MaxID != 1 {
+		t.Fatalf("Client.DictStats mismatch: got=%+v want=%+v", got, want)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DictStats(1); !errors.Is(err, errClientClosed) {
+		t.Fatalf("expected errClientClosed after Close, got %v", err)
+	}
+}

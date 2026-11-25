@@ -1,6 +1,7 @@
 package strata
 
 import (
+	"errors"
 	"sort"
 	"sync"
 	"unsafe"
@@ -383,4 +384,40 @@ func (d *dictionary) resolve(series uint16, dimIdx uint8, id uint32) string {
 		return ""
 	}
 	return d.dims[dictDimKey{series: series, dim: dimIdx}].resolve(id)
+}
+
+func (s *Series) DictStats() ([]DictDimStats, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("strata: nil series")
+	}
+	db := s.db
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, errors.New("strata: database is closed")
+	}
+	arity := s.cfg.Arity
+	out := make([]DictDimStats, arity)
+	for dim := range arity {
+		st := DictDimStats{Dim: dim}
+		if dimData := db.dict.dims[dictDimKey{series: s.id, dim: uint8(dim)}]; dimData != nil {
+			if dimData.nextID > 0 {
+				st.MaxID = dimData.nextID - 1
+			}
+			if dimData.count > 0 {
+				st.LiveCount = uint32(dimData.count)
+			}
+			if st.MaxID > st.LiveCount {
+				st.DeadCount = st.MaxID - st.LiveCount
+			}
+			st.InlineBytes = uint64(len(dimData.arena))
+			if dimData.ext != nil {
+				st.ExternalBytes = dimData.ext.fwdTotalBytes + dimData.ext.sstTotalBytes
+				st.ForwardPages = uint32(len(dimData.ext.fwdPages))
+				st.ReverseBlocks = uint32(len(dimData.ext.sstBlocks))
+			}
+		}
+		out[dim] = st
+	}
+	return out, nil
 }
