@@ -488,3 +488,141 @@ func TestExternalDictThreeTierPriority(t *testing.T) {
 		t.Fatalf("3-tier priority mismatch (extra > tail > ext): %+v", res.Groups[0][:3])
 	}
 }
+
+func TestEmptyTagFilteringAndWideCursorPagination(t *testing.T) {
+	base := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	now := base.Add(30 * time.Minute)
+	db, err := Open(filepath.Join(t.TempDir(), "empty_tag.db"), Options{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	cfg := SeriesConfig{Arity: 2, SummaryOps: [4]MetricOp{OpSum, OpMin, OpMax, OpLast}, RowOps: [4]MetricOp{OpSum, OpMin, OpMax, OpLast}}
+	s, err := db.Series(31, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendSync(base, Summary{Values: [4]int64{70, 10, 40, 40}},
+		Row{Tags: []string{"", "d1"}, Values: [4]int64{10, 10, 10, 10}},
+		Row{Tags: []string{"foo", "d1"}, Values: [4]int64{20, 20, 20, 20}},
+		Row{Tags: []string{"bar", "d1"}, Values: [4]int64{40, 40, 40, 40}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendSync(now, Summary{Values: [4]int64{45, 5, 25, 25}},
+		Row{Tags: []string{"", "d2"}, Values: [4]int64{5, 5, 5, 5}},
+		Row{Tags: []string{"foo", "d2"}, Values: [4]int64{15, 15, 15, 15}},
+		Row{Tags: []string{"baz", "d2"}, Values: [4]int64{25, 25, 25, 25}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	cases := []struct {
+		name      string
+		filters   []Filter
+		wantCount int
+		wantSum   int64
+	}{
+		{
+			name:      "eq-empty",
+			filters:   []Filter{{Dim: 0, Op: TagEq, Values: []string{""}}},
+			wantCount: 2,
+			wantSum:   15,
+		},
+		{
+			name:      "neg-eq-empty",
+			filters:   []Filter{{Dim: 0, Op: TagEq, Values: []string{""}, Negate: true}},
+			wantCount: 4,
+			wantSum:   100,
+		},
+		{
+			name:      "eq-empty-and-foo",
+			filters:   []Filter{{Dim: 0, Op: TagEq, Values: []string{"", "foo"}}},
+			wantCount: 4,
+			wantSum:   50,
+		},
+	}
+	for _, tc := range cases {
+		agg, err := s.Aggregate(ctx, AggregateQuery{From: base, To: now.Add(time.Minute), Filters: tc.filters})
+		if err != nil {
+			t.Fatalf("%s Aggregate: %v", tc.name, err)
+		}
+		aggSum := agg.Summary.Values[0]
+		agg.Release()
+		if aggSum != tc.wantSum {
+			t.Fatalf("%s Aggregate sum=%d want=%d", tc.name, aggSum, tc.wantSum)
+		}
+
+		var scanCount int
+		var scanSum int64
+		if err := s.Scan(ctx, ScanQuery{From: base, To: now.Add(time.Minute), Filters: tc.filters}, func(b ScanBatch) error {
+			for i := range b.Len() {
+				scanCount++
+				scanSum += b.Values(i)[0]
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("%s Scan: %v", tc.name, err)
+		}
+		if scanCount != tc.wantCount || scanSum != tc.wantSum {
+			t.Fatalf("%s Scan count=%d sum=%d want count=%d sum=%d", tc.name, scanCount, scanSum, tc.wantCount, tc.wantSum)
+		}
+
+		page, err := s.Read(ctx, ReadRequest{From: base, To: now.Add(time.Minute), Filters: tc.filters, Limit: 20})
+		if err != nil {
+			t.Fatalf("%s Read: %v", tc.name, err)
+		}
+		var readSum int64
+		for _, r := range page.Rows {
+			readSum += r.Values[0]
+		}
+		readCount := len(page.Rows)
+		page.Release()
+		if readCount != tc.wantCount || readSum != tc.wantSum {
+			t.Fatalf("%s Read count=%d sum=%d want count=%d sum=%d", tc.name, readCount, readSum, tc.wantCount, tc.wantSum)
+		}
+	}
+
+	wideFrom := time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC)
+	wideTo := time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	var cur Cursor
+	var totalRows, pages int
+	var totalSum int64
+	for {
+		page, err := s.Read(ctx, ReadRequest{From: wideFrom, To: wideTo, Limit: 2, Cursor: cur})
+		if err != nil {
+			t.Fatalf("wide Read page %d: %v", pages, err)
+		}
+		if page.RequestedFrom.Unix() != wideFrom.Unix() || page.RequestedTo.Unix() != wideTo.Unix() {
+			page.Release()
+			t.Fatalf("wide window mismatch: got [%v, %v] want [%v, %v]", page.RequestedFrom, page.RequestedTo, wideFrom, wideTo)
+		}
+		for _, r := range page.Rows {
+			totalRows++
+			totalSum += r.Values[0]
+		}
+		hasMore := page.HasMore
+		nextCur := page.NextCursor
+		page.Release()
+		pages++
+		if !hasMore {
+			break
+		}
+		if nextCur.IsZero() {
+			t.Fatalf("expected non-zero NextCursor on page %d", pages)
+		}
+		parsedCur, parseErr := ParseCursor(nextCur.String())
+		if parseErr != nil || parsedCur.IsZero() {
+			t.Fatalf("ParseCursor failed on page %d: err=%v zero=%v", pages, parseErr, parsedCur.IsZero())
+		}
+		cur = parsedCur
+	}
+	if pages < 3 || totalRows != 6 || totalSum != 115 {
+		t.Fatalf("wide Read pagination mismatch: pages=%d rows=%d sum=%d", pages, totalRows, totalSum)
+	}
+}

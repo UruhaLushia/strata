@@ -3,6 +3,7 @@ package strata
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -173,37 +174,25 @@ func (db *DB) Compact() error {
 		err = tf.Close()
 	}
 	releaseView()
-	if err == nil {
-		previousView := db.view
-		db.data = nil
-		db.mapped = nil
-		db.view = nil
-		err = renameAtomic(tmp, db.path)
-		if err != nil {
-			db.data, db.mapped, db.view = previousView.data, previousView.mapped, previousView
-		} else {
-			db.view = previousView
-		}
-	}
-	if err == nil {
-		err = syncParent(filepathDir(db.path))
-	}
 	if err != nil {
-		if db.data == nil {
-			oldView := db.view
-			db.data, _ = openData(db.path, false)
-			if db.data != nil {
-				db.mapped, _ = mapPrefix(db.data, db.head.walOffset, db.shouldMmap())
-				db.view = newFileView(db.data, db.mapped, db.head.sections[secTSBlocks])
-				if oldView != nil {
-					oldView.release()
-				}
-			}
-		}
+		_ = tf.Close()
+		_ = os.Remove(tmp)
 		db.mu.Unlock()
 		return err
 	}
-	oldView := db.view
+	previousView := db.view
+	db.data = nil
+	db.mapped = nil
+	db.view = nil
+	if err = renameAtomic(tmp, db.path); err != nil {
+		if previousView != nil {
+			db.data, db.mapped, db.view = previousView.data, previousView.mapped, previousView
+		}
+		_ = os.Remove(tmp)
+		db.mu.Unlock()
+		return err
+	}
+	syncErr := syncParent(filepath.Dir(db.path))
 	newData, openErr := openData(db.path, false)
 	if openErr == nil {
 		var newMapped mapView
@@ -213,28 +202,22 @@ func (db *DB) Compact() error {
 		} else {
 			db.data, db.head, db.sealedSeq, db.mapped = newData, newHead, sealedSeq, newMapped
 			db.view = newFileView(newData, newMapped, newHead.sections[secTSBlocks])
-			if oldView != nil {
-				oldView.release()
+			if previousView != nil {
+				previousView.release()
 			}
 		}
 	}
-	err = openErr
-	if err == nil {
-		err = db.loadLocked()
-		db.durableSeq = finalSeq
+	loadOrOpenErr := openErr
+	if loadOrOpenErr == nil {
+		if loadOrOpenErr = db.loadLocked(); loadOrOpenErr == nil {
+			db.durableSeq = finalSeq
+		}
+	} else if previousView != nil {
+		db.data, db.mapped, db.view = previousView.data, previousView.mapped, previousView
+	}
+	if loadOrOpenErr != nil {
+		db.writer = false
 	}
 	db.mu.Unlock()
-	return err
-}
-
-func filepathDir(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' || path[i] == '\\' {
-			if i == 0 {
-				return path[:1]
-			}
-			return path[:i]
-		}
-	}
-	return "."
+	return errors.Join(loadOrOpenErr, syncErr)
 }

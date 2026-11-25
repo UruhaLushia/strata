@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"iter"
+	"math"
 	"slices"
 	"time"
 )
@@ -531,7 +532,15 @@ func (db *DB) commitKVLocked(ops []kvOp) error {
 	now := db.opts.Now().UTC()
 	for i := range ops {
 		if ops[i].hasTTL {
-			ops[i].expiresAtUnixNano = now.Add(ops[i].ttl).UnixNano()
+			nowNs := now.UnixNano()
+			if nowNs > 0 && int64(ops[i].ttl) > math.MaxInt64-nowNs {
+				ops[i].expiresAtUnixNano = math.MaxInt64
+			} else {
+				ops[i].expiresAtUnixNano = nowNs + int64(ops[i].ttl)
+			}
+			if ops[i].expiresAtUnixNano == 0 {
+				ops[i].expiresAtUnixNano = 1
+			}
 		}
 	}
 	rev := db.kvRev + 1

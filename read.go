@@ -29,10 +29,10 @@ func isLightReadCandidate(db *DB, req ReadRequest, defaultWindow time.Duration, 
 		}
 	}
 	if useCursor {
-		if req.Cursor.rowSkip > lightReadMaxOffset || req.Cursor.winToNs < req.Cursor.winFromNs {
+		if req.Cursor.rowSkip > lightReadMaxOffset || req.Cursor.winToSec < req.Cursor.winFromSec {
 			return false
 		}
-		return uint64(req.Cursor.winToNs)-uint64(req.Cursor.winFromNs) <= uint64(lightReadMaxWindow)
+		return uint64(req.Cursor.winToSec)-uint64(req.Cursor.winFromSec) <= uint64(lightReadMaxWindow/time.Second)
 	}
 	if req.Window < 0 {
 		return false
@@ -146,8 +146,8 @@ func (s *Series) readWithOptions(ctx context.Context, req ReadRequest, defaultWi
 		allTime: req.AllTime, defaultWindow: defaultWindow,
 	}
 	if useCursor {
-		winFrom := time.Unix(0, req.Cursor.winFromNs).UTC().Unix()
-		winTo := time.Unix(0, req.Cursor.winToNs).UTC().Unix()
+		winFrom := req.Cursor.winFromSec
+		winTo := req.Cursor.winToSec
 		planFrom := max(winFrom, req.Cursor.slotStart)
 		ws = windowSpec{fixed: true, fixedFrom: winFrom, fixedTo: winTo, fixedPlanFrom: planFrom}
 	}
@@ -159,14 +159,13 @@ func (s *Series) readWithOptions(ctx context.Context, req ReadRequest, defaultWi
 	}
 	defer pq.release()
 
-	winFromNs := time.Unix(pq.from, 0).UTC().UnixNano()
-	winToNs := time.Unix(pq.to, 0).UTC().UnixNano()
+	winFromSec, winToSec := pq.from, pq.to
 	if useCursor {
-		winFromNs, winToNs = req.Cursor.winFromNs, req.Cursor.winToNs
+		winFromSec, winToSec = req.Cursor.winFromSec, req.Cursor.winToSec
 	}
 	page := &PageResult{
-		RequestedFrom: time.Unix(0, winFromNs).UTC(),
-		RequestedTo:   time.Unix(0, winToNs).UTC(),
+		RequestedFrom: time.Unix(winFromSec, 0).UTC(),
+		RequestedTo:   time.Unix(winToSec, 0).UTC(),
 		Exact:         true,
 	}
 	if pq.empty || len(pq.plans) == 0 {
@@ -227,7 +226,7 @@ func (s *Series) readWithOptions(ctx context.Context, req ReadRequest, defaultWi
 		if len(page.Rows) == limit {
 			if len(pq.compiled) == 0 && plan.block.rowCount > 0 {
 				page.HasMore = true
-				page.NextCursor = makeNextCursor(winFromNs, winToNs, qHash, plan.block, 0)
+				page.NextCursor = makeNextCursor(winFromSec, winToSec, qHash, plan.block, 0)
 				break
 			}
 			hasMatch, probeErr := probeSlotHasMatch(pq.execDB, plan.block, pq.sources, &pq.execSeries, pq.compiled, allowDim0BS, slot)
@@ -237,7 +236,7 @@ func (s *Series) readWithOptions(ctx context.Context, req ReadRequest, defaultWi
 			}
 			if hasMatch {
 				page.HasMore = true
-				page.NextCursor = makeNextCursor(winFromNs, winToNs, qHash, plan.block, 0)
+				page.NextCursor = makeNextCursor(winFromSec, winToSec, qHash, plan.block, 0)
 				break
 			}
 			continue
@@ -272,7 +271,7 @@ func (s *Series) readWithOptions(ctx context.Context, req ReadRequest, defaultWi
 		}
 		if len(page.Rows) == limit && takeStart+taken < matchCount {
 			page.HasMore = true
-			page.NextCursor = makeNextCursor(winFromNs, winToNs, qHash, plan.block, uint32(takeStart+taken))
+			page.NextCursor = makeNextCursor(winFromSec, winToSec, qHash, plan.block, uint32(takeStart+taken))
 			break
 		}
 	}
@@ -284,9 +283,9 @@ func (s *Series) readWithOptions(ctx context.Context, req ReadRequest, defaultWi
 	return page, nil
 }
 
-func makeNextCursor(winFromNs, winToNs int64, qHash uint64, b sealedMeta, rowSkip uint32) Cursor {
+func makeNextCursor(winFromSec, winToSec int64, qHash uint64, b sealedMeta, rowSkip uint32) Cursor {
 	return Cursor{
-		winFromNs: winFromNs, winToNs: winToNs, queryHash: qHash,
+		winFromSec: winFromSec, winToSec: winToSec, queryHash: qHash,
 		slotStart: b.start, slotRes: b.res, rowSkip: rowSkip, valid: true,
 	}
 }

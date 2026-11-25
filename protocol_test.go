@@ -1459,3 +1459,201 @@ func TestResetAllDictRotationAndStats(t *testing.T) {
 		}
 	})
 }
+
+func TestBatch1AtomicityAndStartupCleanup(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
+	cfg := SeriesConfig{Arity: 1, SummaryOps: ops, RowOps: ops}
+
+	t.Run("RefreshWriterNoopAndReadOnlyCorruptPreservesState", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "refresh_atomic.db")
+		db, err := Open(path, Options{Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if db != nil {
+				_ = db.Close()
+			}
+		}()
+		s, err := db.Series(1, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ts := now.Add(-2 * time.Hour)
+		if err := s.Append(ts, Summary{Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f},
+			Row{Tags: []string{"k1"}, Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Refresh(); err != nil {
+			t.Fatalf("writer Refresh failed: %v", err)
+		}
+		if len(db.pending) != 1 {
+			t.Fatalf("writer Refresh cleared pending: len=%d", len(db.pending))
+		}
+		if err := db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+
+		roDB, err := Open(path, Options{ReadOnly: true, Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roDB.Close()
+		roS, err := roDB.Series(1, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldGen := roDB.head.gen
+		oldHead := roDB.head
+
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db = nil
+
+		// Replace file with a next-gen superblock whose TS index CRC is corrupted so next.loadLocked fails.
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		badHead := oldHead
+		badHead.gen++
+		badHead.sections[secTSIndex].crc ^= 0xffffffff
+		slot := encodeSlot(badHead)
+		copy(raw[:slotSize], slot)
+		copy(raw[slotSize:headerSize], slot)
+		badPath := path + ".corrupt"
+		if err := os.WriteFile(badPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := renameAtomic(badPath, path); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := roDB.Refresh(); err == nil {
+			t.Fatal("expected read-only Refresh error on corrupted next generation")
+		}
+		if roDB.head.gen != oldGen {
+			t.Fatalf("failed Refresh mutated generation: got=%d want=%d", roDB.head.gen, oldGen)
+		}
+		res, err := roS.Aggregate(ctx, AggregateQuery{
+			AllTime: true,
+			Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"k1"}}},
+		})
+		if err != nil {
+			t.Fatalf("query after failed Refresh returned error: %v", err)
+		}
+		got := res.Summary.Values[0]
+		res.Release()
+		if got != 10 {
+			t.Fatalf("query after failed Refresh lost data: got=%d want=10", got)
+		}
+	})
+
+	t.Run("OpenCleansCrashTempFiles", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "cleanup.db")
+		db, err := Open(path, Options{Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		stale := []string{path + ".tmp", path + ".invtmp", path + ".invchk"}
+		for _, p := range stale {
+			if err := os.WriteFile(p, []byte("stale"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		db, err = Open(path, Options{Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, p := range stale {
+			if _, err := os.Stat(p); !os.IsNotExist(err) {
+				t.Fatalf("expected stale temp file %s removed on Open, stat err=%v", p, err)
+			}
+		}
+	})
+
+	t.Run("FlushLockedErrorRollbackNoDoubleCount", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "flush_rollback.db")
+		db, err := Open(path, Options{Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if db != nil {
+				_ = db.Close()
+			}
+		}()
+		s, err := db.Series(1, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Append(now.Add(-2*time.Minute), Summary{Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f},
+			Row{Tags: []string{"m1"}, Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Append(now.Add(-time.Minute), Summary{Values: [4]int64{20, 20, 20, 20}, Mask: 0x0f},
+			Row{Tags: []string{"m2"}, Values: [4]int64{20, 20, 20, 20}, Mask: 0x0f},
+		); err != nil {
+			t.Fatal(err)
+		}
+		origPos, origAppend, origAlloc := db.walPos, db.appendSeq, db.allocatedSeq
+
+		// Swap in a read-only fd to force appendFrame failure during Flush and verify rollback.
+		roFD, err := openData(path, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		origData := db.data
+		db.data = roFD
+		flushErr := db.Flush()
+		db.data = origData
+		_ = roFD.Close()
+		if flushErr == nil {
+			t.Fatal("expected Flush failure on read-only file descriptor")
+		}
+		if db.walPos != origPos || db.appendSeq != origAppend || db.allocatedSeq != origAlloc || len(db.pending) != 2 {
+			t.Fatalf("Flush error did not roll back WAL state: pos=%d/%d append=%d/%d alloc=%d/%d pending=%d",
+				db.walPos, origPos, db.appendSeq, origAppend, db.allocatedSeq, origAlloc, len(db.pending))
+		}
+
+		// Retry Sync on restored writable fd and verify reopened sum has no double count.
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		if db.appendSeq != origAppend+2 || db.allocatedSeq != origAlloc+2 {
+			t.Fatalf("unexpected seqs after retry: append=%d alloc=%d want=%d", db.appendSeq, db.allocatedSeq, origAppend+2)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db = nil
+
+		reopened, err := Open(path, Options{Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		rs, err := reopened.Series(1, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := rs.Aggregate(ctx, AggregateQuery{AllTime: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := res.Summary.Values[0]
+		res.Release()
+		if got != 30 {
+			t.Fatalf("reopened sum after Flush rollback+retry got=%d want=30", got)
+		}
+	})
+}

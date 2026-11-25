@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"sort"
 
 	"github.com/klauspost/compress/zstd"
 )
 
-var blockStreamsMagic = [4]byte{'S', 'T', 'R', '2'}
+var (
+	blockStreamsMagic      = [4]byte{'S', 'T', 'R', '2'}
+	errBlockOutsideSection = errors.New("strata: block outside section")
+)
 
 const streamFlagUnsorted byte = 1
 
@@ -283,7 +285,7 @@ func sectionBlock(f *osFile, d sectionDesc, off uint64, n uint32, mapped []byte)
 
 func sectionBlockPooled(f *osFile, d sectionDesc, off uint64, n uint32, mapped []byte) ([]byte, *[]byte, error) {
 	if off < d.offset || off+uint64(n) > d.offset+d.length {
-		return nil, nil, fmt.Errorf("strata: block outside section off=%d len=%d section=%d+%d", off, n, d.offset, d.length)
+		return nil, nil, errBlockOutsideSection
 	}
 	if mapped != nil && off >= dataStart && off+uint64(n) <= dataStart+uint64(len(mapped)) {
 		return mapped[off-dataStart : off-dataStart+uint64(n)], nil, nil

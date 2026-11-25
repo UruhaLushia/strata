@@ -15,10 +15,13 @@ type compiledFilter struct {
 	bits     []uint64
 }
 
-func compileFiltersSnap(dict dictionary, series uint16, filters []Filter) []compiledFilter {
+func compileFiltersSnap(dict dictionary, series uint16, arity int, filters []Filter) []compiledFilter {
 	out := make([]compiledFilter, len(filters))
 	for i, filter := range filters {
-		ids := matchingTagIDsSnap(dict, series, filter)
+		var ids []uint32
+		if filter.Dim >= 0 && filter.Dim < arity {
+			ids = matchingTagIDsSnap(dict, series, filter)
+		}
 		compiled := compiledFilter{dim: filter.Dim, negate: filter.Negate, ids: ids}
 		switch {
 		case len(ids) == 1:

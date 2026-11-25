@@ -64,7 +64,7 @@ func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts query
 
 	var sealedBits *blockBitmap
 	if len(filters) > 0 {
-		compiled := compileFiltersSnap(snap.dict, snap.series.id, filters)
+		compiled := compileFiltersSnap(snap.dict, snap.series.id, snap.series.cfg.Arity, filters)
 		ordered, orderedCompiled := orderCompiledFilters(filters, compiled)
 		for i, f := range ordered {
 			if !f.Negate && len(orderedCompiled[i].ids) == 0 {

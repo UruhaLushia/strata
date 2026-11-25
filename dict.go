@@ -178,6 +178,8 @@ func (dim *dictDim) appendValue(id uint32, value string) {
 	dim.extra[id] = value
 	if prev == "" && value != "" {
 		dim.count++
+	} else if prev != "" && value == "" && dim.count > 0 {
+		dim.count--
 	}
 }
 

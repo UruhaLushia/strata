@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1070,4 +1071,46 @@ func TestKVSectionPassthrough(t *testing.T) {
 		assertKV(t, reg, "k", []byte("legacy-val"), true)
 		assertTSSum(t, reSeries, now.Add(-3*time.Hour), now, 7)
 	})
+}
+
+func TestKVPutTTLMaxDuration(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "kv_max_ttl.db")
+	opts := Options{Now: func() time.Time { return now }}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := db.Region("ttl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = r.PutTTL("forever", []byte("alive"), time.Duration(math.MaxInt64)); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := r.Get("forever"); err != nil || !ok || string(v) != "alive" {
+		t.Fatalf("immediate Get failed: val=%q ok=%v err=%v", v, ok, err)
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := r.Get("forever"); err != nil || !ok || string(v) != "alive" {
+		t.Fatalf("post-Compact Get failed: val=%q ok=%v err=%v", v, ok, err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	rr, err := reopened.Region("ttl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := rr.Get("forever"); err != nil || !ok || string(v) != "alive" {
+		t.Fatalf("reopen Get failed: val=%q ok=%v err=%v", v, ok, err)
+	}
 }

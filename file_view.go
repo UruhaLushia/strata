@@ -2,7 +2,6 @@ package strata
 
 import (
 	"errors"
-	"fmt"
 	"sync/atomic"
 )
 
@@ -55,7 +54,7 @@ func (v *fileView) adviseDontNeed() {
 
 func (v *fileView) readRawPooled(offset uint64, length, wantCRC uint32) ([]byte, *[]byte, error) {
 	if offset < v.blocks.offset || offset+uint64(length) > v.blocks.offset+v.blocks.length {
-		return nil, nil, fmt.Errorf("strata: block outside section off=%d len=%d section=%d+%d", offset, length, v.blocks.offset, v.blocks.length)
+		return nil, nil, errBlockOutsideSection
 	}
 	raw, bufPtr, err := sectionBlockPooled(v.data, v.blocks, offset, length, v.mappedBytes())
 	if err != nil {

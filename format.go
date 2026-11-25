@@ -2,11 +2,11 @@ package strata
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
 	"math"
+	"math/rand/v2"
 	"time"
 )
 
@@ -223,7 +223,8 @@ func decodeSlot(raw []byte) (superblock, bool) {
 
 func initialSuper() superblock {
 	var u [16]byte
-	_, _ = rand.Read(u[:])
+	binary.LittleEndian.PutUint64(u[:8], rand.Uint64())
+	binary.LittleEndian.PutUint64(u[8:], rand.Uint64())
 	if u == [16]byte{} {
 		copy(u[:], []byte("strata-phase1a"))
 	}

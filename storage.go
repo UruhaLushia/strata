@@ -22,6 +22,9 @@ func Open(path string, opts Options) (*DB, error) {
 		if err != nil {
 			return nil, err
 		}
+		_ = os.Remove(path + ".tmp")
+		_ = os.Remove(path + ".invtmp")
+		_ = os.Remove(path + ".invchk")
 	}
 	f, err := openData(path, opts.ReadOnly)
 	if err != nil && !opts.ReadOnly && os.IsNotExist(err) {
@@ -44,13 +47,6 @@ func Open(path string, opts Options) (*DB, error) {
 		writer:         !opts.ReadOnly,
 		lock:           lk,
 		data:           f,
-		series:         make(map[uint16]*Series),
-		dict:           newDictWithPolicy(policy),
-		live:           make(map[bucketKey]*bucket),
-		pending:        make(map[bucketKey]*bucket),
-		kvCatalog:      make(map[string]uint16),
-		kvRegions:      make(map[uint16]*kvRegion),
-		kvOverlay:      make(map[kvKey]kvValue),
 		kvNext:         0x100,
 	}
 	if st, stErr := f.Stat(); stErr != nil {

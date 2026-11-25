@@ -134,6 +134,9 @@ func searchCandidatesSnap(snap *querySnapshot, filters []Filter, compiled []comp
 		if len(ids) == 0 {
 			return nil, true, nil
 		}
+		if ids[0] == 0 {
+			continue
+		}
 		totalTags := snap.dict.dimCount(series, uint8(f.Dim))
 		if totalTags > 0 && len(ids)*5 >= totalTags*4 {
 			continue
@@ -214,6 +217,9 @@ func matchingTagIDsSnap(d dictionary, series uint16, f Filter) []uint32 {
 	dimSnap := &d.snapshotDims[f.Dim]
 	ids := make([]uint32, 0)
 	for _, value := range f.Values {
+		if tagMatches(f.Op, "", value) {
+			ids = append(ids, 0)
+		}
 		switch f.Op {
 		case TagEq:
 			if id := dimSnap.lookup(value); id != 0 {

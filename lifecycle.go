@@ -94,16 +94,24 @@ func (db *DB) Refresh() error {
 	if db.closed {
 		return errors.New("strata: database is closed")
 	}
+	if db.writer {
+		return nil
+	}
 	probe, err := openData(db.path, true)
 	if err != nil {
 		return err
 	}
 	head, err := readSuper(probe)
-	_ = probe.Close()
 	if err != nil {
+		_ = probe.Close()
 		return err
 	}
+	if head.incompat&^knownIncompat != 0 {
+		_ = probe.Close()
+		return ErrIncompatFormat
+	}
 	if head.uuid == db.head.uuid && head.gen == db.head.gen {
+		_ = probe.Close()
 		pos, max, scanErr := scanWAL(db.data, db.walPos, false, db.applyFrame)
 		if scanErr != nil {
 			return scanErr
@@ -117,22 +125,85 @@ func (db *DB) Refresh() error {
 		db.lastRefreshSize = pos
 		return nil
 	}
-	f, err := openData(db.path, db.opts.ReadOnly)
-	if err != nil {
-		return err
-	}
-	oldView := db.view
+	f := probe
 	mapped, err := mapPrefix(f, head.walOffset, db.shouldMmap())
 	if err != nil {
 		_ = f.Close()
 		return err
 	}
-	db.data, db.head, db.mapped = f, head, mapped
-	db.view = newFileView(f, mapped, head.sections[secTSBlocks])
+	next := &DB{
+		path:   db.path,
+		opts:   db.opts,
+		policy: db.policy,
+		writer: false,
+		data:   f,
+		head:   head,
+		mapped: mapped,
+		view:   newFileView(f, mapped, head.sections[secTSBlocks]),
+	}
+	if err := next.loadLocked(); err != nil {
+		next.view.release()
+		return err
+	}
+
+	oldSeries := db.series
+	mergedSeries := make(map[uint16]*Series, max(len(next.series), len(oldSeries)))
+	for id, fresh := range next.series {
+		if old := oldSeries[id]; old != nil {
+			if old.configInferred && !fresh.configInferred {
+				old.cfg = fresh.cfg
+				old.configInferred = false
+			} else if old.configInferred {
+				old.cfg.SummaryOps, old.cfg.RowOps = fresh.cfg.SummaryOps, fresh.cfg.RowOps
+			}
+			old.resetEpoch = fresh.resetEpoch
+			old.rules = fresh.rules
+			mergedSeries[id] = old
+			continue
+		}
+		fresh.db = db
+		mergedSeries[id] = fresh
+	}
+	for id, old := range oldSeries {
+		if _, ok := mergedSeries[id]; !ok {
+			old.resetEpoch = 0
+			old.rules = nil
+			mergedSeries[id] = old
+		}
+	}
+
+	oldView := db.view
+	db.data = next.data
+	db.view = next.view
+	db.head = next.head
+	db.mapped = next.mapped
+	db.series = mergedSeries
+	db.dict = next.dict
+	db.sealed = next.sealed
+	db.sealedByRes = next.sealedByRes
+	db.optional = next.optional
+	db.live = next.live
+	db.appendSeq = next.appendSeq
+	db.allocatedSeq = next.allocatedSeq
+	db.durableSeq = next.durableSeq
+	db.sealedSeq = next.sealedSeq
+	db.order = next.order
+	db.walPos = next.walPos
+	db.pending = next.pending
+	db.pendingDict = next.pendingDict
+	db.pendingBytes = next.pendingBytes
+	db.lastRefreshSize = next.lastRefreshSize
+	db.kvCatalog = next.kvCatalog
+	db.kvRegions = next.kvRegions
+	db.kvOverlay = next.kvOverlay
+	db.kvSST = next.kvSST
+	db.kvRev = next.kvRev
+	db.kvNext = next.kvNext
+	db.invert = next.invert
 	if oldView != nil {
 		oldView.release()
 	}
-	return db.loadLocked()
+	return nil
 }
 
 func (db *DB) Flush() error { db.mu.Lock(); defer db.mu.Unlock(); return db.flushLocked(false) }
@@ -157,12 +228,15 @@ func (db *DB) flushLocked(force bool) error {
 		mins = append(mins, m)
 	}
 	slices.Sort(mins)
+	prevPos, prevAppend, prevAllocated := db.walPos, db.appendSeq, db.allocatedSeq
 	for _, m := range mins {
 		bs := groups[m]
 		db.allocatedSeq++
 		payload := encodeDelta(dicts, bs)
 		pos, err := appendFrame(db.data, db.walPos, frameDelta, db.allocatedSeq, payload)
 		if err != nil {
+			_ = db.data.f.Truncate(prevPos)
+			db.walPos, db.appendSeq, db.allocatedSeq = prevPos, prevAppend, prevAllocated
 			return err
 		}
 		db.walPos = pos

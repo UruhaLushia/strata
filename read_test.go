@@ -250,13 +250,13 @@ func TestLightReadLaneIsolationAndFallback(t *testing.T) {
 
 	// ParseCursor must reject rowSkip > math.MaxInt32 (MF-2).
 	badSkipCur := Cursor{
-		winFromNs: now.Add(-time.Hour).UnixNano(),
-		winToNs:   now.UnixNano(),
-		queryHash: cursorQueryHash(1, nil, false, false),
-		slotStart: now.Add(-10 * time.Minute).Unix(),
-		rowSkip:   uint32(math.MaxInt32) + 1,
-		slotRes:   resMinuteHR,
-		valid:     true,
+		winFromSec: now.Add(-time.Hour).Unix(),
+		winToSec:   now.Unix(),
+		queryHash:  cursorQueryHash(1, nil, false, false),
+		slotStart:  now.Add(-10 * time.Minute).Unix(),
+		rowSkip:    uint32(math.MaxInt32) + 1,
+		slotRes:    resMinuteHR,
+		valid:      true,
 	}
 	if _, err := ParseCursor(badSkipCur.String()); !errors.Is(err, ErrInvalidCursor) {
 		t.Fatalf("ParseCursor should reject rowSkip > MaxInt32, got %v", err)
@@ -295,12 +295,12 @@ func TestLightReadLaneIsolationAndFallback(t *testing.T) {
 		tooManyVals[i] = fmt.Sprintf("sm1-g-%02d", i)
 	}
 	overflowCur := Cursor{
-		winFromNs: math.MinInt64,
-		winToNs:   math.MaxInt64,
-		queryHash: cursorQueryHash(1, nil, false, false),
-		slotStart: now.Add(-10 * time.Minute).Unix(),
-		slotRes:   resMinuteHR,
-		valid:     true,
+		winFromSec: math.MinInt64,
+		winToSec:   math.MaxInt64,
+		queryHash:  cursorQueryHash(1, nil, false, false),
+		slotStart:  now.Add(-10 * time.Minute).Unix(),
+		slotRes:    resMinuteHR,
+		valid:      true,
 	}
 	mustFallback := []struct {
 		name string
