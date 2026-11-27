@@ -2,17 +2,19 @@
 
 [English](README.md) | 简体中文
 
-一个纯 Go（`CGO_ENABLED=0`）实现的**特化**单文件嵌入式时序与键值存储引擎，专为低内存客户端遥测、网关指标与网络流量统计设计。
+一个纯 Go（`CGO_ENABLED=0`）实现的**极轻量、内存有界的嵌入式存储套件**，适用于代理客户端流量统计、游戏启动统计、AI API 用量统计以及桌面与移动后台工具。代理网关的 90 天百万行数据集是核心压测基线。
 
 ## 定位与适用边界
 
-Strata **不是**通用 SQL、文档或自由文本日志数据库。它主动放弃通用 Schema，以换取极小体积、可控内存上限与高速下推标签检索：
+根包在单个文件内存储固定结构的时序数据和事务键值数据，具备小体积、可控内存上限与标签过滤下推能力。
 
 - **固定遥测 Schema**：每条序列固定支持最多 8 个字符串标签维度（`Arity: 1..8`）与 4 个 `int64` 指标（`OpSum`、`OpMin`、`OpMax`、`OpLast`）。
 - **内置多级汇总**：自动按 `1m` / `1h` / `1d` 降采样并按层级过期，内置本地时区按小时聚合（`RollupLocalHours`）。
-- **面向网络/标签特化的检索能力**：`STR2` 列式分块、5 模式自适应倒排索引、内联/外置分页混合词典（`SecTSDict codec=2`）、内置下推过滤（`TagEq`、`TagPrefix`、`TagSuffix`、`TagContains`、`TagCIDR`），以及防止首屏小页被重查询阻塞的 1 槽有界轻读通道。
+- **标签检索**：`STR2` 列式分块、5 模式自适应倒排索引、内联与外置分页混合词典、内置下推过滤（`TagEq`、`TagPrefix`、`TagSuffix`、`TagContains`、`TagCIDR`），以及防止首屏小页被重查询阻塞的 1 槽有界轻读通道。
 - **同文件事务 KV**：在同一单文件内提供纯字节事务 KV 分区（`Region`、`Batch`、`Scan`、`ScanSeq`），支持 TTL、CAS 与快照无锁流式扫描。
 - **内存优先**：提供 `MemoryBalanced` / `MemoryConstrained` 双档预算、零指针（`noscan`）索引结构、显式 `Client.Reclaim()`（Unix 下触发 `MADV_DONTNEED`），外部依赖仅 `klauspost/compress` 与 `golang.org/x/sys`。
+
+v0.2.0 根包使用 `UNIDBv02` 文件格式，打开 v0.1.0 数据库会报错。
 
 ## 快速上手
 
@@ -63,6 +65,35 @@ _ = reg.Put("theme", []byte("dark"))
 
 // 空闲时回收缓冲池、缓存与冷 mmap 页
 client.Reclaim()
+```
+
+## 可选事件历史
+
+按需导入 `github.com/UruhaLushia/strata/eventlog`，在本地保留有界的结构化事件历史。根包与 `eventlog` 双向零依赖，应用未导入该子包时没有事件历史开销。记录直接存盘，无 Zstd 和常驻块目录开销。
+
+`Open` 返回 `(*eventlog.Log, error)`。`Append`、`Flush()`、`Sync()` 和 `Close()` 均返回 `error`。`Scan` 按追加顺序倒序扫描，限制扫描范围并返回 `(eventlog.ScanResult, error)`。
+
+```go
+log, err := eventlog.Open("events", eventlog.Options{})
+if err != nil {
+	panic(err)
+}
+defer log.Close()
+
+if err := log.Append(eventlog.Record{
+	TimestampNS: time.Now().UnixNano(), StreamID: 1, Payload: []byte("launch"),
+}); err != nil {
+	panic(err)
+}
+if err := log.Sync(); err != nil {
+	panic(err)
+}
+if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}, func(r eventlog.Record) error {
+	println(string(r.Payload))
+	return nil
+}); err != nil {
+	panic(err)
+}
 ```
 
 ## 基准测试

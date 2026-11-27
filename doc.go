@@ -1,17 +1,11 @@
-// Package strata implements an embedded, memory-bounded single-file time-series
-// and key-value storage engine in pure Go.
+// Package strata implements lightweight, memory-bounded embedded storage for
+// time-series metrics and transactional key-value data in a single file.
 //
-// Strata stores multi-dimensional telemetry series (up to 8 tag dimensions and 4
-// metrics per row) alongside transactional KV regions inside one crash-safe file
-// with WAL durability, multi-resolution rollups (1m / 1h / 1d), columnar STR2
-// block compression, adaptive 5-mode inverted indexes, and hybrid inline/external
-// paged dictionaries for high-cardinality dimensions.
+// Applications can store traffic metrics, game launch statistics, or API usage
+// alongside local settings and state. Use [OpenClient] or [NewClient] for
+// time-series rollups, aggregation, paginated reads, streaming scans, and
+// transactions across key-value regions.
 //
-// Applications typically interact through [OpenClient] or [NewClient], which
-// manage series/region handle caching, bounded query concurrency, cursor-based
-// pagination ([Client.Read] / [Client.WithPage]), streaming scans ([Client.Scan]
-// / [Client.ScanSeq]), pushed-down aggregations ([Client.Aggregate] /
-// [Client.WithAggregate]), pure-byte transactional KV ([Region] / [Batch] /
-// [Region.Scan] / [Region.ScanSeq]), and explicit memory reclamation
-// ([Client.Reclaim]).
+// The independent github.com/UruhaLushia/strata/eventlog subpackage provides
+// optional, bounded structured event history.
 package strata

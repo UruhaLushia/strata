@@ -2,17 +2,19 @@
 
 English | [简体中文](README_zh.md)
 
-A **specialized**, memory-bounded, single-file embedded TSDB & KV storage engine in pure Go (`CGO_ENABLED=0`), designed for low-memory client telemetry, gateway metrics, and network traffic analytics.
+An **ultralight, memory-bounded embedded storage toolkit** in pure Go (`CGO_ENABLED=0`). Use it for proxy client traffic statistics, game launch statistics, AI API usage, or desktop and mobile background tools. The 90-day, million-row proxy gateway dataset is the core stress-test baseline.
 
 ## Scope
 
-Strata is **not** a general-purpose SQL, document, or free-text log database. It trades schema generality for tiny footprint, predictable memory ceilings, and fast pushed-down tag queries:
+The root package stores fixed-schema time series and transactional key-value data in one file, with a small footprint, bounded memory, and tag filters pushed down into queries.
 
 - **Fixed schema**: Up to 8 string tag dimensions (`Arity: 1..8`) + 4 `int64` metrics (`OpSum`, `OpMin`, `OpMax`, `OpLast`) per series.
 - **Built-in rollups**: Automatic `1m` / `1h` / `1d` downsampling with per-tier retention and local-hour rollup (`RollupLocalHours`).
-- **Tailored tag search**: Columnar `STR2` blocks, 5-mode adaptive inverted indexes, hybrid inline/disk-paged dictionaries (`SecTSDict codec=2`), pushdown filters (`TagEq`, `TagPrefix`, `TagSuffix`, `TagContains`, `TagCIDR`), and a 1-slot bounded light-read lane for recent small pages.
+- **Tag search**: Columnar `STR2` blocks, 5-mode adaptive inverted indexes, hybrid inline/disk-paged dictionaries, pushdown filters (`TagEq`, `TagPrefix`, `TagSuffix`, `TagContains`, `TagCIDR`), and a 1-slot bounded light-read lane for recent small pages.
 - **Co-located KV**: Pure-byte transactional KV regions (`Region`, `Batch`, `Scan`, `ScanSeq`) with TTL, CAS, and lock-free streaming scans inside the same file.
 - **Memory-first**: `MemoryBalanced` / `MemoryConstrained` profiles, pointer-free (`noscan`) indexes, explicit `Client.Reclaim()` (`MADV_DONTNEED` on Unix), and only 2 external dependencies (`klauspost/compress`, `golang.org/x/sys`).
+
+The v0.2.0 root package uses the `UNIDBv02` file format. Opening a v0.1.0 database returns an error.
 
 ## Quick Start
 
@@ -63,6 +65,35 @@ _ = reg.Put("theme", []byte("dark"))
 
 // Reclaim idle pools, caches, and mmap pages
 client.Reclaim()
+```
+
+## Optional event history
+
+Import `github.com/UruhaLushia/strata/eventlog` to keep a bounded local history of structured events. The root package and `eventlog` have no dependency on each other, so applications that omit `eventlog` incur no event history overhead. Records are stored directly, with no Zstd or resident block directory.
+
+`Open` returns `(*eventlog.Log, error)`. `Append`, `Flush()`, `Sync()`, and `Close()` each return `error`. `Scan` visits a bounded set of records in reverse append order and returns `(eventlog.ScanResult, error)`.
+
+```go
+log, err := eventlog.Open("events", eventlog.Options{})
+if err != nil {
+	panic(err)
+}
+defer log.Close()
+
+if err := log.Append(eventlog.Record{
+	TimestampNS: time.Now().UnixNano(), StreamID: 1, Payload: []byte("launch"),
+}); err != nil {
+	panic(err)
+}
+if err := log.Sync(); err != nil {
+	panic(err)
+}
+if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}, func(r eventlog.Record) error {
+	println(string(r.Payload))
+	return nil
+}); err != nil {
+	panic(err)
+}
 ```
 
 ## Benchmarks

@@ -15,7 +15,7 @@ const (
 	slotSize               = 2048
 	headerSize             = 4096
 	dataStart              = 0x1000
-	magic                  = "UNIDBv01"
+	magic                  = "UNIDBv02"
 	knownCompat     uint32 = 0
 	knownReadOnly   uint32 = 0
 	knownIncompat   uint32 = 0
