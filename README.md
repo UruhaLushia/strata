@@ -2,7 +2,7 @@
 
 English | [简体中文](README_zh.md)
 
-An **ultralight, memory-bounded embedded storage toolkit** in pure Go (`CGO_ENABLED=0`). Use it for proxy client traffic statistics, game launch statistics, AI API usage, or desktop and mobile background tools. The 90-day, million-row proxy gateway dataset is the core stress-test baseline.
+An **ultralight, memory-bounded storage engine** in pure Go (`CGO_ENABLED=0`).
 
 ## Scope
 
@@ -104,24 +104,36 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 
 | Dataset | `.db` Size | Open `HeapAlloc` | Post-Reclaim `RssAnon` (`mmap=true`) | Incremental `Compact` |
 |---|---:|---:|---:|---:|
-| Realistic (5K domains, 2K IPs) | 10.15 MiB | 2.22 MiB | 9.56 MiB | 182–195 ms |
-| Extreme (1.06M unique IPv6) | 26.45 MiB | 2.32 MiB | 14.40 MiB | 438–454 ms |
+| Realistic (5K domains, 2K IPs) | 10.06 MiB | 2.20 MiB | 13.48 MiB | 172–176 ms |
+| Extreme (1.06M unique IPv6) | 26.36 MiB | 2.31 MiB | 14.42 MiB | 446–462 ms |
 
 ### Query Latency & Allocations
 
 | Benchmark | Realistic | Extreme (1.06M IPv6) |
 |---|---:|---:|
-| `SummaryOnly` (90d zero-disk) | 38.0 µs / 1.1 KiB / 9 allocs | 38.0 µs / 1.1 KiB / 9 allocs |
-| `ReadLast15mPage200` | 41.1 µs / 11.1 KiB / 21 allocs | 75.0 µs / 15.8 KiB / 221 allocs |
-| `Read90dDeepOffset5000` | 91.1 µs / 80.4 KiB / 14 allocs | 101.2 µs / 83.9 KiB / 214 allocs |
-| `Scan90dSparseMeta` (76 rows) | 3.03 ms / 80.6 KiB / 39 allocs | 5.80 ms / 454 KiB / 46 allocs |
-| `Scan90dMediumMeta` (1,768 rows) | 6.46 ms / 86.5 KiB / 95 allocs | 10.09 ms / 532 KiB / 103 allocs |
-| `Scan90dDenseMeta` (344K / 530K rows) | 9.72 ms / 445 KiB / 98 allocs | 15.11 ms / 990 KiB / 102 allocs |
-| `Scan90dTimeFirstIDs` (735K / 1.06M rows) | 8.93 ms / 430 KiB / 87 allocs | 13.23 ms / 957 KiB / 90 allocs |
-| `AggregateFiltered` | 1.29 ms / 348 KiB / 87 allocs | — |
-| `AggregateTopK` (5K domains Top-50) | 5.40 ms / 757 KiB / 158 allocs | — |
-| `AggregateDomain` (5K domains) | 6.68 ms / 1.10 MiB / 135 allocs | — |
-| `ExtremeDestIPTopK` (1.06M IPv6 exact Top-50) | — | 44.36 ms / 2.70 MiB / 355 allocs (`39.0 ms` post-Reclaim `mmap=true`) |
+| `SummaryOnly` (90d zero-disk) | 36.1 µs / 887 B / 7 allocs | 36.1 µs / 887 B / 7 allocs |
+| `ReadLast15mPage200` | 39.1 µs / 10.8 KiB / 14 allocs | 68.4 µs / 15.5 KiB / 214 allocs |
+| `Read90dDeepOffset5000` | 84.2 µs / 80.3 KiB / 14 allocs | 86.8 µs / 83.6 KiB / 214 allocs |
+| `OutboundLookup` (15m / 1h / 24h / 7d hit) | 83.4 µs / 212.8 µs / 543.0 µs / 1.06 ms | 64.1 µs / 65.5 µs / 64.7 µs / 71.0 µs |
+| `OutboundLookup` (unknown miss) | 3.9–4.1 µs / 9.4 KiB / 16 allocs | 10.2–10.8 µs / 9.6 KiB / 17 allocs |
+| `Scan90dSparseMeta` (76 rows) | 2.94 ms / 86.2 KiB / 39 allocs | 5.11 ms / 95.3 KiB / 39 allocs |
+| `Scan90dMediumMeta` (1,768 rows) | 6.29 ms / 88.0 KiB / 26 allocs | 8.51 ms / 105.7 KiB / 27 allocs |
+| `Scan90dDenseMeta` (344K / 530K rows) | 9.60 ms / 445 KiB / 28 allocs | 13.80 ms / 1.00 MiB / 35 allocs |
+| `Scan90dTimeFirstIDs` (735K / 1.06M rows) | 7.69 ms / 426 KiB / 16 allocs | 10.72 ms / 968 KiB / 20 allocs |
+| `AggregateFiltered` | 1.17 ms / 236 KiB / 81 allocs | — |
+| `AggregateTopK` (5K domains Top-50) | 4.77 ms / 824 KiB / 102 allocs | — |
+| `AggregateDomain` (5K domains) | 5.47 ms / 1.13 MiB / 72 allocs | — |
+| `ExtremeDestIPTopK` (1.06M IPv6 exact Top-50) | — | 38.30 ms / 2.41 MiB / 218 allocs |
+
+### `eventlog` Footprint & Throughput
+
+Stripped `CGO_ENABLED=0` binary size (`-trimpath -ldflags="-s -w"`): root only `2.46 MiB`, root + linked unused `eventlog` `+0 B`, root + active `eventlog` `+96 KiB`, standalone `eventlog` `1.49 MiB` (zero Zstd dependency).
+
+| `eventlog` Benchmark (64B payload, 4 MiB shard) | Latency | Memory / Allocs | Throughput |
+|---|---:|---:|---:|
+| `AppendFlush` (batched write) | 42.1 ns/event | 0 allocs/op | 1,522 MB/s |
+| `ScanRecent` (recent 200, ~1.5 KiB frames) | 14.0 µs | 345 B / 6 allocs | — |
+| `ScanRecent` (full 4 MiB shard, ~1.5 KiB frames) | 1.16 ms | 344 B / 6 allocs | ~3.5 GB/s |
 
 Under 8-way mixed concurrency saturation (`mmap=true`), `SummaryOnly` stays at `p99 <= 183 µs` and bounded small-page `Read` stays at `p99 <= 424 µs` (`<= 303 µs` under `MemoryConstrained`).
 
