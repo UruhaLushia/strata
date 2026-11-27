@@ -11,10 +11,6 @@ import (
 	"time"
 )
 
-func newDict() dictionary {
-	return newDictWithPolicy(memPolicy{dictPageCacheBytes: 256 << 10, dictHotBytes: 256 << 10})
-}
-
 func encodeBlockLevel(b sealedBlock, level CompressionLevel) ([]byte, error) {
 	enc := newZstdEncoder(level, 128<<10)
 	defer enc.Close()

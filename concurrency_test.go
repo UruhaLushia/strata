@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,290 +20,7 @@ const (
 	backgroundTestTimeout  = 2 * time.Second
 )
 
-func TestConcurrentStartClose(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "strata.db")
-	opts := Options{FlushInterval: time.Hour, SyncInterval: time.Hour}
-	for range 16 {
-		db, err := Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx := t.Context()
-		db.Start(ctx)
-		done := backgroundLoopDone(db)
-		db.Start(ctx)
-		if done == nil || backgroundLoopDone(db) != done {
-			t.Fatal("Start did not keep exactly one loop")
-		}
-
-		var wg sync.WaitGroup
-		start := make(chan struct{})
-		for range 8 {
-			wg.Go(func() {
-				<-start
-				for range 16 {
-					db.Start(ctx)
-					runtime.Gosched()
-				}
-			})
-		}
-		for range 2 {
-			wg.Go(func() {
-				<-start
-				if err := db.Close(); err != nil {
-					t.Error(err)
-				}
-			})
-		}
-		close(start)
-		wg.Wait()
-
-		select {
-		case <-done:
-		default:
-			t.Fatal("Close returned before the loop stopped")
-		}
-		db.Start(ctx)
-		assertNoBackgroundLoop(t, db)
-	}
-}
-
-func TestStartSkipsInactiveDB(t *testing.T) {
-	canceled, cancel := context.WithCancel(t.Context())
-	cancel()
-	opts := Options{FlushInterval: time.Hour, SyncInterval: time.Hour}
-	path := filepath.Join(t.TempDir(), "strata.db")
-	closed, err := Open(path, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := closed.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reader, err := Open(path, Options{ReadOnly: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	for _, tc := range []struct {
-		name string
-		db   *DB
-		ctx  context.Context
-	}{
-		{"read-only", reader, t.Context()},
-		{"closed", closed, t.Context()},
-		{"canceled", &DB{opts: opts, writer: true}, canceled},
-		{"disabled", &DB{writer: true}, t.Context()},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			tc.db.Start(tc.ctx)
-			assertNoBackgroundLoop(t, tc.db)
-		})
-	}
-}
-
-func TestStartRestartsAfterCancel(t *testing.T) {
-	ctx1, cancel1 := context.WithCancel(t.Context())
-	defer cancel1()
-	ctx2, cancel2 := context.WithCancel(t.Context())
-	defer cancel2()
-	db, s, now, release := startBlockedAutoCompact(t, ctx1)
-	done := backgroundLoopDone(db)
-	started := make(chan struct{})
-	go func() {
-		cancel1()
-		db.Start(ctx2)
-		cancel2()
-		db.Start(context.Background())
-		close(started)
-	}()
-	waitForBackgroundSignal(t, started, "Start waited for the canceled loop to exit")
-	release()
-	waitForBackgroundContext(t, db, done, nil)
-	assertBackgroundFlush(t, db, s, now)
-}
-
-func TestStartReentersFromNow(t *testing.T) {
-	ctx1, cancel1 := context.WithCancel(t.Context())
-	defer cancel1()
-	ctx2, cancel2 := context.WithCancel(t.Context())
-	defer cancel2()
-	now := time.Now()
-	db, s := testDB(t, &now, Options{FlushInterval: backgroundTestInterval, SyncInterval: time.Hour})
-	defer closeBackgroundTestDB(t, db)
-
-	returned := make(chan struct{})
-	db.opts.Now = func() time.Time {
-		select {
-		case <-returned:
-		default:
-			cancel1()
-			db.Start(ctx2)
-			close(returned)
-		}
-		return now
-	}
-	db.Start(ctx1)
-	done := backgroundLoopDone(db)
-	waitForBackgroundSignal(t, returned, "Start did not return in the Now callback")
-	waitForBackgroundContext(t, db, done, ctx2.Done())
-	assertBackgroundFlush(t, db, s, now)
-
-	closeBackgroundTestDB(t, db)
-	select {
-	case <-done:
-	default:
-		t.Fatal("Close returned before the loop stopped")
-	}
-	assertNoBackgroundLoop(t, db)
-}
-
-func TestConcurrentCloseWaitsForBackgroundLoop(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	db, _, _, release := startBlockedAutoCompact(t, ctx)
-	done := backgroundLoopDone(db)
-	started := make(chan struct{})
-	go func() {
-		cancel()
-		db.Start(context.Background())
-		close(started)
-	}()
-	waitForBackgroundSignal(t, started, "Start did not register a handoff during compaction")
-
-	db.loopMu.Lock()
-	stop := db.loopStop
-	db.loopMu.Unlock()
-	closed := make(chan error, 2)
-	closeDB := func() {
-		err := db.Close()
-		if err == nil {
-			select {
-			case <-done:
-			default:
-				err = errors.New("Close returned before the loop stopped")
-			}
-		}
-		closed <- err
-	}
-	go closeDB()
-	waitForBackgroundSignal(t, stop, "the first Close did not signal the loop to stop")
-
-	second := make(chan struct{})
-	go func() {
-		close(second)
-		closeDB()
-	}()
-	waitForBackgroundSignal(t, second, "the second Close did not start")
-	select {
-	case err := <-closed:
-		t.Fatalf("Close returned while background compaction was blocked: %v", err)
-	case <-time.After(backgroundTestInterval):
-	}
-	release()
-	for range 2 {
-		select {
-		case err := <-closed:
-			if err != nil {
-				t.Error(err)
-			}
-		case <-time.After(backgroundTestTimeout):
-			t.Fatal("Close did not return after compaction was released")
-		}
-	}
-	assertNoBackgroundLoop(t, db)
-}
-
-func startBlockedAutoCompact(t *testing.T, ctx context.Context) (*DB, *Series, time.Time, func()) {
-	t.Helper()
-	now := time.Now()
-	db, s := testDB(t, &now, Options{FlushInterval: backgroundTestInterval, SyncInterval: time.Hour, WALCompactBytes: 1})
-	entered, unblock := make(chan struct{}), make(chan struct{})
-	release := sync.OnceFunc(func() { close(unblock) })
-	t.Cleanup(func() {
-		release()
-		closeBackgroundTestDB(t, db)
-	})
-	db.compactHook = func() {
-		select {
-		case <-unblock:
-			return
-		default:
-		}
-		close(entered)
-		<-unblock
-	}
-	if err := s.Append(now.Add(-time.Hour), Summary{Values: [4]int64{1}}); err != nil {
-		t.Fatal(err)
-	}
-	db.Start(ctx)
-	waitForBackgroundSignal(t, entered, "background compaction did not reach the hook")
-	return db, s, now, release
-}
-
-func TestBackgroundLoopStopsOnCompactWriteDisable(t *testing.T) {
-	now := time.Now()
-	db, _ := testDB(t, &now, Options{FlushInterval: time.Hour, SyncInterval: time.Hour})
-	defer closeBackgroundTestDB(t, db)
-	ctx := t.Context()
-
-	// A required unknown section is written successfully and rejected when reloaded.
-	db.optional = []optionalSection{{desc: sectionDesc{kind: 7}, data: []byte{1}, slot: 7}}
-	db.Start(ctx)
-	done := backgroundLoopDone(db)
-	if done == nil {
-		t.Fatal("Start did not register a loop")
-	}
-	if err := db.Compact(); !errors.Is(err, ErrIncompatFormat) {
-		t.Fatalf("Compact reload error = %v, want %v", err, ErrIncompatFormat)
-	}
-	if err := db.Flush(); err != ErrReadOnly {
-		t.Fatalf("Flush after write disable = %v, want %v", err, ErrReadOnly)
-	}
-	waitForBackgroundSignal(t, done, "loop did not stop before the next tick")
-	db.Start(ctx)
-	assertNoBackgroundLoop(t, db)
-}
-
-type startContext struct {
-	context.Context
-	done func() <-chan struct{}
-}
-
-func (c startContext) Done() <-chan struct{} { return c.done() }
-
-func TestStartContextDoneCanReenter(t *testing.T) {
-	now := time.Now()
-	db, _ := testDB(t, &now, Options{FlushInterval: time.Hour, SyncInterval: time.Hour})
-	defer db.Close()
-
-	var done <-chan struct{}
-	db.Start(startContext{Context: context.Background(), done: func() <-chan struct{} {
-		if !db.loopMu.TryLock() {
-			t.Fatal("Start called Context.Done with loopMu held")
-		}
-		db.loopMu.Unlock()
-		if !db.mu.TryLock() {
-			t.Fatal("Start called Context.Done with mu held")
-		}
-		db.mu.Unlock()
-		var nilCtx context.Context
-		db.Start(nilCtx)
-		done = backgroundLoopDone(db)
-		return nil
-	}})
-	if done == nil || backgroundLoopDone(db) != done {
-		t.Fatal("reentrant Start did not keep exactly one loop")
-	}
-}
-
-func backgroundLoopDone(db *DB) <-chan struct{} {
-	db.loopMu.Lock()
-	defer db.loopMu.Unlock()
-	return db.loopDone
-}
-
-func waitForBackgroundSignal(t *testing.T, signal <-chan struct{}, message string) {
+func awaitSignal(t *testing.T, signal <-chan struct{}, message string) {
 	t.Helper()
 	select {
 	case <-signal:
@@ -311,7 +29,7 @@ func waitForBackgroundSignal(t *testing.T, signal <-chan struct{}, message strin
 	}
 }
 
-func waitForBackgroundCondition(t *testing.T, message string, ready func() bool) {
+func awaitCondition(t *testing.T, message string, ready func() bool) {
 	t.Helper()
 	tick := time.NewTicker(backgroundTestInterval)
 	defer tick.Stop()
@@ -325,42 +43,20 @@ func waitForBackgroundCondition(t *testing.T, message string, ready func() bool)
 	}
 }
 
-func waitForBackgroundContext(t *testing.T, db *DB, done, ctxDone <-chan struct{}) {
+func awaitResult(t *testing.T, result <-chan error, message string) {
 	t.Helper()
-	waitForBackgroundCondition(t, "the loop did not hand off to the requested context", func() bool {
-		db.loopMu.Lock()
-		defer db.loopMu.Unlock()
-		return done != nil && db.loopDone == done && db.loopCtxDone == ctxDone && !db.loopHasNext
-	})
-}
-
-func assertBackgroundFlush(t *testing.T, db *DB, s *Series, now time.Time) {
-	t.Helper()
-	db.mu.RLock()
-	before := db.walPos
-	db.mu.RUnlock()
-	if err := s.Append(now, Summary{Values: [4]int64{1}}); err != nil {
-		t.Fatal(err)
-	}
-	waitForBackgroundCondition(t, "restarted loop did not flush pending data to WAL", func() bool {
-		db.mu.RLock()
-		defer db.mu.RUnlock()
-		return db.walPos > before && len(db.pending) == 0
-	})
-}
-
-func closeBackgroundTestDB(t *testing.T, db *DB) {
-	t.Helper()
-	closed := make(chan error, 1)
-	go func() { closed <- db.Close() }()
 	select {
-	case err := <-closed:
-		if err != nil {
-			t.Error(err)
-		}
+	case err := <-result:
+		requireOK(t, err)
 	case <-time.After(backgroundTestTimeout):
-		t.Error("Close did not return")
+		t.Fatal(message)
 	}
+}
+
+func backgroundLoopDone(db *DB) <-chan struct{} {
+	db.loopMu.Lock()
+	defer db.loopMu.Unlock()
+	return db.loopDone
 }
 
 func assertNoBackgroundLoop(t *testing.T, db *DB) {
@@ -368,1266 +64,805 @@ func assertNoBackgroundLoop(t *testing.T, db *DB) {
 	db.loopMu.Lock()
 	defer db.loopMu.Unlock()
 	if db.loopDone != nil || db.loopStop != nil || db.loopCtxDone != nil || db.loopHasNext || db.loopNextCtxDone != nil {
-		t.Fatal("background loop is still registered")
+		t.Fatal("background loop still registered")
 	}
 }
 
-func dictCacheStats(db *DB) (used, maxBytes int) {
-	if db == nil {
-		return 0, 0
+type startContext struct {
+	context.Context
+	done func() <-chan struct{}
+}
+
+func (c startContext) Done() <-chan struct{} { return c.done() }
+
+func TestBackgroundLoopLifecycle(t *testing.T) {
+	t.Run("ConcurrentStartClose", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "strata.db")
+		for range 16 {
+			db, err := Open(path, Options{})
+			requireOK(t, err)
+			ctx := t.Context()
+			db.Start(ctx)
+			done := backgroundLoopDone(db)
+			db.Start(ctx)
+			if done == nil || backgroundLoopDone(db) != done {
+				t.Fatal("repeated Start did not retain the same loop")
+			}
+			requireOK(t, runConcurrentWorkers(8, func(id int) error {
+				if id < 2 {
+					return db.Close()
+				}
+				for range 16 {
+					db.Start(t.Context())
+					runtime.Gosched()
+				}
+				return nil
+			}))
+			select {
+			case <-done:
+			default:
+				t.Fatal("Close returned before the loop stopped")
+			}
+			db.Start(t.Context())
+			assertNoBackgroundLoop(t, db)
+		}
+	})
+	t.Run("Inactive", func(t *testing.T) {
+		now := time.Now()
+		closed, _ := testDB(t, &now, Options{})
+		requireOK(t, closed.Close())
+		reader, err := Open(closed.path, Options{ReadOnly: true})
+		requireOK(t, err)
+		defer reader.Close()
+		ctx := t.Context()
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		for _, tc := range []struct {
+			db  *DB
+			ctx context.Context
+		}{
+			{reader, ctx}, {closed, ctx},
+			{&DB{writer: true, opts: Options{FlushInterval: time.Hour}}, canceled},
+			{&DB{writer: true}, ctx},
+		} {
+			tc.db.Start(tc.ctx)
+			assertNoBackgroundLoop(t, tc.db)
+		}
+	})
+	t.Run("CompactWriteFuse", func(t *testing.T) {
+		now := time.Now()
+		db, _ := testDB(t, &now, Options{FlushInterval: time.Hour, SyncInterval: time.Hour})
+		defer db.Close()
+		db.optional = []optionalSection{{desc: sectionDesc{kind: 7}, data: []byte{1}, slot: 7}}
+		db.Start(t.Context())
+		done := backgroundLoopDone(db)
+		if err := db.Compact(); !errors.Is(err, ErrIncompatFormat) {
+			t.Fatalf("Compact reload error=%v", err)
+		}
+		if err := db.Flush(); err != ErrReadOnly {
+			t.Fatalf("Flush after write fuse=%v", err)
+		}
+		awaitSignal(t, done, "write fuse did not stop the loop")
+		db.Start(t.Context())
+		assertNoBackgroundLoop(t, db)
+	})
+	t.Run("ContextDoneReentry", func(t *testing.T) {
+		now := time.Now()
+		db, _ := testDB(t, &now, Options{})
+		defer db.Close()
+		var done <-chan struct{}
+		db.Start(startContext{Context: context.Background(), done: func() <-chan struct{} {
+			if !db.loopMu.TryLock() {
+				t.Fatal("Context.Done ran under loopMu")
+			}
+			db.loopMu.Unlock()
+			if !db.mu.TryLock() {
+				t.Fatal("Context.Done ran under mu")
+			}
+			db.mu.Unlock()
+			var nilCtx context.Context
+			db.Start(nilCtx)
+			done = backgroundLoopDone(db)
+			return nil
+		}})
+		if done == nil || backgroundLoopDone(db) != done {
+			t.Fatal("reentrant Start did not retain one loop")
+		}
+	})
+}
+
+func TestBackgroundLoopHandoff(t *testing.T) {
+	verify := func(t *testing.T, db *DB, s *Series, now time.Time, done, ctxDone <-chan struct{}) {
+		t.Helper()
+		awaitCondition(t, "background context did not change on the same loop", func() bool {
+			db.loopMu.Lock()
+			defer db.loopMu.Unlock()
+			return done != nil && db.loopDone == done && !db.loopHasNext && db.loopCtxDone == ctxDone
+		})
+		db.mu.RLock()
+		before := db.walPos
+		db.mu.RUnlock()
+		requireOK(t, s.Append(now, Summary{Values: testValues(1)}))
+		awaitCondition(t, "restarted loop did not flush", func() bool {
+			db.mu.RLock()
+			defer db.mu.RUnlock()
+			return db.walPos > before && len(db.pending) == 0
+		})
 	}
+	t.Run("ReplaceCanceledHandoff", func(t *testing.T) {
+		ctx1, cancel1 := context.WithCancel(t.Context())
+		defer cancel1()
+		ctx2, cancel2 := context.WithCancel(t.Context())
+		defer cancel2()
+		db, s, now, release := startBlockedAutoCompact(t, ctx1)
+		done := backgroundLoopDone(db)
+		started := make(chan struct{})
+		go func() {
+			cancel1()
+			db.Start(ctx2)
+			cancel2()
+			db.Start(context.Background())
+			close(started)
+		}()
+		awaitSignal(t, started, "Start waited for the canceled loop")
+		release()
+		verify(t, db, s, now, done, nil)
+	})
+	t.Run("NowCallback", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		now := time.Now()
+		db, s := testDB(t, &now, Options{FlushInterval: backgroundTestInterval})
+		defer func() {
+			closed := make(chan error, 1)
+			go func() { closed <- db.Close() }()
+			awaitResult(t, closed, "Close blocked after Now callback")
+			assertNoBackgroundLoop(t, db)
+		}()
+		returned := make(chan struct{})
+		db.opts.Now = func() time.Time {
+			select {
+			case <-returned:
+			default:
+				cancel()
+				db.Start(t.Context())
+				close(returned)
+			}
+			return now
+		}
+		db.Start(ctx)
+		done := backgroundLoopDone(db)
+		awaitSignal(t, returned, "Start blocked inside Now")
+		verify(t, db, s, now, done, t.Context().Done())
+	})
+	t.Run("BothClosesWait", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		db, _, _, release := startBlockedAutoCompact(t, ctx)
+		done := backgroundLoopDone(db)
+		started := make(chan struct{})
+		go func() { cancel(); db.Start(context.Background()); close(started) }()
+		awaitSignal(t, started, "Start blocked while registering handoff")
+		db.loopMu.Lock()
+		stop := db.loopStop
+		db.loopMu.Unlock()
+		results := make(chan error, 2)
+		closeDB := func() {
+			err := db.Close()
+			if err == nil {
+				select {
+				case <-done:
+				default:
+					err = errors.New("Close returned before the loop stopped")
+				}
+			}
+			results <- err
+		}
+		go closeDB()
+		go closeDB()
+		awaitSignal(t, stop, "Close did not signal the loop")
+		// The stop signal is shared. Observe both callers waiting inside Close.
+		stack := make([]byte, 16<<10)
+		awaitCondition(t, "both Close calls did not wait for compaction", func() bool {
+			select {
+			case err := <-results:
+				t.Fatalf("Close returned during blocked compaction: %v", err)
+			default:
+			}
+			n := runtime.Stack(stack, true)
+			if n == len(stack) {
+				stack = make([]byte, 2*len(stack))
+				return false
+			}
+			waiting := 0
+			for goroutine := range strings.SplitSeq(string(stack[:n]), "\n\n") {
+				if strings.Contains(goroutine, "[chan receive]") && strings.Contains(goroutine, ".(*DB).Close(") &&
+					strings.Contains(goroutine, ".TestBackgroundLoopHandoff.") {
+					waiting++
+				}
+			}
+			return waiting == 2
+		})
+		release()
+		for range 2 {
+			awaitResult(t, results, "Close blocked after compaction")
+		}
+		assertNoBackgroundLoop(t, db)
+	})
+}
+
+func startBlockedAutoCompact(t *testing.T, ctx context.Context) (*DB, *Series, time.Time, func()) {
+	t.Helper()
+	now := time.Now()
+	db, s := testDB(t, &now, Options{FlushInterval: backgroundTestInterval, WALCompactBytes: 1})
+	entered, unblock := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(unblock) })
+	t.Cleanup(func() {
+		release()
+		closed := make(chan error, 1)
+		go func() { closed <- db.Close() }()
+		awaitResult(t, closed, "Close blocked after compaction")
+	})
+	db.compactHook = sync.OnceFunc(func() { close(entered); <-unblock })
+	appendValue(t, s, now.Add(-time.Hour), 1)
+	db.Start(ctx)
+	awaitSignal(t, entered, "automatic compact did not reach its hook")
+	return db, s, now, release
+}
+
+func dictCacheStats(db *DB) (used, capacity int) {
 	db.mu.RLock()
-	c := db.dict.pageCache
+	cache := db.dict.pageCache
 	db.mu.RUnlock()
-	if c == nil {
+	if cache == nil {
 		return 0, 0
 	}
-	c.mu.Lock()
-	used, maxBytes = c.usedBytes, c.maxBytes
-	c.mu.Unlock()
-	return used, maxBytes
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	return cache.usedBytes, cache.maxBytes
 }
 
 func TestCompactSealedSeqLessThanFenceAndCrash(t *testing.T) {
 	now := time.Date(2026, 2, 10, 12, 34, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "strata.db")
-	db, err := Open(path, Options{Now: func() time.Time { return now }})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := db.Series(1, SeriesConfig{Arity: 1, SummaryOps: [4]MetricOp{OpSum, OpMin, OpMax, OpLast}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	db, s := testDB(t, &now, Options{})
+	defer db.Close()
 	old := now.Add(-2 * time.Hour)
-	hot := now.Add(-time.Minute)
-	if err := s.AppendSync(old, Summary{Values: [4]int64{10, 10, 10, 10}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Append(hot, Summary{Values: [4]int64{20, 20, 20, 20}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Flush(); err != nil {
-		t.Fatal(err)
-	}
+	appendValue(t, s, old, 10)
+	appendValue(t, s, now.Add(-time.Minute), 20)
 	fence := db.appendSeq
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		_ = s.AppendSync(now.Add(-30*time.Second), Summary{Values: [4]int64{30, 30, 30, 30}})
-	})
-	if err := db.Compact(); err != nil {
-		t.Fatal(err)
+	var tailErr error
+	db.compactHook = func() {
+		tailErr = s.AppendSync(now.Add(-30*time.Second), Summary{Values: testValues(30)}, testRow(30, "a", "b"))
 	}
-	wg.Wait()
+	requireOK(t, db.Compact())
+	db.compactHook = nil
+	requireOK(t, tailErr)
 	if db.head.sealedWalSeq >= fence {
-		t.Fatalf("expected unfinished fence, sealed=%d fence=%d", db.head.sealedWalSeq, fence)
+		t.Fatalf("sealed sequence=%d should precede fence=%d", db.head.sealedWalSeq, fence)
 	}
-	ctx := context.Background()
-	for range 3 {
-		if err := db.Compact(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	res, err := s.Aggregate(ctx, AggregateQuery{From: old, To: now})
-	if err != nil || res.Summary.Values[0] != 60 {
-		t.Fatalf("repeated compaction changed aggregate: err=%v result=%+v", err, res)
-	}
-	res.Release()
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	_ = os.Remove(path + ".lock")
+	// Recover directly from the compacted file and its WAL, before graceful Close.
+	raw, err := os.ReadFile(db.path)
+	requireOK(t, err)
+	path := filepath.Join(t.TempDir(), "crash.db")
+	requireOK(t, os.WriteFile(path, raw, 0o600))
+	recovered, err := Open(path, db.opts)
+	requireOK(t, err)
+	defer recovered.Close()
+	rs := mustSeries(t, recovered, s.id, s.cfg)
+	assertTSSum(t, rs, old, now, 60)
+	requireOK(t, recovered.Compact())
+	assertTSSum(t, rs, old, now, 60)
 }
 
 func TestReaderRefreshAcrossRename(t *testing.T) {
-	for _, useMmap := range []bool{false, true} {
-		t.Run(map[bool]string{false: "readat", true: "mmap"}[useMmap], func(t *testing.T) {
-			now := time.Now().UTC().Truncate(time.Minute)
-			path := filepath.Join(t.TempDir(), "strata.db")
-			writer, err := Open(path, Options{Now: func() time.Time { return now }})
-			if err != nil {
-				t.Fatal(err)
+	for _, mmap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mmap=%t", mmap), func(t *testing.T) {
+			now := time.Now().Truncate(time.Minute)
+			writer, s := testDB(t, &now, Options{})
+			defer writer.Close()
+			reader, err := Open(writer.path, Options{ReadOnly: true, UseMmap: mmap})
+			requireOK(t, err)
+			defer reader.Close()
+			old, data := now.Add(-2*time.Hour), reader.data
+			appendValue(t, s, old, 1)
+			requireOK(t, reader.Refresh())
+			if reader.data != data {
+				t.Fatal("incremental Refresh reopened the same generation")
 			}
-			series, _ := writer.Series(3, SeriesConfig{Arity: 1})
-			reader, err := Open(path, Options{ReadOnly: true, UseMmap: useMmap})
-			if err != nil {
-				t.Fatal(err)
+			rs := mustSeries(t, reader, s.id, s.cfg)
+			requireOK(t, writer.Compact())
+			requireOK(t, reader.Refresh())
+			if reader.data == data || reader.head.gen != writer.head.gen {
+				t.Fatal("Refresh did not replace the previous file view")
 			}
-			if err := series.AppendSync(now.Add(-2*time.Hour), Summary{Values: [4]int64{1, 1, 1, 1}}); err != nil {
-				t.Fatal(err)
-			}
-			readerData := reader.data
-			if err := reader.Refresh(); err != nil {
-				t.Fatal(err)
-			}
-			if reader.data != readerData {
-				t.Fatal("incremental refresh reopened unchanged generation")
-			}
-			if err := writer.Compact(); err != nil {
-				t.Fatal(err)
-			}
-			if err := reader.Refresh(); err != nil {
-				t.Fatal(err)
-			}
-			rs, _ := reader.Series(3, SeriesConfig{Arity: 1})
-			ctx := context.Background()
-			res, err := rs.Aggregate(ctx, AggregateQuery{From: now.Add(-3 * time.Hour), To: now})
-			if err != nil || len(res.Segments) == 0 {
-				t.Fatalf("refresh result err=%v res=%+v", err, res)
-			}
-			res.Release()
-			if err := series.AppendSync(now.Add(-time.Minute), Summary{Values: [4]int64{2, 2, 2, 2}}); err != nil {
-				t.Fatal(err)
-			}
-			if err := reader.Refresh(); err != nil {
-				t.Fatal(err)
-			}
-			res, err = rs.Aggregate(ctx, AggregateQuery{From: now.Add(-3 * time.Hour), To: now})
-			if err != nil || res.Summary.Values[0] < 3 {
-				t.Fatalf("tail refresh err=%v result=%+v", err, res)
-			}
-			res.Release()
-			_ = reader.Close()
-			_ = writer.Close()
+			assertTSSum(t, rs, old, now, 1)
+			appendValue(t, s, now.Add(-time.Minute), 2)
+			requireOK(t, reader.Refresh())
+			assertTSSum(t, rs, old, now, 3)
 		})
 	}
 }
 
 func TestCompactFailureKeepsOldBlocksReadable(t *testing.T) {
-	ctx := context.Background()
-	now := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
-	dbPath := filepath.Join(t.TempDir(), "fail.db")
-	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
-
-	db, err := Open(dbPath, Options{Now: func() time.Time { return now }, MemoryProfile: MemoryBalanced})
-	if err != nil {
-		t.Fatal(err)
+	now := time.Now().Truncate(time.Minute)
+	db, s := testDB(t, &now, Options{})
+	defer func() { _ = db.Close() }()
+	seed := func(ts time.Time, n, offset int) {
+		t.Helper()
+		seedHighCardMinute(t, s, ts, n, func(i int) []string {
+			return []string{fmt.Sprintf("g-%02d", i%10), fmt.Sprintf("k-%04d", offset+i)}
+		})
 	}
-	defer db.Close()
-
-	s, _ := db.Series(1, SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops})
-	appendBatch := func(ts time.Time, startID, count int) {
-		rows := make([]Row, count)
-		var sum Summary
-		for i := range count {
-			v := [4]int64{int64(startID + i + 1), int64(10 + i), int64(100 + i), int64(1000 + startID + i)}
-			rows[i] = Row{Tags: []string{fmt.Sprintf("g-%02d", i%10), fmt.Sprintf("k-%04d", startID+i)}, Values: v, Mask: 0x0f}
-			mergeSummary(&sum, Summary{Values: v, Mask: 0x0f}, ops, uint64(i+1), uint64(i))
+	seed(now.Add(-5*time.Minute), 300, 0)
+	requireOK(t, db.Compact())
+	seed(now.Add(-time.Minute), 260, 300)
+	requireOK(t, db.Sync())
+	check := func() {
+		t.Helper()
+		agg, err := s.Aggregate(t.Context(), AggregateQuery{AllTime: true, GroupDims: []int{0}})
+		requireOK(t, err)
+		defer agg.Release()
+		if agg.Summary.Values[0] != 560 || len(agg.Groups) != 1 || len(agg.Groups[0]) != 10 {
+			t.Fatalf("old blocks changed after Compact: %+v", agg)
 		}
-		if err := s.Append(ts, sum, rows...); err != nil {
-			t.Fatal(err)
-		}
-	}
-	appendBatch(now.Add(-5*time.Minute), 0, 300)
-	if err := db.Compact(); err != nil {
-		t.Fatal(err)
-	}
-	appendBatch(now.Add(-2*time.Minute), 300, 260)
-	if err := db.Sync(); err != nil {
-		t.Fatal(err)
-	}
-
-	type snap struct {
-		summary Summary
-		scanCnt int
-		scanV0  int64
-		groups  []GroupRow
-	}
-	capture := func(ser *Series) snap {
-		var out snap
-		sumAgg, err := ser.Aggregate(ctx, AggregateQuery{AllTime: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		out.summary = sumAgg.Summary
-		sumAgg.Release()
-		if err := ser.Scan(ctx, ScanQuery{AllTime: true, BatchSize: 128}, func(b ScanBatch) error {
-			for i := range b.Len() {
-				out.scanCnt++
-				out.scanV0 += b.Values(i)[0]
+		for _, group := range agg.Groups[0] {
+			if group.Summary.Values[0] != 56 {
+				t.Fatalf("group changed after Compact: %+v", group)
 			}
-			return nil
-		}); err != nil {
-			t.Fatal(err)
 		}
-		grpAgg, err := ser.Aggregate(ctx, AggregateQuery{AllTime: true, GroupDims: []int{0}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		out.groups = slices.Clone(grpAgg.Groups[0])
-		grpAgg.Release()
-		return out
-	}
-	assertSame := func(label string, got, want snap) {
-		if got.summary != want.summary || got.scanCnt != want.scanCnt || got.scanV0 != want.scanV0 || !slices.Equal(got.groups, want.groups) {
-			t.Fatalf("%s diverged: got=(%+v,%d,%d) want=(%+v,%d,%d)", label, got.summary, got.scanCnt, got.scanV0, want.summary, want.scanCnt, want.scanV0)
+		n, sum, err := scanCountSumErr(t.Context(), s, ScanQuery{AllTime: true})
+		if err != nil || n != 560 || sum != 560 {
+			t.Fatalf("Scan after Compact: rows=%d sum=%d err=%v", n, sum, err)
 		}
 	}
-
-	want := capture(s)
-
-	// Cross-platform failure: non-empty directory at db.path+".tmp" blocks Compact temp creation.
-	tmpDir := dbPath + ".tmp"
-	if err := os.Mkdir(tmpDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "blocker"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	tmp := db.path + ".tmp"
+	requireOK(t, os.Mkdir(tmp, 0o755))
+	requireOK(t, os.WriteFile(filepath.Join(tmp, "blocker"), []byte("x"), 0o600))
 	if err := db.Compact(); err == nil {
-		t.Fatal("expected Compact failure when .tmp is a non-empty directory")
+		t.Fatal("Compact wrote through a blocked temporary path")
 	}
-	assertSame("after-tmp-open-failure", capture(s), want)
-	_ = os.RemoveAll(tmpDir)
-
-	// Mid-Compact renameAtomic failure on Unix.
+	check()
+	requireOK(t, os.RemoveAll(tmp))
 	if runtime.GOOS != "windows" {
-		db.compactHook = func() { _ = os.Remove(dbPath + ".tmp") }
+		db.compactHook = func() { _ = os.Remove(tmp) }
 		err := db.Compact()
 		db.compactHook = nil
 		if err == nil {
-			t.Fatal("expected Compact failure when .tmp removed before renameAtomic")
+			t.Fatal("Compact renamed a missing temporary file")
 		}
-		assertSame("after-rename-failure", capture(s), want)
+		check()
 	}
-
-	// Recovery Compact succeeds and persists cleanly.
-	if err := db.Compact(); err != nil {
-		t.Fatalf("recovery Compact failed: %v", err)
-	}
-	assertSame("after-recovery", capture(s), want)
+	requireOK(t, db.Compact())
+	check()
+	db = reopenTestDB(t, db, db.path, db.opts)
+	s = mustSeries(t, db, s.id, s.cfg)
+	check()
 }
 
 func TestConcurrentReadCompactReclaimRace(t *testing.T) {
-	ctx := context.Background()
-	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
-	baseNow := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
-
 	for _, profile := range []MemoryProfile{MemoryConstrained, MemoryBalanced} {
 		for _, mmap := range []bool{false, true} {
 			t.Run(fmt.Sprintf("profile=%d-mmap=%t", profile, mmap), func(t *testing.T) {
-				var clockSec atomic.Int64
-				clockSec.Store(baseNow.Unix())
-				db, err := Open(filepath.Join(t.TempDir(), "race.db"), Options{
-					Now:           func() time.Time { return time.Unix(clockSec.Load(), 0).UTC() },
-					MemoryProfile: profile,
-					UseMmap:       mmap,
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
+				now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+				db, s := testDB(t, &now, Options{UseMmap: mmap, MemoryProfile: profile})
+				defer db.Close()
 				client := NewClient(db, ClientOptions{})
-				s, _ := db.Series(1, SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops})
-
-				for slot := range 3 {
-					ts := baseNow.Add(time.Duration(slot-5) * time.Minute)
-					rows := make([]Row, 80)
-					for i := range rows {
-						rows[i] = Row{
-							Tags:   []string{fmt.Sprintf("dom-%02d", i%20), fmt.Sprintf("ip-%04d", slot*80+i)},
-							Values: [4]int64{int64(i + 1), 1, int64(i + 10), int64(slot*1000 + i)},
-							Mask:   0x0f,
-						}
-					}
-					if err := s.Append(ts, Summary{Values: [4]int64{80, 1, 90, 1000}, Mask: 0x0f}, rows...); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := db.Compact(); err != nil {
-					t.Fatal(err)
-				}
-
-				deadline := time.Now().Add(40 * time.Millisecond)
-				var stop atomic.Bool
-				errSink := newTestErrSink(32)
-
-				var wg sync.WaitGroup
-				wg.Go(func() {
-					step := 0
-					for time.Now().Before(deadline) {
-						step++
-						ts := time.Unix(clockSec.Add(60), 0).UTC()
-						rows := make([]Row, 30)
-						for i := range rows {
-							rows[i] = Row{
-								Tags:   []string{fmt.Sprintf("dom-%02d", (step+i)%20), fmt.Sprintf("ip-%05d", step*30+i)},
-								Values: [4]int64{int64(i + 1), 1, int64(i + 5), int64(step*100 + i)},
-								Mask:   0x0f,
-							}
-						}
-						if err := s.Append(ts, Summary{Values: [4]int64{30, 1, 35, int64(step * 100)}, Mask: 0x0f}, rows...); err != nil {
-							errSink.record(err)
-							return
-						}
-						if step%3 == 0 {
-							if err := db.Compact(); err != nil {
-								errSink.record(err)
-								return
-							}
-						}
-					}
-					stop.Store(true)
+				defer client.Close()
+				seedHighCardMinute(t, s, now.Add(-5*time.Minute), 300, func(i int) []string {
+					return []string{"dom", fmt.Sprintf("ip-%d", i)}
 				})
-
-				for id := range 3 {
-					wg.Go(func() {
-						iter := 0
-						for !stop.Load() {
-							iter++
-							var qErr error
-							switch (iter + id) % 4 {
-							case 0:
-								qErr = readCheckErr(ctx, s, ReadRequest{AllTime: true, Limit: 50}, nil)
-							case 1:
-								qErr = s.Scan(ctx, ScanQuery{AllTime: true, BatchSize: 64, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"dom-03"}}}}, func(ScanBatch) error { return nil })
-							case 2:
-								_, qErr = aggSumErr(ctx, s, AggregateQuery{AllTime: true, GroupDims: []int{0}})
-							case 3:
-								_, qErr = aggSumErr(ctx, s, AggregateQuery{AllTime: true, GroupDims: []int{1}, TopK: 15})
+				appendValue(t, s, now.Add(-4*time.Minute), 1)
+				requireOK(t, db.Compact())
+				ctx := t.Context()
+				cacheErrors := newTestErrSink(12)
+				requireOK(t, runConcurrentWorkers(3, func(id int) error {
+					for i := range 12 {
+						switch id {
+						case 0:
+							if err := s.Append(now.Add(time.Duration(i)*time.Minute), Summary{Values: testValues(1)}, testRow(1, "dom", "live")); err != nil {
+								return err
 							}
-							if qErr != nil {
-								errSink.record(qErr)
-								return
+							if i%3 == 0 {
+								if err := db.Compact(); err != nil {
+									return err
+								}
 							}
-							if used, maxB := dictCacheStats(db); maxB > 0 && used > maxB {
-								errSink.record(fmt.Errorf("dictPageCache overflow: used=%d max=%d", used, maxB))
-								return
+						case 1:
+							if err := readCheckErr(ctx, s, ReadRequest{AllTime: true, Limit: 50}, nil); err != nil {
+								return err
 							}
+							if _, _, err := scanCountSumErr(ctx, s, ScanQuery{AllTime: true, Filters: tagFilter(0, TagEq, "dom")}); err != nil {
+								return err
+							}
+							if _, err := aggSumErr(ctx, s, AggregateQuery{AllTime: true, GroupDims: []int{1}, TopK: 15}); err != nil {
+								return err
+							}
+							if used, budget := dictCacheStats(db); budget > 0 && used > budget {
+								cacheErrors.record(fmt.Errorf("dictionary cache used=%d budget=%d", used, budget))
+							}
+						case 2:
+							client.Reclaim()
+							runtime.Gosched()
 						}
-					})
-				}
-
-				wg.Go(func() {
-					for !stop.Load() {
-						client.Reclaim()
-						time.Sleep(10 * time.Millisecond)
 					}
-				})
-
-				wg.Wait()
-				errSink.check(t)
+					return nil
+				}))
+				cacheErrors.check(t)
 				client.Reclaim()
 				if used, _ := dictCacheStats(db); used != 0 {
-					t.Fatalf("dictPageCache used=%d after Reclaim, want 0", used)
+					t.Fatalf("Reclaim left %d cache bytes", used)
 				}
-				_ = client.Close()
-				_ = db.Close()
 			})
 		}
 	}
 }
 
 func TestInferredSeriesConfigRefreshRace(t *testing.T) {
-	ctx := context.Background()
-	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
-	dbPath := filepath.Join(t.TempDir(), "inferred-refresh.db")
-	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
-	cfg := SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops}
-
-	wdb, err := Open(dbPath, Options{Now: func() time.Time { return now }})
-	if err != nil {
-		t.Fatal(err)
+	now := time.Now().Truncate(time.Minute)
+	writer, s := testDB(t, &now, Options{})
+	defer writer.Close()
+	appendValue(t, s, now.Add(-5*time.Minute), 10)
+	client, err := OpenClient(writer.path, ClientOptions{DB: Options{ReadOnly: true}})
+	requireOK(t, err)
+	defer client.Close()
+	ctx := t.Context()
+	req := ReadRequest{AllTime: true, Limit: 10}
+	requireOK(t, client.WithPage(ctx, s.id, req, nil))
+	if cached := client.DB().series[s.id]; cached == nil || !cached.configInferred {
+		t.Fatal("reader must start with an inferred config")
 	}
-	defer wdb.Close()
-	ws, _ := wdb.Series(1, cfg)
-	if err := ws.Append(now.Add(-5*time.Minute), Summary{Values: [4]int64{10, 2, 8, 5}, Mask: 0x0f},
-		Row{Tags: []string{"g-1", "k-1"}, Values: [4]int64{10, 2, 8, 5}, Mask: 0x0f},
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := wdb.Sync(); err != nil {
-		t.Fatal(err)
-	}
-
-	roClient, err := OpenClient(dbPath, ClientOptions{DB: Options{ReadOnly: true, Now: func() time.Time { return now }}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer roClient.Close()
-	p, err := roClient.Read(ctx, 1, ReadRequest{AllTime: true, Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p.Release()
-	roDB := roClient.DB()
-	roDB.mu.RLock()
-	inferredBefore := roDB.series[1] != nil && roDB.series[1].configInferred
-	roDB.mu.RUnlock()
-	if !inferredBefore {
-		t.Fatal("expected read-only client to cache configInferred=true series before Compact")
-	}
-
-	if err := wdb.Compact(); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := runConcurrentWorkers(4, func(id int) error {
-		if id == 3 {
-			for range 20 {
-				if err := roClient.Refresh(); err != nil {
-					return err
+	requireOK(t, writer.Compact())
+	id, cfg := s.id, s.cfg
+	requireOK(t, runConcurrentWorkers(4, func(worker int) error {
+		for range 16 {
+			var err error
+			switch worker {
+			case 0:
+				err = client.Refresh()
+			case 1:
+				if _, err = client.Series(id, cfg); err == nil {
+					err = client.WithPage(ctx, id, req, nil)
 				}
+			case 2:
+				err = client.WithAggregate(ctx, id, AggregateQuery{AllTime: true, GroupDims: []int{0}}, nil)
+				if err == nil {
+					err = client.WithAggregate(ctx, id, AggregateQuery{AllTime: true}, nil)
+				}
+			case 3:
+				err = client.Scan(ctx, id, ScanQuery{AllTime: true}, func(ScanBatch) error { return nil })
 			}
-			return nil
-		}
-		for range 20 {
-			if id == 0 {
-				if _, err := roClient.Series(1, cfg); err != nil {
-					return err
-				}
-			}
-			for _, fn := range []func() error{
-				func() error { return roClient.WithPage(ctx, 1, ReadRequest{AllTime: true, Limit: 10}, nil) },
-				func() error {
-					return roClient.Scan(ctx, 1, ScanQuery{AllTime: true}, func(ScanBatch) error { return nil })
-				},
-				func() error {
-					return roClient.WithAggregate(ctx, 1, AggregateQuery{AllTime: true, GroupDims: []int{0}}, nil)
-				},
-				func() error { return roClient.WithAggregate(ctx, 1, AggregateQuery{AllTime: true}, nil) },
-			} {
-				if err := fn(); err != nil {
-					return err
-				}
+			if err != nil {
+				return err
 			}
 		}
 		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	}))
 }
 
 func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
-	ctx := context.Background()
-	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
-	baseNow := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
-
-	for _, useMmap := range []bool{false, true} {
-		t.Run(map[bool]string{false: "readat", true: "mmap"}[useMmap], func(t *testing.T) {
-			var clockSec atomic.Int64
-			clockSec.Store(baseNow.Unix())
-
-			db, err := Open(filepath.Join(t.TempDir(), "filter-lockfree.db"), Options{
-				Now:     func() time.Time { return time.Unix(clockSec.Load(), 0).UTC() },
-				UseMmap: useMmap,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
+	for _, mmap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mmap=%t", mmap), func(t *testing.T) {
+			now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+			db, _ := testDB(t, &now, Options{UseMmap: mmap})
 			defer db.Close()
-
-			s, err := db.Series(9, SeriesConfig{Arity: 3, SummaryOps: ops, RowOps: ops})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			const extCount = 17000
-			seedTS := baseNow.Add(-2 * time.Hour)
-			seedHighCardMinute(t, s, seedTS, extCount, func(i int) []string {
-				return []string{
-					fmt.Sprintf("svc-%05d.prod.local", i),
-					fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff),
-					fmt.Sprintf("app-%03d", i%150),
-				}
+			s := mustSeries(t, db, 9, defaultSeriesConfig(3))
+			ts := now.Add(-2 * time.Hour)
+			seedHighCardMinute(t, s, ts, 17000, func(i int) []string {
+				return []string{fmt.Sprintf("svc-%05d", i), fmt.Sprintf("10.0.%d.%d", i>>8, i&255), fmt.Sprintf("app-%03d", i%150)}
 			})
-			if err := s.Append(seedTS, Summary{Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f}, Row{
-				Tags:   []string{"anchor-beacon.edge.net", "198.51.100.42", "app-anchor"},
-				Values: [4]int64{7, 7, 7, 7},
-				Mask:   0x0f,
-			}); err != nil {
-				t.Fatal(err)
+			requireOK(t, s.Append(ts, Summary{Values: testValues(7)}, testRow(7, "anchor.edge.net", "198.51.100.42", "app-anchor")))
+			requireOK(t, db.Compact())
+			stats := dictStats(t, s)
+			if stats[0].ExternalBytes == 0 || stats[1].ExternalBytes == 0 || stats[2].ExternalBytes != 0 {
+				t.Fatalf("seed needs external and inline dimensions: %+v", stats)
 			}
-			if err := db.Compact(); err != nil {
-				t.Fatal(err)
-			}
-
-			db.mu.RLock()
-			dictCodec := db.head.sections[secTSDict].codec
-			dim0 := db.dict.dims[dictDimKey{series: 9, dim: 0}]
-			dim1 := db.dict.dims[dictDimKey{series: 9, dim: 1}]
-			dim2 := db.dict.dims[dictDimKey{series: 9, dim: 2}]
-			hasExt0 := dim0 != nil && dim0.ext != nil
-			hasExt1 := dim1 != nil && dim1.ext != nil
-			inline2OK := dim2 != nil && dim2.ext == nil && dim2.count == 151
-			mutID := db.dict.lookup(9, 0, "svc-00000.prod.local")
-			mutInlineID := db.dict.lookup(9, 2, "app-149")
-			db.mu.RUnlock()
-
-			if dictCodec != 1 || !hasExt0 || !hasExt1 || !inline2OK || mutID == 0 || mutInlineID == 0 {
-				t.Fatalf("unexpected dict layout: codec=%d ext0=%t ext1=%t inline2=%t mutID=%d mutInlineID=%d",
-					dictCodec, hasExt0, hasExt1, inline2OK, mutID, mutInlineID)
-			}
-
-			// Trigger lazy sorted index on inline dim 2 before testing extra override against sorted.
-			if got := queryAggSum(t, s, AggregateQuery{
-				AllTime: true,
-				Filters: []Filter{{Dim: 2, Op: TagEq, Values: []string{"app-anchor"}}},
-			}); got != 7 {
-				t.Fatalf("pre-override inline TagEq got=%d want=7", got)
-			}
-
-			// Verify 3-tier override priority (extra > tail > ext / extra > sorted) across lock-free filter ops.
-			db.mu.Lock()
-			db.dict.apply(dictEntry{id: mutID, series: 9, dim: 0, value: "override-init.alt.org"})
-			db.dict.apply(dictEntry{id: mutInlineID, series: 9, dim: 2, value: "app-override"})
-			db.mu.Unlock()
+			assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(2, TagEq, "app-anchor")}, 7)
 			for _, tc := range []struct {
-				name   string
-				filter Filter
-				want   int64
+				dim      uint8
+				old, new string
+				want     int64
 			}{
-				{"ext-overridden-old-eq", Filter{Dim: 0, Op: TagEq, Values: []string{"svc-00000.prod.local"}}, 0},
-				{"ext-override-new-eq", Filter{Dim: 0, Op: TagEq, Values: []string{"override-init.alt.org"}}, 1},
-				{"ext-override-new-prefix", Filter{Dim: 0, Op: TagPrefix, Values: []string{"override-init"}}, 1},
-				{"ext-override-new-suffix", Filter{Dim: 0, Op: TagSuffix, Values: []string{".alt.org"}}, 1},
-				{"ext-override-new-contains", Filter{Dim: 0, Op: TagContains, Values: []string{"override-init"}}, 1},
-				{"inline-overridden-old-eq", Filter{Dim: 2, Op: TagEq, Values: []string{"app-149"}}, 0},
-				{"inline-overridden-old-prefix", Filter{Dim: 2, Op: TagPrefix, Values: []string{"app-149"}}, 0},
-				{"inline-override-new-eq", Filter{Dim: 2, Op: TagEq, Values: []string{"app-override"}}, 113},
-				{"inline-override-new-prefix", Filter{Dim: 2, Op: TagPrefix, Values: []string{"app-over"}}, 113},
-				{"inline-override-new-contains", Filter{Dim: 2, Op: TagContains, Values: []string{"override"}}, 113},
+				{0, "svc-00000", "override-alt", 1}, {2, "app-149", "override-app", 113},
 			} {
-				if got := queryAggSum(t, s, AggregateQuery{AllTime: true, Filters: []Filter{tc.filter}}); got != tc.want {
-					t.Fatalf("%s: got sum=%d want=%d", tc.name, got, tc.want)
+				id := db.dict.lookup(s.id, tc.dim, tc.old)
+				if id == 0 {
+					t.Fatalf("missing override source %q", tc.old)
 				}
+				db.dict.apply(dictEntry{id: id, series: s.id, dim: tc.dim, value: tc.new})
+				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(int(tc.dim), TagEq, tc.old)}, 0)
+				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(int(tc.dim), TagEq, tc.new)}, tc.want)
+				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(int(tc.dim), TagPrefix, tc.old)}, 0)
+				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(int(tc.dim), TagContains, tc.new)}, tc.want)
 			}
 
-			var stopReaders atomic.Bool
-			var filterReads atomic.Int64
-			readersActive := make(chan struct{})
-			var signalActive sync.Once
-			errSink := newTestErrSink(32)
-			recErr := func(err error) {
-				if err != nil {
-					errSink.record(err)
-					signalActive.Do(func() { close(readersActive) })
-				}
-			}
-
-			var readerWG sync.WaitGroup
-			for id := range 4 {
-				readerWG.Go(func() {
-					defer signalActive.Do(func() { close(readersActive) })
-					iter := 0
-					for !stopReaders.Load() {
-						iter++
-						switch (iter + id) % 6 {
+			ctx := t.Context()
+			contains := AggregateQuery{AllTime: true, Filters: tagFilter(0, TagContains, "anchor")}
+			suffix := ReadRequest{AllTime: true, Filters: tagFilter(0, TagSuffix, ".edge.net"), Limit: 10}
+			cidr := ScanQuery{AllTime: true, Filters: tagFilter(1, TagCIDR, "198.51.100.0/24")}
+			prefix := tagFilter(0, TagPrefix, "svc-0010")
+			negatedPrefix := append(slices.Clone(prefix), Filter{Dim: 2, Op: TagEq, Values: []string{"app-anchor"}, Negate: true})
+			entered, unblock := make(chan struct{}), make(chan struct{})
+			release := sync.OnceFunc(func() { close(unblock) })
+			defer release()
+			db.compactHook = func() { close(entered); <-unblock }
+			compacted := make(chan error, 1)
+			go func() { compacted <- db.Compact() }()
+			awaitSignal(t, entered, "Compact did not reach the write boundary")
+			work := make(chan error, 1)
+			go func() {
+				work <- runConcurrentWorkers(3, func(id int) error {
+					for i := range 12 {
+						switch id {
 						case 0:
-							if got, err := aggSumErr(ctx, s, AggregateQuery{
-								AllTime: true,
-								Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"anchor-beacon"}}},
-							}); err != nil {
-								recErr(err)
-								return
-							} else if got != 7 {
-								recErr(fmt.Errorf("TagContains anchor mismatch: got=%d want=7", got))
-								return
+							if err := s.Append(now.Add(time.Duration(i)*time.Minute), Summary{Values: testValues(3)},
+								testRow(3, fmt.Sprintf("tail-%d", i), "10.2.0.1", "app-tail")); err != nil {
+								return err
 							}
 						case 1:
-							if err := readCheckErr(ctx, s, ReadRequest{
-								AllTime: true, Limit: 10,
-								Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".edge.net"}}},
-							}, func(page *PageResult) error {
-								if len(page.Rows) != 1 || page.Rows[0].Tags[0] != "anchor-beacon.edge.net" {
-									return fmt.Errorf("TagSuffix anchor row mismatch")
+							if got, err := aggSumErr(ctx, s, contains); err != nil || got != 7 {
+								return fmt.Errorf("contains: sum=%d err=%v", got, err)
+							}
+							if err := readCheckErr(ctx, s, suffix, func(p *PageResult) error {
+								if len(p.Rows) != 1 || p.Rows[0].Tags[0] != "anchor.edge.net" {
+									return fmt.Errorf("suffix rows: %+v", p.Rows)
 								}
 								return nil
 							}); err != nil {
-								recErr(err)
-								return
+								return err
 							}
 						case 2:
-							if matched, sumV0, err := scanCountSumErr(ctx, s, ScanQuery{
-								AllTime: true, BatchSize: 32,
-								Filters: []Filter{{Dim: 1, Op: TagCIDR, Values: []string{"198.51.100.0/24"}}},
-							}); err != nil {
-								recErr(err)
-								return
-							} else if matched != 1 || sumV0 != 7 {
-								recErr(fmt.Errorf("TagCIDR anchor mismatch: matched=%d sumV0=%d", matched, sumV0))
-								return
+							n, sum, err := scanCountSumErr(ctx, s, cidr)
+							if err != nil || n != 1 || sum != 7 {
+								return fmt.Errorf("CIDR: rows=%d sum=%d err=%v", n, sum, err)
 							}
-						case 3:
-							if got, err := aggSumErr(ctx, s, AggregateQuery{
-								AllTime: true,
-								Filters: []Filter{
-									{Dim: 0, Op: TagPrefix, Values: []string{"svc-0010"}},
-									{Dim: 2, Op: TagEq, Values: []string{"app-anchor"}, Negate: true},
-								},
-							}); err != nil {
-								recErr(err)
-								return
-							} else if got != 10 {
-								recErr(fmt.Errorf("TagPrefix+Negate mismatch: got=%d want=10", got))
-								return
+							if got, err := aggSumErr(ctx, s, AggregateQuery{AllTime: true, Filters: negatedPrefix}); err != nil || got != 10 {
+								return fmt.Errorf("prefix with negation: sum=%d err=%v", got, err)
 							}
-						case 4:
-							if err := readCheckErr(ctx, s, ReadRequest{
-								AllTime: true, Limit: 10,
-								Filters: []Filter{{Dim: 2, Op: TagEq, Values: []string{"app-anchor"}}},
-							}, func(page *PageResult) error {
-								if len(page.Rows) != 1 || page.Rows[0].Values[0] != 7 {
-									return fmt.Errorf("inline TagEq anchor mismatch")
-								}
-								return nil
-							}); err != nil {
-								recErr(err)
-								return
-							}
-						case 5:
-							agg, err := s.Aggregate(ctx, AggregateQuery{
-								AllTime: true, GroupDims: []int{2},
-								Filters: []Filter{{Dim: 2, Op: TagPrefix, Values: []string{"app-00"}}},
-							})
-							if err != nil {
-								recErr(err)
-								return
-							}
-							gotSum, gotGroups := agg.Summary.Values[0], len(agg.Groups[0])
-							agg.Release()
-							if gotSum != 1140 || gotGroups != 10 {
-								recErr(fmt.Errorf("inline TagPrefix group mismatch: sum=%d groups=%d", gotSum, gotGroups))
-								return
-							}
-						}
-						if filterReads.Add(1) >= 2 {
-							signalActive.Do(func() { close(readersActive) })
 						}
 					}
+					return nil
 				})
-			}
+			}()
+			awaitResult(t, work, "filtered queries or Append blocked during Compact")
+			release()
+			awaitResult(t, compacted, "Compact did not finish")
+			db.compactHook = nil
+			assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(0, TagPrefix, "tail-")}, 36)
 
-			<-readersActive
-			readsBeforePhase1 := filterReads.Load()
-
-			// Phase 1: sustained Appends (tail inserts + inline mergeTailIntoSorted + extra updates)
-			// must make steady progress concurrently with heavy high-cardinality filter scans.
-			const phase1Appends = 80
-			var maxAppend time.Duration
-			for step := range phase1Appends {
-				ts := time.Unix(clockSec.Add(60), 0).UTC()
-				row := Row{
-					Tags: []string{
-						fmt.Sprintf("tail-p1-%03d.dyn.local", step),
-						fmt.Sprintf("10.2.0.%d", step%250),
-						fmt.Sprintf("app-dyn-%03d", step),
-					},
-					Values: [4]int64{3, 3, 3, 3},
-					Mask:   0x0f,
-				}
-				start := time.Now()
-				err := s.Append(ts, Summary{Values: [4]int64{3, 3, 3, 3}, Mask: 0x0f}, row)
-				elapsed := time.Since(start)
-				if err != nil {
-					recErr(err)
-					break
-				}
-				if elapsed > maxAppend {
-					maxAppend = elapsed
-				}
-				if step%10 == 0 {
-					db.mu.Lock()
-					db.dict.apply(dictEntry{id: mutID, series: 9, dim: 0, value: fmt.Sprintf("override-step-%03d.alt.org", step)})
-					db.mu.Unlock()
-				}
+			p, err := s.Read(ctx, ReadRequest{AllTime: true, Filters: prefix, Limit: 1})
+			requireOK(t, err)
+			cursor := p.NextCursor
+			p.Release()
+			if cursor.IsZero() {
+				t.Fatal("missing cursor before Close")
 			}
-			if maxAppend > 2*time.Second {
-				recErr(fmt.Errorf("Append blocked too long during concurrent filter scans: max=%v", maxAppend))
-			}
-
-			// Phase 2: 3-way concurrency with FilterQueries + Append + Compact.
-			const phase2Appends = 40
-			var compactWG sync.WaitGroup
-			compactWG.Go(func() {
-				for range 2 {
-					if err := db.Compact(); err != nil {
-						recErr(err)
-						return
-					}
-				}
-			})
-			for step := range phase2Appends {
-				ts := time.Unix(clockSec.Add(60), 0).UTC()
-				row := Row{
-					Tags: []string{
-						fmt.Sprintf("tail-p2-%03d.dyn.local", step),
-						fmt.Sprintf("10.2.1.%d", step%250),
-						fmt.Sprintf("app-dyn-%03d", phase1Appends+step),
-					},
-					Values: [4]int64{3, 3, 3, 3},
-					Mask:   0x0f,
-				}
-				if err := s.Append(ts, Summary{Values: [4]int64{3, 3, 3, 3}, Mask: 0x0f}, row); err != nil {
-					recErr(err)
-					break
-				}
-			}
-			compactWG.Wait()
-			stopReaders.Store(true)
-			readerWG.Wait()
-			errSink.check(t)
-			if filterReads.Load() <= readsBeforePhase1 {
-				t.Fatalf("expected concurrent filter reads during writes/compacts: before=%d after=%d",
-					readsBeforePhase1, filterReads.Load())
-			}
-
-			// Post-stress deterministic accuracy checks across all 5 filter operators.
-			for _, tc := range []struct {
-				name   string
-				filter Filter
-				want   int64
-			}{
-				{"tail-p1-prefix", Filter{Dim: 0, Op: TagPrefix, Values: []string{"tail-p1-"}}, phase1Appends * 3},
-				{"tail-p2-prefix", Filter{Dim: 0, Op: TagPrefix, Values: []string{"tail-p2-"}}, phase2Appends * 3},
-				{"dyn-inline-prefix", Filter{Dim: 2, Op: TagPrefix, Values: []string{"app-dyn-"}}, (phase1Appends + phase2Appends) * 3},
-				{"dyn-cidr", Filter{Dim: 1, Op: TagCIDR, Values: []string{"10.2.0.0/23"}}, (phase1Appends + phase2Appends) * 3},
-				{"anchor-eq", Filter{Dim: 0, Op: TagEq, Values: []string{"anchor-beacon.edge.net"}}, 7},
-			} {
-				if got := queryAggSum(t, s, AggregateQuery{AllTime: true, Filters: []Filter{tc.filter}}); got != tc.want {
-					t.Fatalf("%s: got sum=%d want=%d", tc.name, got, tc.want)
-				}
-			}
-
-			// Concurrent queries + Close() under -race, followed by deterministic closed-DB checks.
-			cursorFilter := []Filter{{Dim: 0, Op: TagPrefix, Values: []string{"svc-0010"}}}
-			cursorPage, err := s.Read(ctx, ReadRequest{AllTime: true, Limit: 1, Filters: cursorFilter})
-			if err != nil || !cursorPage.HasMore || cursorPage.NextCursor.IsZero() {
-				t.Fatalf("failed to obtain cursor before close: err=%v hasMore=%t", err, cursorPage != nil && cursorPage.HasMore)
-			}
-			savedCursor := cursorPage.NextCursor
-			cursorPage.Release()
-
-			var closing atomic.Bool
-			var closeStarted, closedSeen atomic.Int32
-			var stopClose atomic.Bool
-			closeReady := make(chan struct{})
-			var sigClose sync.Once
-			closeErrSink := newTestErrSink(16)
-			recCloseErr := func(err error) {
-				closeErrSink.record(err)
-				stopClose.Store(true)
-				sigClose.Do(func() { close(closeReady) })
-			}
-
-			var closeWG sync.WaitGroup
-			for id := range 3 {
-				closeWG.Go(func() {
-					defer sigClose.Do(func() { close(closeReady) })
-					iter := 0
-					for !stopClose.Load() {
-						iter++
-						var qErr error
-						switch (iter + id) % 4 {
-						case 0:
-							_, qErr = aggSumErr(ctx, s, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"anchor-beacon"}}}})
-						case 1:
-							qErr = readCheckErr(ctx, s, ReadRequest{AllTime: true, Limit: 10, Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".edge.net"}}}}, nil)
-						case 2:
-							qErr = s.Scan(ctx, ScanQuery{AllTime: true, BatchSize: 32, Filters: []Filter{{Dim: 1, Op: TagCIDR, Values: []string{"198.51.100.0/24"}}}}, func(ScanBatch) error { return nil })
-						case 3:
-							_, qErr = aggSumErr(ctx, s, AggregateQuery{AllTime: true})
-						}
-						if qErr != nil {
-							if !closing.Load() {
-								recCloseErr(fmt.Errorf("unexpected error before Close: %w", qErr))
-								return
-							}
-							if closedSeen.Add(1) >= 6 {
-								stopClose.Store(true)
-								return
-							}
-							continue
-						}
-						if closeStarted.Add(1) >= 2 {
-							sigClose.Do(func() { close(closeReady) })
-						}
-					}
+			scanEntered, scanUnblock := make(chan struct{}), make(chan struct{})
+			releaseScan := sync.OnceFunc(func() { close(scanUnblock) })
+			defer releaseScan()
+			firstBatch := sync.OnceFunc(func() { close(scanEntered); <-scanUnblock })
+			scanned := make(chan error, 1)
+			go func() {
+				n := 0
+				err := s.Scan(ctx, ScanQuery{AllTime: true, Filters: prefix, BatchSize: 1}, func(b ScanBatch) error {
+					n += b.Len()
+					firstBatch()
+					return nil
 				})
+				if err == nil && n != 10 {
+					err = fmt.Errorf("in-flight Scan returned %d rows after Close", n)
+				}
+				scanned <- err
+			}()
+			awaitSignal(t, scanEntered, "filtered Scan did not reach first batch")
+			closed := make(chan error, 1)
+			go func() { closed <- db.Close() }()
+			awaitResult(t, closed, "Close waited on an in-flight Scan")
+			releaseScan()
+			awaitResult(t, scanned, "in-flight Scan did not finish")
+			for _, q := range []AggregateQuery{contains, {AllTime: true}} {
+				if _, err := aggSumErr(ctx, s, q); err == nil {
+					t.Fatal("Aggregate succeeded after Close")
+				}
 			}
-
-			<-closeReady
-			closing.Store(true)
-			if err := db.Close(); err != nil {
-				stopClose.Store(true)
-				closeWG.Wait()
-				t.Fatal(err)
+			for _, q := range []ReadRequest{suffix, {Cursor: cursor, Filters: prefix, Limit: 1}} {
+				if err := readCheckErr(ctx, s, q, nil); err == nil {
+					t.Fatal("Read succeeded after Close")
+				}
 			}
-			closeWG.Wait()
-			closeErrSink.check(t)
-
-			if agg, err := s.Aggregate(ctx, AggregateQuery{
-				AllTime: true,
-				Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"anchor-beacon"}}},
-			}); err == nil {
-				agg.Release()
-				t.Fatal("expected error on filtered Aggregate after Close")
-			}
-			if agg, err := s.Aggregate(ctx, AggregateQuery{AllTime: true}); err == nil {
-				agg.Release()
-				t.Fatal("expected error on SummaryOnly Aggregate after Close")
-			}
-			if page, err := s.Read(ctx, ReadRequest{
-				AllTime: true,
-				Limit:   10,
-				Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".edge.net"}}},
-			}); err == nil {
-				page.Release()
-				t.Fatal("expected error on filtered Read after Close")
-			}
-			if page, err := s.Read(ctx, ReadRequest{Cursor: savedCursor, Limit: 1, Filters: cursorFilter}); err == nil {
-				page.Release()
-				t.Fatal("expected error on cursor Read after Close")
-			}
-			if err := s.Scan(ctx, ScanQuery{
-				AllTime: true,
-				Filters: []Filter{{Dim: 1, Op: TagCIDR, Values: []string{"198.51.100.0/24"}}},
-			}, func(ScanBatch) error { return nil }); err == nil {
-				t.Fatal("expected error on filtered Scan after Close")
+			if _, _, err := scanCountSumErr(ctx, s, cidr); err == nil {
+				t.Fatal("Scan succeeded after Close")
 			}
 		})
 	}
 }
 
 func TestResetAllConcurrentQueryAppendCompact(t *testing.T) {
-	ctx := context.Background()
-	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
-	baseNow := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
-
-	var clockSec atomic.Int64
-	clockSec.Store(baseNow.Unix())
-
-	db, err := Open(filepath.Join(t.TempDir(), "reset-all-race.db"), Options{
-		Now:     func() time.Time { return time.Unix(clockSec.Load(), 0).UTC() },
-		UseMmap: true,
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	clock.Store(now.Unix())
+	db, err := Open(filepath.Join(t.TempDir(), "reset-race.db"), Options{
+		UseMmap: true, Now: func() time.Time { return time.Unix(clock.Load(), 0) },
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireOK(t, err)
 	defer db.Close()
-
-	s1, err := db.Series(1, SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s2, err := db.Series(2, SeriesConfig{Arity: 1, SummaryOps: ops, RowOps: ops})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	const extCount = 17000
-	seedTS := baseNow.Add(-2 * time.Hour)
-	seedHighCardMinute(t, s1, seedTS, extCount, func(i int) []string {
-		return []string{fmt.Sprintf("old-%05d.net", i), fmt.Sprintf("g-%02d", i%10)}
+	s := mustSeries(t, db, 1, defaultSeriesConfig(2))
+	other := mustSeries(t, db, 2, defaultSeriesConfig(1))
+	seedHighCardMinute(t, s, now.Add(-2*time.Hour), 17000, func(i int) []string {
+		return []string{fmt.Sprintf("old-%05d.net", i), "old"}
 	})
-	seedHighCardMinute(t, s2, seedTS, 200, func(i int) []string {
-		return []string{fmt.Sprintf("keep-%03d", i)}
-	})
-	if err := db.Compact(); err != nil {
-		t.Fatal(err)
+	requireOK(t, other.Append(now.Add(-2*time.Hour), Summary{Values: testValues(1)}, testRow(1, "keep")))
+	requireOK(t, db.Compact())
+	if dictStats(t, s)[0].ExternalBytes == 0 {
+		t.Fatal("reset race requires an external dictionary")
 	}
-	initStats, err := s1.DictStats()
-	if err != nil || len(initStats) != 2 || initStats[0].ExternalBytes == 0 {
-		t.Fatalf("expected external dict on s1 before concurrent ResetAll: err=%v stats=%+v", err, initStats)
-	}
-
-	var stopReaders atomic.Bool
-	var reads atomic.Int64
-	readersActive := make(chan struct{})
-	var sigActive sync.Once
-	errSink := newTestErrSink(32)
-	recErr := func(err error) {
-		if err != nil {
-			errSink.record(err)
-			sigActive.Do(func() { close(readersActive) })
-		}
-	}
-
-	var readerWG sync.WaitGroup
-	for id := range 3 {
-		readerWG.Go(func() {
-			defer sigActive.Do(func() { close(readersActive) })
-			iter := 0
-			for !stopReaders.Load() {
-				iter++
-				switch (iter + id) % 5 {
-				case 0:
-					if _, err := aggSumErr(ctx, s1, AggregateQuery{
-						AllTime: true,
-						Filters: []Filter{{Dim: 0, Op: TagContains, Values: []string{"old-0010"}}},
-					}); err != nil {
-						recErr(err)
-						return
-					}
-				case 1:
-					if err := readCheckErr(ctx, s1, ReadRequest{
-						AllTime: true, Limit: 10,
-						Filters: []Filter{{Dim: 0, Op: TagSuffix, Values: []string{".net"}}},
-					}, nil); err != nil {
-						recErr(err)
-						return
-					}
-				case 2:
-					if err := s1.Scan(ctx, ScanQuery{
-						AllTime: true, BatchSize: 64,
-						Filters: []Filter{{Dim: 0, Op: TagPrefix, Values: []string{"live-"}}},
-					}, func(ScanBatch) error { return nil }); err != nil {
-						recErr(err)
-						return
-					}
-				case 3:
-					if _, err := s1.DictStats(); err != nil {
-						recErr(err)
-						return
-					}
-				case 4:
-					if got, err := aggSumErr(ctx, s2, AggregateQuery{
-						AllTime: true,
-						Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"keep-042"}}},
-					}); err != nil {
-						recErr(err)
-						return
-					} else if got != 1 {
-						recErr(fmt.Errorf("s2 affected by concurrent s1 ResetAll: got=%d want=1", got))
-						return
+	ctx := t.Context()
+	keep := AggregateQuery{AllTime: true, Filters: tagFilter(0, TagEq, "keep")}
+	requireOK(t, runConcurrentWorkers(5, func(id int) error {
+		for i := range 12 {
+			switch id {
+			case 0:
+				ts := time.Unix(clock.Add(60), 0)
+				if err := s.Append(ts, Summary{Values: testValues(2)}, testRow(2, fmt.Sprintf("live-%d", i), "live")); err != nil {
+					return err
+				}
+			case 1:
+				if i%4 == 0 {
+					if err := s.ResetAll(); err != nil {
+						return err
 					}
 				}
-				if reads.Add(1) >= 2 {
-					sigActive.Do(func() { close(readersActive) })
+			case 2:
+				if i%6 == 0 {
+					if err := db.Compact(); err != nil {
+						return err
+					}
+				}
+			case 3:
+				if _, err := aggSumErr(ctx, s, AggregateQuery{AllTime: true, Filters: tagFilter(0, TagContains, "old-0010")}); err != nil {
+					return err
+				}
+				if err := readCheckErr(ctx, s, ReadRequest{AllTime: true, Limit: 10, Filters: tagFilter(0, TagSuffix, ".net")}, nil); err != nil {
+					return err
+				}
+				if _, _, err := scanCountSumErr(ctx, s, ScanQuery{AllTime: true, Filters: tagFilter(0, TagPrefix, "live-")}); err != nil {
+					return err
+				}
+				if _, err := s.DictStats(); err != nil {
+					return err
+				}
+			case 4:
+				if got, err := aggSumErr(ctx, other, keep); err != nil || got != 1 {
+					return fmt.Errorf("neighbor series during ResetAll: sum=%d err=%v", got, err)
 				}
 			}
-		})
-	}
-
-	<-readersActive
-
-	var mutWG sync.WaitGroup
-	mutWG.Go(func() {
-		for step := range 60 {
-			ts := time.Unix(clockSec.Add(60), 0).UTC()
-			row := Row{
-				Tags:   []string{fmt.Sprintf("live-%03d.net", step), fmt.Sprintf("g-%02d", step%10)},
-				Values: [4]int64{2, 2, 2, 2},
-				Mask:   0x0f,
-			}
-			if err := s1.Append(ts, Summary{Values: [4]int64{2, 2, 2, 2}, Mask: 0x0f}, row); err != nil {
-				recErr(err)
-				return
-			}
-		}
-	})
-	mutWG.Go(func() {
-		for range 3 {
 			runtime.Gosched()
-			if err := s1.ResetAll(); err != nil {
-				recErr(err)
-				return
-			}
-			time.Sleep(2 * time.Millisecond)
 		}
-	})
-	mutWG.Go(func() {
-		for range 2 {
-			if err := db.Compact(); err != nil {
-				recErr(err)
-				return
-			}
-		}
-	})
-
-	mutWG.Wait()
-	stopReaders.Store(true)
-	readerWG.Wait()
-	errSink.check(t)
-
-	// Final deterministic marker + full seal Compact verifies dict reclamation and consistency.
-	finalTS := time.Unix(clockSec.Add(60), 0).UTC()
-	if err := s1.AppendSync(finalTS, Summary{Values: [4]int64{77, 77, 77, 77}, Mask: 0x0f},
-		Row{Tags: []string{"final-marker.net", "final-g"}, Values: [4]int64{77, 77, 77, 77}, Mask: 0x0f},
-	); err != nil {
-		t.Fatal(err)
+		return nil
+	}))
+	requireOK(t, s.AppendSync(time.Unix(clock.Add(60), 0), Summary{Values: testValues(77)}, testRow(77, "marker", "live")))
+	clock.Add(10 * 60)
+	requireOK(t, db.Compact())
+	st := dictStats(t, s)[0]
+	if st.ExternalBytes != 0 || st.MaxID == 0 || st.MaxID > 13 || st.LiveCount != st.MaxID || st.DeadCount != 0 {
+		t.Fatalf("external dictionary survived reset: %+v", st)
 	}
-	clockSec.Add(10 * 60)
-	if err := db.Compact(); err != nil {
-		t.Fatal(err)
-	}
-
-	if got1 := queryAggSum(t, s1, AggregateQuery{
-		AllTime: true,
-		Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"final-marker.net"}}},
-	}); got1 != 77 {
-		t.Fatalf("final marker sum got=%d want=77", got1)
-	}
-
-	finalStats1, err := s1.DictStats()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(finalStats1) != 2 || finalStats1[0].ExternalBytes != 0 || finalStats1[0].ForwardPages != 0 ||
-		finalStats1[0].ReverseBlocks != 0 || finalStats1[0].MaxID == 0 || finalStats1[0].MaxID >= 1000 ||
-		finalStats1[0].LiveCount != finalStats1[0].MaxID || finalStats1[0].DeadCount != 0 {
-		t.Fatalf("unexpected final s1 DictStats after concurrent ResetAll+Compact: %+v", finalStats1)
-	}
-
-	if got2 := queryAggSum(t, s2, AggregateQuery{
-		AllTime: true,
-		Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"keep-042"}}},
-	}); got2 != 1 {
-		t.Fatalf("s2 final sum got=%d want=1", got2)
-	}
-	finalStats2, err := s2.DictStats()
-	if err != nil || len(finalStats2) != 1 || finalStats2[0].MaxID != 200 || finalStats2[0].LiveCount != 200 {
-		t.Fatalf("unexpected final s2 DictStats: err=%v stats=%+v", err, finalStats2)
-	}
+	assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(0, TagEq, "marker")}, 77)
+	assertQuerySum(t, other, keep, 1)
 }
 
 func TestDictGCPhaseBConcurrentResurrectionAndResetAll(t *testing.T) {
-	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
-	ctx := context.Background()
-
-	t.Run("PhaseBResurrectionExternalFoldedPage", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "resurrect_ext.db")
-		clock := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
-		opts := Options{
-			Now:         func() time.Time { return clock },
-			Retention1m: 2 * time.Hour,
-			Retention1h: 4 * time.Hour,
-			Retention1d: 6 * time.Hour,
-		}
-		cfg := SeriesConfig{Arity: 2, SummaryOps: ops, RowOps: ops}
-		db, err := Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if db != nil {
-				_ = db.Close()
-			}
-		}()
-		s := mustSeries(t, db, 1, cfg)
-
-		const persistN = 4
-		const deadN = 17000
-		seedTS := clock.Add(-10 * time.Minute)
-		keepRows := make([]Row, persistN)
-		for i := range persistN {
-			keepRows[i] = Row{
-				Tags:   []string{fmt.Sprintf("2001:db8:keep::%d", i+1), "keep"},
-				Values: [4]int64{10, 10, 10, 10}, Mask: 0x0f,
-			}
-		}
-		if err := s.Append(seedTS, Summary{Values: [4]int64{persistN * 10, 10, 10, 10}, Mask: 0x0f}, keepRows...); err != nil {
-			t.Fatal(err)
-		}
-		seedHighCardMinute(t, s, seedTS, deadN, func(i int) []string {
-			return []string{fmt.Sprintf("2001:db8:old::%05d", i+1), "old"}
-		})
-		if err := db.Compact(); err != nil {
-			t.Fatal(err)
-		}
-		stInit, err := s.DictStats()
-		if err != nil || stInit[0].ExternalBytes == 0 || stInit[0].MaxID != persistN+deadN {
-			t.Fatalf("expected external dim after seed: err=%v stats=%+v", err, stInit)
-		}
-
-		// Expire all 17,000 old tags and keep only 4 persistent tags.
-		clock = clock.Add(12 * time.Hour)
-		if err := s.Append(clock.Add(-10*time.Minute), Summary{Values: [4]int64{persistN * 10, 10, 10, 10}, Mask: 0x0f}, keepRows...); err != nil {
-			t.Fatal(err)
-		}
-
-		// During Phase B (after pruned SecTSDict with folded pages is written), concurrently
-		// write dead tags that hit the old in-memory dict (newID=false, no dictEntry emitted).
-		var hookErr error
-		db.compactHook = func() {
-			if err := s.AppendSync(clock.Add(-30*time.Second), Summary{Values: [4]int64{66, 11, 33, 33}, Mask: 0x0f},
-				Row{Tags: []string{"2001:db8:old::00042", "res"}, Values: [4]int64{11, 11, 11, 11}, Mask: 0x0f},
-				Row{Tags: []string{"2001:db8:old::05000", "res"}, Values: [4]int64{22, 22, 22, 22}, Mask: 0x0f},
-				Row{Tags: []string{"2001:db8:brandnew::1", "new"}, Values: [4]int64{33, 33, 33, 33}, Mask: 0x0f},
-			); err != nil {
-				hookErr = err
-				return
-			}
-			// Second delta frame reusing the same resurrected ID tests dedup across frames.
-			if err := s.AppendSync(clock.Add(-20*time.Second), Summary{Values: [4]int64{14, 14, 14, 14}, Mask: 0x0f},
-				Row{Tags: []string{"2001:db8:old::00042", "res"}, Values: [4]int64{14, 14, 14, 14}, Mask: 0x0f},
-			); err != nil {
-				hookErr = err
-			}
-		}
-		err = db.Compact()
+	opts := Options{Retention1m: 2 * time.Hour, Retention1h: 4 * time.Hour, Retention1d: 6 * time.Hour}
+	compactWithWrites := func(t *testing.T, db *DB, writes func() error) {
+		t.Helper()
+		var writeErr error
+		db.compactHook = func() { writeErr = writes() }
+		err := db.Compact()
 		db.compactHook = nil
-		if err != nil {
-			t.Fatalf("Compact with Phase B resurrection: %v", err)
-		}
-		if hookErr != nil {
-			t.Fatalf("compactHook AppendSync failed: %v", hookErr)
+		requireOK(t, err)
+		requireOK(t, writeErr)
+	}
+	t.Run("FoldedExternalPage", func(t *testing.T) {
+		now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+		db, s := testDB(t, &now, opts)
+		defer func() { _ = db.Close() }()
+		const staleCount = 17000
+		oldTag := func(i int) string { return fmt.Sprintf("old-%05d", i) }
+		seedHighCardMinute(t, s, now.Add(-10*time.Minute), staleCount, func(i int) []string {
+			return []string{oldTag(i), "old"}
+		})
+		appendValue(t, s, now.Add(-10*time.Minute), 10)
+		requireOK(t, db.Compact())
+		if st := dictStats(t, s)[0]; st.ExternalBytes == 0 || st.MaxID != staleCount+1 {
+			t.Fatalf("seed did not create an external dictionary: %+v", st)
 		}
 
-		verify := func(label string, curS *Series) {
-			t.Helper()
+		now = now.Add(12 * time.Hour)
+		appendValue(t, s, now.Add(-10*time.Minute), 10)
+		compactWithWrites(t, db, func() error {
+			err := s.AppendSync(now.Add(-30*time.Second), Summary{Values: [4]int64{66, 11, 33, 33}},
+				testRow(11, oldTag(42), "old"), testRow(22, oldTag(5000), "old"), testRow(33, "brandnew", "new"))
+			if err != nil {
+				return err
+			}
+			// A separate WAL frame reuses a resurrected ID.
+			return s.AppendSync(now.Add(-20*time.Second), Summary{Values: testValues(14)}, testRow(14, oldTag(42), "old"))
+		})
+		for _, followup := range []bool{false, true} {
+			if followup {
+				now = now.Add(10 * time.Minute)
+				requireOK(t, db.Compact())
+			}
+			db = reopenTestDB(t, db, db.path, db.opts)
+			s = mustSeries(t, db, s.id, s.cfg)
 			for _, tc := range []struct {
 				tag  string
 				want int64
-			}{
-				{"2001:db8:old::00042", 25},
-				{"2001:db8:old::05000", 22},
-				{"2001:db8:brandnew::1", 33},
-				{"2001:db8:keep::1", 10},
-				{"2001:db8:old::00043", 0},
-			} {
-				if got := queryAggSum(t, curS, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{tc.tag}}}}); got != tc.want {
-					t.Fatalf("%s tag=%s sum=%d want=%d", label, tc.tag, got, tc.want)
-				}
+			}{{oldTag(42), 25}, {oldTag(5000), 22}, {oldTag(43), 0}, {"brandnew", 33}, {"a", 10}} {
+				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(0, TagEq, tc.tag)}, tc.want)
 			}
-			if err := readCheckErr(ctx, curS, ReadRequest{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"2001:db8:old::05000"}}}, Limit: 10}, func(page *PageResult) error {
-				if len(page.Rows) != 1 || page.Rows[0].Tags[0] != "2001:db8:old::05000" || page.Rows[0].Values[0] != 22 {
-					return fmt.Errorf("unexpected Read #5000: %+v", page.Rows)
-				}
-				return nil
-			}); err != nil {
-				t.Fatalf("%s %v", label, err)
-			}
-			if _, scanSum, err := scanCountSumErr(ctx, curS, ScanQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"2001:db8:old::00042"}}}}); err != nil || scanSum != 25 {
-				t.Fatalf("%s Scan #42: err=%v sum=%d want=25", label, err, scanSum)
-			}
-			st, err := curS.DictStats()
-			if err != nil {
-				t.Fatal(err)
-			}
-			wantMax := uint32(persistN + deadN + 1)
-			if st[0].MaxID != wantMax || st[0].LiveCount != 7 || st[0].DeadCount != wantMax-7 {
-				t.Fatalf("%s DictStats dim0=%+v want max=%d live=7 dead=%d", label, st[0], wantMax, wantMax-7)
+			if st := dictStats(t, s)[0]; st.MaxID != staleCount+2 || st.LiveCount != 4 || st.DeadCount != staleCount-2 {
+				t.Fatalf("resurrected dictionary stats: %+v", st)
 			}
 		}
-
-		verify("post-compact", s)
-		db = reopenTestDB(t, db, path, opts)
-		s = mustSeries(t, db, 1, cfg)
-		verify("reopened", s)
-
-		// Follow-up Compact seals the resurrected tail WAL and unfolds the previously folded page cleanly.
-		clock = clock.Add(10 * time.Minute)
-		if err := db.Compact(); err != nil {
-			t.Fatalf("follow-up Compact: %v", err)
-		}
-		db = reopenTestDB(t, db, path, opts)
-		s = mustSeries(t, db, 1, cfg)
-		verify("post-unfold-reopen", s)
-	})
-
-	t.Run("PhaseBConcurrentResetAllIsolation", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "resurrect_resetall.db")
-		clock := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
-		opts := Options{
-			Now:         func() time.Time { return clock },
-			Retention1m: 2 * time.Hour,
-			Retention1h: 4 * time.Hour,
-			Retention1d: 6 * time.Hour,
-		}
-		cfg := SeriesConfig{Arity: 1, SummaryOps: ops, RowOps: ops}
-		db, err := Open(path, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if db != nil {
-				_ = db.Close()
-			}
-		}()
-		s1 := mustSeries(t, db, 1, cfg)
-		s2 := mustSeries(t, db, 2, cfg)
-
-		const n = 1500
-		seedTS := clock.Add(-10 * time.Minute)
-		seedHighCardMinute(t, s1, seedTS, n, func(i int) []string {
-			return []string{fmt.Sprintf("s1-old-%04d", i+1)}
-		})
-		seedHighCardMinute(t, s2, seedTS, n, func(i int) []string {
-			return []string{fmt.Sprintf("s2-old-%04d", i+1)}
-		})
-		if err := s2.Append(seedTS, Summary{Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
-			Row{Tags: []string{"s2-keep"}, Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
-		); err != nil {
-			t.Fatal(err)
-		}
-		if err := db.Compact(); err != nil {
-			t.Fatal(err)
-		}
-
-		// Expire all s1 data (triggers full omission liveCnt==0) and all s2-old-* (triggers pruning).
-		clock = clock.Add(12 * time.Hour)
-		if err := s2.Append(clock.Add(-10*time.Minute), Summary{Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
-			Row{Tags: []string{"s2-keep"}, Values: [4]int64{7, 7, 7, 7}, Mask: 0x0f},
-		); err != nil {
-			t.Fatal(err)
-		}
-
-		var hookErr error
-		db.compactHook = func() {
-			if err := s1.AppendSync(clock.Add(-40*time.Second), Summary{Values: [4]int64{9, 9, 9, 9}, Mask: 0x0f},
-				Row{Tags: []string{"s1-old-0010"}, Values: [4]int64{9, 9, 9, 9}, Mask: 0x0f},
-			); err != nil {
-				hookErr = err
-				return
-			}
-			if err := s1.ResetAll(); err != nil {
-				hookErr = err
-				return
-			}
-			if err := s1.AppendSync(clock.Add(-30*time.Second), Summary{Values: [4]int64{300, 100, 200, 200}, Mask: 0x0f},
-				Row{Tags: []string{"s1-fresh-a"}, Values: [4]int64{100, 100, 100, 100}, Mask: 0x0f},
-				Row{Tags: []string{"s1-fresh-b"}, Values: [4]int64{200, 200, 200, 200}, Mask: 0x0f},
-			); err != nil {
-				hookErr = err
-				return
-			}
-			if err := s2.AppendSync(clock.Add(-20*time.Second), Summary{Values: [4]int64{55, 55, 55, 55}, Mask: 0x0f},
-				Row{Tags: []string{"s2-old-0010"}, Values: [4]int64{55, 55, 55, 55}, Mask: 0x0f},
-			); err != nil {
-				hookErr = err
-			}
-		}
-		err = db.Compact()
-		db.compactHook = nil
-		if err != nil {
-			t.Fatalf("Compact with concurrent ResetAll: %v", err)
-		}
-		if hookErr != nil {
-			t.Fatalf("compactHook failed: %v", hookErr)
-		}
-
-		db = reopenTestDB(t, db, path, opts)
-		s1 = mustSeries(t, db, 1, cfg)
-		s2 = mustSeries(t, db, 2, cfg)
-
-		for _, tc := range []struct {
-			s    *Series
-			tag  string
-			want int64
-		}{
-			{s1, "s1-fresh-a", 100},
-			{s1, "s1-fresh-b", 200},
-			{s1, "s1-old-0010", 0},
-			{s1, "s1-old-0001", 0},
-			{s2, "s2-keep", 7},
-			{s2, "s2-old-0010", 55},
-		} {
-			if got := queryAggSum(t, tc.s, AggregateQuery{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{tc.tag}}}}); got != tc.want {
-				t.Fatalf("%s sum=%d want=%d", tc.tag, got, tc.want)
-			}
-		}
-		st1, err := s1.DictStats()
-		if err != nil || st1[0].MaxID != 2 || st1[0].LiveCount != 2 || st1[0].DeadCount != 0 {
-			t.Fatalf("unexpected s1 DictStats after concurrent ResetAll: err=%v stats=%+v", err, st1)
-		}
-		if err := readCheckErr(ctx, s2, ReadRequest{AllTime: true, Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{"s2-old-0010"}}}, Limit: 10}, func(page *PageResult) error {
-			if len(page.Rows) != 1 || page.Rows[0].Tags[0] != "s2-old-0010" || page.Rows[0].Values[0] != 55 {
-				return fmt.Errorf("unexpected s2 Read resurrected rows: %+v", page.Rows)
+		requireOK(t, readCheckErr(t.Context(), s, ReadRequest{AllTime: true, Filters: tagFilter(0, TagEq, oldTag(5000)), Limit: 10}, func(p *PageResult) error {
+			if len(p.Rows) != 1 || p.Rows[0].Tags[0] != oldTag(5000) || p.Rows[0].Values[0] != 22 {
+				return fmt.Errorf("resurrected Read rows: %+v", p.Rows)
 			}
 			return nil
-		}); err != nil {
-			t.Fatal(err)
+		}))
+		n, sum, err := scanCountSumErr(t.Context(), s, ScanQuery{AllTime: true, Filters: tagFilter(0, TagEq, oldTag(42))})
+		if err != nil || n != 1 || sum != 25 {
+			t.Fatalf("resurrected Scan: rows=%d sum=%d err=%v", n, sum, err)
 		}
+	})
+	t.Run("ConcurrentResetAll", func(t *testing.T) {
+		now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+		db, _ := testDB(t, &now, opts)
+		defer func() { _ = db.Close() }()
+		cfg := defaultSeriesConfig(1)
+		reset, keep := mustSeries(t, db, 1, cfg), mustSeries(t, db, 2, cfg)
+		ts := now.Add(-10 * time.Minute)
+		for _, s := range []*Series{reset, keep} {
+			seedHighCardMinute(t, s, ts, 1500, func(i int) []string { return []string{fmt.Sprintf("old-%04d", i+1)} })
+		}
+		requireOK(t, keep.Append(ts, Summary{Values: testValues(7)}, testRow(7, "keep")))
+		requireOK(t, db.Compact())
+		now = now.Add(12 * time.Hour)
+		requireOK(t, keep.Append(now.Add(-10*time.Minute), Summary{Values: testValues(7)}, testRow(7, "keep")))
+
+		compactWithWrites(t, db, func() error {
+			if err := reset.AppendSync(now.Add(-40*time.Second), Summary{Values: testValues(9)}, testRow(9, "old-0010")); err != nil {
+				return err
+			}
+			if err := reset.ResetAll(); err != nil {
+				return err
+			}
+			if err := reset.AppendSync(now.Add(-30*time.Second), Summary{Values: testValues(300)}, testRow(100, "fresh-a"), testRow(200, "fresh-b")); err != nil {
+				return err
+			}
+			return keep.AppendSync(now.Add(-20*time.Second), Summary{Values: testValues(55)}, testRow(55, "old-0010"))
+		})
+		db = reopenTestDB(t, db, db.path, db.opts)
+		reset, keep = mustSeries(t, db, reset.id, cfg), mustSeries(t, db, keep.id, cfg)
+		for _, tc := range []struct {
+			s   *Series
+			tag string
+			sum int64
+		}{
+			{reset, "fresh-a", 100}, {reset, "fresh-b", 200}, {reset, "old-0010", 0},
+			{reset, "old-0001", 0}, {keep, "keep", 7}, {keep, "old-0010", 55},
+		} {
+			assertQuerySum(t, tc.s, AggregateQuery{AllTime: true, Filters: tagFilter(0, TagEq, tc.tag)}, tc.sum)
+		}
+		if st := dictStats(t, reset)[0]; st.MaxID != 2 || st.LiveCount != 2 || st.DeadCount != 0 {
+			t.Fatalf("Phase B carried old-epoch IDs through ResetAll: %+v", st)
+		}
+		req := ReadRequest{AllTime: true, Filters: tagFilter(0, TagEq, "old-0010"), Limit: 10}
+		requireOK(t, readCheckErr(t.Context(), keep, req, func(p *PageResult) error {
+			if len(p.Rows) != 1 || p.Rows[0].Tags[0] != "old-0010" || p.Rows[0].Values[0] != 55 {
+				return fmt.Errorf("neighbor's resurrected row: %+v", p.Rows)
+			}
+			return nil
+		}))
 	})
 }
