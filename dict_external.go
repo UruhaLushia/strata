@@ -189,7 +189,7 @@ func decodeSSTBlock(plain []byte, keyBuf *[]byte, yield func(key []byte, id uint
 	return nil
 }
 
-func (e *dictExtDim) lookupSST(value string) (uint32, error) {
+func (e *dictExtDim) lookupSST(value string, slot *querySlot) (uint32, error) {
 	if e == nil || len(e.sstBlocks) == 0 || value == "" {
 		return 0, nil
 	}
@@ -202,13 +202,11 @@ func (e *dictExtDim) lookupSST(value string) (uint32, error) {
 	if idx < 0 {
 		return 0, nil
 	}
-	slot := querySlot{codecs: e.view.codecs}
-	defer slot.close()
 	plainPtr := getDecodeScratch()
 	defer func() {
 		putDecodeScratch(plainPtr, *plainPtr)
 	}()
-	plain, err := e.readPageInto(e.sstStartOff, e.sstBlocks[idx], plainPtr, &slot)
+	plain, err := e.readPageInto(e.sstStartOff, e.sstBlocks[idx], plainPtr, slot)
 	if err != nil {
 		return 0, err
 	}
@@ -227,7 +225,7 @@ func (e *dictExtDim) lookupSST(value string) (uint32, error) {
 	return found, err
 }
 
-func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst []uint32) ([]uint32, error) {
+func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst []uint32, slot *querySlot) ([]uint32, error) {
 	if e == nil || len(e.sstBlocks) == 0 {
 		return dst, nil
 	}
@@ -240,8 +238,11 @@ func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst 
 			startIdx = idx - 1
 		}
 	}
-	slot := querySlot{codecs: e.view.codecs}
-	defer slot.close()
+	if slot == nil {
+		local := querySlot{codecs: e.view.codecs}
+		defer local.close()
+		slot = &local
+	}
 	plainPtr := getDecodeScratch()
 	defer func() {
 		putDecodeScratch(plainPtr, *plainPtr)
@@ -254,7 +255,7 @@ func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst 
 				break
 			}
 		}
-		plain, err := e.readPageInto(e.sstStartOff, e.sstBlocks[blk], plainPtr, &slot)
+		plain, err := e.readPageInto(e.sstStartOff, e.sstBlocks[blk], plainPtr, slot)
 		if err != nil {
 			return nil, err
 		}

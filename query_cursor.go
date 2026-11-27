@@ -8,6 +8,8 @@ type blockSource struct {
 	candIdx    []uint32
 	live       []sealedBlock
 	candBits   []uint64
+	candBase   uint32
+	candSpan   uint32
 	filterFine bool
 	rules      []resetRule
 }

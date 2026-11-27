@@ -228,7 +228,7 @@ func (s *Series) readWithOptions(ctx context.Context, req ReadRequest, defaultWi
 				page.NextCursor = makeNextCursor(winFromSec, winToSec, qHash, plan.block, 0)
 				break
 			}
-			hasMatch, probeErr := probeSlotHasMatch(pq.execDB, plan.block, pq.sources, &pq.execSeries, pq.compiled, allowDim0BS, slot)
+			hasMatch, probeErr := probeSlotHasMatch(pq.exec.view, plan.block, pq.sources, &pq.execSeries, pq.compiled, allowDim0BS, slot)
 			if probeErr != nil {
 				page.Release()
 				return nil, probeErr
@@ -248,13 +248,13 @@ func (s *Series) readWithOptions(ctx context.Context, req ReadRequest, defaultWi
 			continue
 		}
 
-		block, bufPtr, readErr := mergeSlot(pq.execDB, plan.block, pq.sources, &pq.execSeries)
+		block, bufPtr, readErr := mergeSlot(pq.exec.view, plan.block, pq.sources, &pq.execSeries)
 		if readErr != nil {
 			putReadBuf(bufPtr)
 			page.Release()
 			return nil, readErr
 		}
-		matchCount, taken, takeStart, exErr := readPageFromBlock(block, plan.meta, pq.execDB.dict, s.id, arity, pq.compiled, allowDim0BS, remainingSkip, limit-len(page.Rows), slot, &rowIdxBuf, page)
+		matchCount, taken, takeStart, exErr := readPageFromBlock(block, plan.meta, pq.exec.dict, s.id, arity, pq.compiled, allowDim0BS, remainingSkip, limit-len(page.Rows), slot, &rowIdxBuf, page)
 		putReadBuf(bufPtr)
 		if exErr != nil {
 			page.Release()
@@ -289,8 +289,8 @@ func makeNextCursor(winFromSec, winToSec int64, qHash uint64, b sealedMeta, rowS
 	}
 }
 
-func probeSlotHasMatch(db *DB, chosen sealedMeta, sources querySources, s *Series, filters []compiledFilter, allowDim0BS bool, slot *querySlot) (bool, error) {
-	block, bufPtr, err := mergeSlot(db, chosen, sources, s)
+func probeSlotHasMatch(view *fileView, chosen sealedMeta, sources querySources, s *Series, filters []compiledFilter, allowDim0BS bool, slot *querySlot) (bool, error) {
+	block, bufPtr, err := mergeSlot(view, chosen, sources, s)
 	if bufPtr != nil {
 		defer putReadBuf(bufPtr)
 	}

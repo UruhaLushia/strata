@@ -368,7 +368,7 @@ func (d *dictionary) apply(e dictEntry) error {
 
 func (d *dictionary) lookup(series uint16, dimIdx uint8, value string) (uint32, error) {
 	if d.snapshot && series == d.snapshotSeries && dimIdx < 8 {
-		return d.snapshotDims[dimIdx].lookup(value)
+		return d.snapshotDims[dimIdx].lookup(value, nil)
 	}
 	dim := d.dims[dictDimKey{series: series, dim: dimIdx}]
 	if dim != nil && dim.ext != nil && value != "" {

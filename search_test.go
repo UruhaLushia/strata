@@ -1,13 +1,148 @@
 package strata
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"testing"
 	"time"
 )
+
+func TestTagEqLiveSnapshotWithoutMap(t *testing.T) {
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	db, s := testDB(t, &now, Options{})
+	defer db.Close()
+	from := now.Add(-2 * time.Minute)
+	requireOK(t, s.Append(from, Summary{Values: testValues(12)}, testRow(7, "first", "b"), testRow(5, "", "b")))
+	requireOK(t, s.Append(from.Add(time.Minute), Summary{Values: testValues(13)}, testRow(13, "other", "b")))
+	dim := db.dict.dims[dictDimKey{series: s.id}]
+	dim.byKey = nil
+	check := func(key string, fast, empty bool, want int64) {
+		t.Helper()
+		snap, _, gotEmpty, err := captureQuerySnapshot(db, s, windowSpec{from: from, to: now}, tagFilter(0, TagEq, key))
+		requireOK(t, err)
+		defer snap.release()
+		if gotEmpty != empty || snap.livePreFiltered != fast {
+			t.Fatalf("%q fast=%v empty=%v", key, snap.livePreFiltered, gotEmpty)
+		}
+		if !fast || empty {
+			return
+		}
+		if !snap.hasLiveMatch || len(snap.liveFine) != 2 {
+			t.Fatalf("%q lost live coverage", key)
+		}
+		for _, b := range snap.liveFine {
+			if b.start == from.Unix() {
+				if !b.candidate || len(b.rows) != 1 || b.rows[0].values[0] != want {
+					t.Fatalf("%q matching bucket = %+v", key, b)
+				}
+			} else if b.candidate || len(b.rows) != 0 || b.rowCount != 1 || b.summary.Values[0] != 13 {
+				t.Fatalf("%q noncandidate bucket = %+v", key, b)
+			}
+		}
+	}
+	check("first", true, false, 7)
+	check("missing", true, true, 0)
+	dim.buildSorted()
+	requireOK(t, s.Append(from, Summary{}, testRow(9, "tail", "b")))
+	check("first", true, false, 7)
+	check("tail", true, false, 9)
+	check("missing", true, true, 0)
+	check("", true, false, 5)
+	requireOK(t, dim.appendValue(130, "distant"))
+	check("first", false, false, 0) // Large unmerged tail.
+	dim.sorted = nil
+	check("first", false, false, 0) // Sparse ID domain despite a small live count.
+	dim.buildSorted()
+	dim.extra = map[uint32]string{1: "override"}
+	check("first", false, false, 0)
+}
+
+func TestWindowBlockBitmapBounds(t *testing.T) {
+	const base = uint32(69)
+	for _, span := range []uint32{1, 64, 256, 257} {
+		bm := newBlockBitmap(base, span)
+		for _, pos := range []uint32{base - 1, base, base + span - 1, base + span, base} {
+			bm.set(pos)
+		}
+		if !bm.has(base) || !bm.has(base+span-1) || bm.has(base-1) || bm.has(base+span) || bm.count != int(min(span, 2)) ||
+			(&bm.bits[0] == &bm.inline[0]) != (span <= 256) {
+			t.Fatalf("bitmap span=%d count=%d bits=%v", span, bm.count, bm.bits)
+		}
+		if span&63 != 0 {
+			bm.bits[len(bm.bits)-1] |= uint64(1) << (span & 63)
+			if bm.has(base + span) {
+				t.Fatalf("span %d admitted padding", span)
+			}
+		}
+	}
+}
+
+func TestSinglePostingWindowKeepsGlobalDensityAndCoverage(t *testing.T) {
+	f, err := os.Create(filepath.Join(t.TempDir(), "invert"))
+	requireOK(t, err)
+	defer f.Close()
+	const from, to = int64(3600), int64(3660)
+	window := [3][]uint32{{72, 73, 74, 75, 76, 77, 78}, {71}, {70}}
+	snap := querySnapshot{series: Series{id: 1}, sealed: make([]sealedMeta, 100), fineAll: make([]uint32, 98),
+		hourAll: window[1], dayAll: window[2], view: &fileView{data: &osFile{f: f}}}
+	snap.sealed[70] = sealedMeta{series: 1, res: resDay}
+	snap.sealed[71] = sealedMeta{series: 1, res: resHour, start: from}
+	for _, pos := range window[0] {
+		snap.sealed[pos] = sealedMeta{series: 1, res: resMinuteHR, start: from}
+	}
+	key := encodeInvertKey(invertKey{series: 1, tag: 7})
+	var scratch invertRecordScratch
+	dense := make([]uint32, 36)
+	for i := range dense {
+		dense[i] = uint32(i)
+	}
+	dense[len(dense)-1] = 71
+	// Repeated IDs are valid delta inputs and count once toward global density.
+	duplicates := append(binary.LittleEndian.AppendUint64(nil, key), invertModeDeltaVarint, 41, 5)
+	duplicates = append(duplicates, make([]byte, 39)...)
+	duplicates = append(duplicates, 66)
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+		want int
+	}{
+		{"global dense", slices.Clone(encodeInvertRecordAdaptive(key, dense, false, &scratch)), -1},
+		{"dense skip", slices.Clone(encodeInvertRecordAdaptive(key, nil, true, &scratch)), -1},
+		{"outside only", slices.Clone(encodeInvertRecordAdaptive(key, []uint32{5}, false, &scratch)), 0},
+		{"duplicates and coarse", duplicates, 1},
+	} {
+		_, err := f.WriteAt(tc.raw, 0)
+		requireOK(t, err)
+		snap.invertSec = sectionDesc{length: uint64(len(tc.raw))}
+		snap.invert = []invertChunkMeta{{first: key, last: key, length: uint32(len(tc.raw)), crc: crc(tc.raw)}}
+		bm, empty, err := searchCandidatesSnap(&snap, window, tagFilter(0, TagEq, "tag"), []compiledFilter{{ids: []uint32{7}}}, false, nil)
+		requireOK(t, err)
+		if empty || (bm == nil) != (tc.want < 0) {
+			t.Fatalf("%s bitmap=%v empty=%v", tc.name, bm, empty)
+		}
+		if bm == nil {
+			continue
+		}
+		if bm.base != 70 || bm.span != 9 || bm.count != tc.want || bm.has(5) || bm.has(71) != (tc.want == 1) {
+			t.Fatalf("%s bitmap=%+v", tc.name, bm)
+		}
+		sources := buildQuerySourcesFromSnap(&snap, window[0], window[1], window[2], from, to, bm)
+		if len(sources.hours.idx) != 1 || sources.hours.candIdx == nil || len(sources.hours.candIdx) != tc.want {
+			t.Fatalf("%s lost coarse coverage or candidate: %+v", tc.name, sources.hours)
+		}
+		res := queryResult{sparse: true, Exact: true}
+		plans, err := planQuerySlots(&res, from, to, sources, &snap.series, queryOptions{RequireExact: true}, bm)
+		if tc.want == 1 && !errors.Is(err, ErrResolutionTooCoarse) || tc.want == 0 && (err != nil || len(plans) != 0) {
+			t.Fatalf("%s exact plan length=%d err=%v", tc.name, len(plans), err)
+		}
+	}
+}
 
 func TestTagEqLiveWindowSkipsSealedInversion(t *testing.T) {
 	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)

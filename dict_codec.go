@@ -50,7 +50,7 @@ func readDictInt64(raw []byte, off *int) (int64, error) {
 	return int64(value), err
 }
 
-func (s *dictDimSnap) lookup(value string) (uint32, error) {
+func (s *dictDimSnap) lookup(value string, slot *querySlot) (uint32, error) {
 	if (s.count == 0 && len(s.extra) == 0) || value == "" {
 		return 0, nil
 	}
@@ -68,7 +68,7 @@ func (s *dictDimSnap) lookup(value string) (uint32, error) {
 				return id, nil
 			}
 		}
-		id, err := s.ext.lookupSST(value)
+		id, err := s.ext.lookupSST(value, slot)
 		if err != nil || id != 0 && !hasExtraOverride(s.extra, id) {
 			return id, err
 		}
@@ -114,13 +114,13 @@ func (s *dictDimSnap) lookupInline(value string) uint32 {
 	return 0
 }
 
-func (s *dictDimSnap) matchPrefixIDs(prefix string, dst []uint32) ([]uint32, error) {
+func (s *dictDimSnap) matchPrefixIDs(prefix string, dst []uint32, slot *querySlot) ([]uint32, error) {
 	if s.count == 0 && len(s.extra) == 0 {
 		return dst, nil
 	}
 	if s.ext != nil {
 		var err error
-		dst, err = s.ext.matchPrefixSST(prefix, s.extra, dst)
+		dst, err = s.ext.matchPrefixSST(prefix, s.extra, dst, slot)
 		if err != nil {
 			return nil, err
 		}

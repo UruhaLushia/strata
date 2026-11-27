@@ -10,6 +10,53 @@ import (
 	"time"
 )
 
+func TestAggregateSlotExecutionOrder(t *testing.T) {
+	ops := [4]MetricOp{OpSum, OpMin, OpMax, OpLast}
+	s := &Series{cfg: SeriesConfig{Arity: 1, RowOps: ops, SummaryOps: ops}}
+	var sources querySources
+	plans := make([]plannedSlot, 8)
+	for i := range plans {
+		start := int64(i+1) * 60
+		plans[i] = plannedSlot{
+			block: sealedMeta{start: start, res: resMinuteHR, rowCount: 512},
+			meta:  SegmentMeta{CoveredFrom: time.Unix(start, 0)},
+		}
+		id := uint32(1)
+		if i == 2 || i == len(plans)-1 {
+			id = 2
+		}
+		sources.fine.live = append(sources.fine.live, sealedBlock{start: start, end: start + 60, res: resMinuteHR, candidate: true,
+			rows: []idRow{{tags: [8]uint32{id}, values: testValues(int64(i + 1)), initMask: 0x0f}}})
+	}
+	filters := []compiledFilter{{ids: []uint32{1}, single: 1}}
+	exec, slot := &queryExec{}, &querySlot{}
+	var serial, parallel AggregateResult
+	defer serial.Release()
+	defer parallel.Release()
+	for i, out := range []*AggregateResult{&serial, &parallel} {
+		var res queryResult
+		_, err := executeAggregateSlots(t.Context(), &res, out, plans, sources, s, exec, filters, nil, 1+3*i, 0, slot)
+		requireOK(t, err)
+		out.Summary = res.Summary
+	}
+	if serial.Summary != (Summary{Values: [4]int64{25, 1, 7, 7}, Mask: 0x0f}) || len(serial.Segments) != 6 ||
+		serial.Summary != parallel.Summary || !slices.Equal(serial.Segments, parallel.Segments) {
+		t.Fatalf("serial=%+v parallel=%+v", serial, parallel)
+	}
+	bad := sealedMeta{start: 9 * 60, res: resMinuteHR, rowCount: 512}
+	sources.fine.sealed, sources.fine.idx = []sealedMeta{bad}, []uint32{0}
+	plans[1].block = bad // Missing view precedes a vanished live slot.
+	plans[3].block.start = 10 * 60
+	for _, workers := range []int{1, 4} {
+		var out AggregateResult
+		_, err := executeAggregateSlots(t.Context(), &queryResult{}, &out, plans, sources, s, exec, filters, nil, workers, 0, slot)
+		out.Release()
+		if err == nil || err.Error() != "strata: missing file view" {
+			t.Fatalf("workers=%d first error=%v", workers, err)
+		}
+	}
+}
+
 func TestRollupLocalHoursMinuteAndMixedSegments(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 30, 0, 0, time.UTC)
 	db, s := testDB(t, &now, Options{})
@@ -56,7 +103,7 @@ func TestSparseFilteredGroupUsesOpenAddressing(t *testing.T) {
 	}
 	var res AggregateResult
 	defer res.Release()
-	groups, err := executeAggregateSlots(t.Context(), &pq.qres, &res, pq.plans, pq.sources, &pq.execSeries, pq.execDB, pq.compiled, []int{0}, 1, upper, slot)
+	groups, err := executeAggregateSlots(t.Context(), &pq.qres, &res, pq.plans, pq.sources, &pq.execSeries, &pq.exec, pq.compiled, []int{0}, 1, upper, slot)
 	requireOK(t, err)
 	if groups[0].dense != nil || len(groups[0].open.slots) != 64 {
 		t.Fatal("single matching ID should use a 64-slot open-addressing table")

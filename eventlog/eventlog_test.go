@@ -139,6 +139,36 @@ func TestRoundTripAndScanLimits(t *testing.T) {
 	}
 }
 
+func TestScanShardSnapshot(t *testing.T) {
+	callbackErr := errors.New("callback failed")
+	for _, n := range []int{4, 5} {
+		l, err := Open(t.TempDir(), Options{MaxRecordBytes: 8, MaxBatchBytes: 64,
+			ShardMaxBytes: fileHeaderSize + minRawFrameSize + 8})
+		check(t, err)
+		defer l.Close()
+		var want []int64
+		for i := 1; i <= n; i++ {
+			put(t, l, int64(i))
+			want = append(want, int64(n-i+1))
+		}
+		if got := timestamps(t, l); len(l.shards) != n || !slices.Equal(got, want) {
+			t.Fatalf("%d shards: got %v in %d shards, want %v", n, got, len(l.shards), want)
+		}
+		for _, cbErr := range []error{ErrStopScan, errors.Join(errors.New("wrapped"), ErrStopScan), callbackErr} {
+			result, err := l.Scan(t.Context(), ScanOptions{}, func(Record) error { return cbErr })
+			stopped := cbErr != callbackErr
+			if stopped {
+				check(t, err)
+			} else {
+				wantError(t, err, callbackErr)
+			}
+			if result.Stopped != stopped || result.Records != 1 || result.LimitReached || result.Truncated {
+				t.Fatalf("%d shards, callback error %v: %+v", n, cbErr, result)
+			}
+		}
+	}
+}
+
 func TestCodecRoundTrip(t *testing.T) {
 	const rowBytes = 4 << 10
 	payload := make([]byte, 96<<10)

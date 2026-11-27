@@ -27,6 +27,16 @@ func readInvertChunkFromView(view *fileView, desc sectionDesc, chunk invertChunk
 	return plain, nil, err
 }
 
+func readInvertByte(plain []byte, off *int) (uint64, bool) {
+	if i := *off; i < len(plain) {
+		if b := plain[i]; b < 0x80 {
+			*off = i + 1
+			return uint64(b), true
+		}
+	}
+	return 0, false
+}
+
 func decodeInvertRecordBody(plain []byte, off *int, k uint64, mode byte, match bool, onPosting func(key uint64, blockID uint32), onDense func(key uint64)) error {
 	switch mode {
 	case invertModeDenseSkip:
@@ -48,9 +58,12 @@ func decodeInvertRecordBody(plain []byte, off *int, k uint64, mode byte, match b
 		}
 		var prev uint32
 		for range n {
-			delta, err := readBlockUvarint(plain, off)
-			if err != nil {
-				return err
+			delta, ok := readInvertByte(plain, off)
+			if !ok {
+				delta, err = readBlockUvarint(plain, off)
+				if err != nil {
+					return err
+				}
 			}
 			if delta > uint64(^uint32(0)-prev) {
 				return errors.New("strata: invalid TS invert delta")
@@ -96,25 +109,32 @@ func decodeInvertRecordBody(plain []byte, off *int, k uint64, mode byte, match b
 			return errors.New("strata: invalid TS invert bitset count")
 		}
 	case invertModeRLE:
+		const maxBlockID = 1<<32 - 1
 		runCount, err := readBlockUvarint(plain, off)
 		if err != nil {
 			return err
 		}
 		var prevEnd uint64
 		for range runCount {
-			startDelta, err := readBlockUvarint(plain, off)
-			if err != nil {
-				return err
+			startDelta, ok := readInvertByte(plain, off)
+			if !ok {
+				startDelta, err = readBlockUvarint(plain, off)
+				if err != nil {
+					return err
+				}
 			}
-			runLen, err := readBlockUvarint(plain, off)
-			if err != nil {
-				return err
+			runLen, ok := readInvertByte(plain, off)
+			if !ok {
+				runLen, err = readBlockUvarint(plain, off)
+				if err != nil {
+					return err
+				}
 			}
-			if runLen == 0 || startDelta > uint64(^uint32(0))-prevEnd {
+			if runLen == 0 || prevEnd > maxBlockID || startDelta > maxBlockID-prevEnd {
 				return errors.New("strata: invalid TS invert RLE")
 			}
 			start := prevEnd + startDelta
-			if runLen-1 > uint64(^uint32(0))-start {
+			if runLen-1 > maxBlockID-start {
 				return errors.New("strata: invalid TS invert RLE")
 			}
 			end := start + runLen

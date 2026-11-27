@@ -18,23 +18,27 @@ type windowSpec struct {
 	fixedPlanFrom int64
 }
 
+type queryExec struct {
+	dict   dictionary
+	policy memPolicy
+	codecs *codecTable
+	view   *fileView
+}
+
 type preparedQuery struct {
 	from, to   int64
-	execDB     *DB
+	exec       queryExec
 	execSeries Series
 	sources    querySources
 	plans      []plannedSlot
 	compiled   []compiledFilter
 	qres       queryResult
-	view       *fileView
 	empty      bool
 }
 
 func (p *preparedQuery) release() {
-	if p.view != nil {
-		p.view.release()
-		p.view = nil
-	}
+	p.exec.view.release()
+	p.exec.view = nil
 }
 
 func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts queryOptions, slot *querySlot) (preparedQuery, error) {
@@ -43,18 +47,12 @@ func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts query
 	if err != nil {
 		return pq, err
 	}
+	defer snap.release()
 	pq.from, pq.to = snap.from, snap.to
 	if empty {
 		pq.empty = true
 		return pq, nil
 	}
-	releaseSnap := true
-	defer func() {
-		if releaseSnap {
-			snap.release()
-		}
-	}()
-
 	pq.qres = queryResult{
 		RequestedFrom: time.Unix(planFrom, 0).UTC(), RequestedTo: time.Unix(pq.to, 0).UTC(),
 		EffectiveFrom: time.Unix(planFrom, 0).UTC(), EffectiveTo: time.Unix(pq.to, 0).UTC(),
@@ -73,7 +71,7 @@ func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts query
 			id := snap.liveTagID
 			compiled = []compiledFilter{{dim: filters[0].Dim, ids: []uint32{id}, single: id}}
 		} else {
-			compiled, err = compileFiltersSnap(snap.dict, snap.series.id, snap.series.cfg.Arity, filters)
+			compiled, err = compileFiltersSnap(snap.dict, snap.series.id, snap.series.cfg.Arity, filters, slot)
 			if err != nil {
 				return preparedQuery{}, err
 			}
@@ -90,7 +88,7 @@ func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts query
 		}
 		emptyCand := !hasLiveCandidate
 		if len(fineIdx)+len(hourIdx)+len(dayIdx) != 0 {
-			sealedBits, emptyCand, err = searchCandidatesSnap(&snap, ordered, compiled, hasLiveCandidate, slot)
+			sealedBits, emptyCand, err = searchCandidatesSnap(&snap, [3][]uint32{fineIdx, hourIdx, dayIdx}, ordered, compiled, hasLiveCandidate, slot)
 			if err != nil {
 				return preparedQuery{}, err
 			}
@@ -105,15 +103,13 @@ func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts query
 
 	pq.sources = buildQuerySourcesFromSnap(&snap, fineIdx, hourIdx, dayIdx, planFrom, pq.to, sealedBits)
 	pq.execSeries = snap.series
-	pq.execDB = snap.buildExecDB()
-
-	plans, err := planQuerySlots(&pq.qres, planFrom, pq.to, pq.sources, &pq.execSeries, opts)
+	plans, err := planQuerySlots(&pq.qres, planFrom, pq.to, pq.sources, &pq.execSeries, opts, sealedBits)
 	if err != nil {
 		return preparedQuery{}, err
 	}
 	pq.plans = plans
-	pq.view = snap.view
-	releaseSnap = false
+	pq.exec = queryExec{dict: snap.dict, policy: snap.policy, codecs: snap.codecs, view: snap.view}
+	snap.view = nil
 	return pq, nil
 }
 
@@ -290,8 +286,19 @@ func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 	return nil
 }
 
-func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *Series, opts queryOptions) ([]plannedSlot, error) {
-	est := max(len(sources.days.idx)+min(len(sources.hours.idx), 256)+len(sources.fine.live), 16)
+func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *Series, opts queryOptions, candidates *blockBitmap) ([]plannedSlot, error) {
+	est := 0
+	for _, src := range [...]blockSource{sources.fine, sources.hours, sources.days} {
+		if src.candIdx != nil {
+			est += len(src.candIdx)
+		} else {
+			est += len(src.idx)
+		}
+	}
+	if candidates != nil {
+		est = min(est, candidates.count)
+	}
+	est = max(16, min(est+len(sources.fine.live), 256))
 	plans := make([]plannedSlot, 0, est)
 	if err := walkQuerySlots(res, from, to, sources, s, opts, func(chosen sealedMeta, meta SegmentMeta) error {
 		plans = append(plans, plannedSlot{block: chosen, meta: meta})

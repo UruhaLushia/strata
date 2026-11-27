@@ -1,12 +1,14 @@
 package strata
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"hash/crc32"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -29,6 +31,142 @@ func requireOK(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestQuerySlotDecodeRetainsLargerScratch(t *testing.T) {
+	z := zstd.New(zstd.Fastest)
+	enc, err := z.NewEncoder(64 << 10)
+	requireOK(t, err)
+	defer enc.Close()
+	large, small := bytes.Repeat([]byte{7}, 32<<10), bytes.Repeat([]byte{9}, 16<<10)
+	bigFrame, err := enc.Encode(nil, large)
+	requireOK(t, err)
+	smallFrame, err := enc.Encode(nil, small)
+	requireOK(t, err)
+	prev := make([]byte, 32<<10)
+	slot := querySlot{codecs: testCodecTable(t, z), colScratch: prev[:0]}
+	defer slot.close()
+	for range 3 {
+		for _, tc := range []struct{ raw, frame []byte }{{large, bigFrame}, {small, smallFrame}, {large, bigFrame}} {
+			got, err := slot.decode(codec.IDZstd, tc.frame, len(tc.raw))
+			requireOK(t, err)
+			if !bytes.Equal(got, tc.raw) || cap(got) != len(tc.raw) || &got[0] != &prev[0] ||
+				cap(slot.colScratch) != len(prev) || &slot.colScratch[:1][0] != &prev[0] {
+				t.Fatalf("decode of %d bytes failed to reuse the expected buffer", len(tc.raw))
+			}
+		}
+	}
+	if _, err := slot.decode(codec.IDZstd, bigFrame, len(small)); !errors.Is(err, codec.ErrTooLarge) || cap(slot.colScratch) != len(prev) {
+		t.Fatalf("bounded decode scratch=%d error=%v", cap(slot.colScratch), err)
+	}
+	for _, tc := range []struct {
+		name string
+		out  []byte
+		err  error
+		want int
+	}{
+		{"allocated", make([]byte, 1, 64<<10), nil, 64 << 10},
+		{"empty", nil, nil, len(prev)},
+		{"error", make([]byte, 1, 64<<10), os.ErrInvalid, len(prev)},
+		{"over budget", make([]byte, 1, maxActiveScratchCap+1), nil, len(prev)},
+		{"over limit", make([]byte, 2, 64<<10), nil, len(prev)},
+	} {
+		s := querySlot{colScratch: prev[:0], decID: codec.IDZstd, dec: scratchResultDecoder{out: tc.out, err: tc.err}}
+		got, err := s.decode(codec.IDZstd, nil, 1)
+		if !bytes.Equal(got, tc.out) || err != tc.err || cap(s.colScratch) != tc.want || len(s.colScratch) != 0 {
+			t.Fatalf("%s: len=%d err=%v scratch cap=%d", tc.name, len(got), err, cap(s.colScratch))
+		}
+	}
+}
+
+type scratchResultDecoder struct {
+	codec.Decoder
+	out []byte
+	err error
+}
+
+func (d scratchResultDecoder) Decode(_, _ []byte, _ int) ([]byte, error) { return d.out, d.err }
+
+func TestFilterCompilationBorrowsSSTDecoder(t *testing.T) {
+	c := &countingQueryCodec{Codec: s2.New(s2.Default)}
+	table := testCodecTable(t, c)
+	enc, err := c.NewEncoder(4 << 10)
+	requireOK(t, err)
+	defer enc.Close()
+	f, err := os.Create(filepath.Join(t.TempDir(), "sst"))
+	requireOK(t, err)
+	defer f.Close()
+	data := &osFile{f: f}
+	w := newDictSSTWriter(data, 0, crc32.New(castagnoli), enc)
+	long := "prefix-" + strings.Repeat("a", 150)
+	for i, key := range []string{long, "prefix-" + strings.Repeat("b", 150)} {
+		requireOK(t, w.add(key, uint32(i+1)))
+		requireOK(t, w.flush())
+		if w.blocks[i].rawLen == 0 {
+			t.Fatal("fixture SST block was not compressed")
+		}
+	}
+	ext := &dictExtDim{view: &fileView{data: data, codecs: table}, secDesc: sectionDesc{length: uint64(w.pos), codec: c.ID()},
+		sstBlocks: w.blocks, sstFirstArena: w.firstArena, sstFirstOffs: w.firstOffs}
+	dict := dictionary{snapshot: true, snapshotSeries: 7}
+	dict.snapshotDims[0] = dictDimSnap{ext: ext, count: 2, nextID: 3, tailBase: 3}
+	filters := []Filter{{Op: TagEq, Values: []string{long}}, {Op: TagPrefix, Values: []string{"prefix-"}}}
+	check := func(slot *querySlot) {
+		t.Helper()
+		got, err := compileFiltersSnap(dict, 7, 1, filters, slot)
+		requireOK(t, err)
+		if !slices.Equal(got[0].ids, []uint32{1}) || !slices.Equal(got[1].ids, []uint32{1, 2}) {
+			t.Fatalf("SST filter IDs = %v / %v", got[0].ids, got[1].ids)
+		}
+	}
+	slot := &querySlot{codecs: table, colScratch: make([]byte, 0, 32<<10)}
+	defer slot.close()
+	check(slot)
+	if c.opened != 1 || c.closed != 0 || cap(slot.colScratch) != 32<<10 {
+		t.Fatalf("borrowed decoder opened=%d closed=%d scratch=%d", c.opened, c.closed, cap(slot.colScratch))
+	}
+	c.err = os.ErrInvalid
+	if _, err := compileFiltersSnap(dict, 7, 1, filters, slot); !errors.Is(err, c.err) {
+		t.Fatalf("SST decode error = %v", err)
+	}
+	c.err = nil
+	check(nil)
+	slot.close()
+	if c.opened != 3 || c.closed != 3 {
+		t.Fatalf("fallback decoder opened=%d closed=%d", c.opened, c.closed)
+	}
+}
+
+type countingQueryCodec struct {
+	codec.Codec
+	opened, closed int
+	err            error
+}
+
+func (c *countingQueryCodec) NewDecoder() (codec.Decoder, error) {
+	d, err := c.Codec.NewDecoder()
+	if err != nil {
+		return nil, err
+	}
+	c.opened++
+	return countingQueryDecoder{Decoder: d, owner: c}, nil
+}
+
+type countingQueryDecoder struct {
+	codec.Decoder
+	owner *countingQueryCodec
+}
+
+func (d countingQueryDecoder) Decode(dst, src []byte, limit int) ([]byte, error) {
+	if d.owner.err != nil {
+		return nil, d.owner.err
+	}
+	return d.Decoder.Decode(dst, src, limit)
+}
+
+func (d countingQueryDecoder) Close() error {
+	d.owner.closed++
+	return d.Decoder.Close()
 }
 
 type allocatingCodec struct {

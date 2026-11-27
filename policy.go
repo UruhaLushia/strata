@@ -148,12 +148,15 @@ func (s *querySlot) decodeInto(id uint8, raw, dst []byte, maxRaw int) ([]byte, e
 }
 
 func (s *querySlot) decode(id uint8, raw []byte, maxRaw int) ([]byte, error) {
-	plain, err := s.decodeInto(id, raw, s.colScratch, maxRaw)
-	if cap(plain) <= maxActiveScratchCap {
-		s.colScratch = plain[:0]
-	} else {
-		s.colScratch = nil
+	prev := s.colScratch
+	plain, err := s.decodeInto(id, raw, prev, maxRaw)
+	if cap(prev) > maxActiveScratchCap {
+		prev = nil
 	}
+	if err == nil && len(plain) <= maxRaw && cap(plain) <= maxActiveScratchCap && cap(plain) > cap(prev) {
+		prev = plain
+	}
+	s.colScratch = prev[:0]
 	return plain, err
 }
 

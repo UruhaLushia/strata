@@ -203,6 +203,16 @@ func appendPage(view *columnarBlockView, cols *[streamColumnCount]decodedCol, me
 		if err != nil {
 			return err
 		}
+		if n > 0 && col.mode == modeConst {
+			tag, err := d.resolve(series, uint8(dim), uint32(col.val))
+			if err != nil {
+				return err
+			}
+			for i := range outRows {
+				outRows[i].Tags[dim] = tag
+			}
+			continue
+		}
 		for i := range n {
 			r := rangeLo + i
 			if !isRange {

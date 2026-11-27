@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/UruhaLushia/strata/codec"
+	"github.com/UruhaLushia/strata/codec/s2"
 	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
@@ -48,12 +50,17 @@ func buildGateway90DayFixture(t testing.TB) gateway90Fixture {
 
 func buildGateway90DayFixtureMode(t testing.TB, extreme bool) gateway90Fixture {
 	t.Helper()
+	return buildGateway90DayFixtureWithCodec(t, extreme, zstd.New(zstd.Fastest))
+}
+
+func buildGateway90DayFixtureWithCodec(t testing.TB, extreme bool, factory codec.Codec) gateway90Fixture {
+	t.Helper()
 	base := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 	start := base.Add(-90 * 24 * time.Hour)
 	clock := base
 	path := filepath.Join(t.TempDir(), "strata.db")
 	db, err := Open(path, Options{
-		Codec:       zstd.New(zstd.Fastest),
+		Codec:       factory,
 		Now:         func() time.Time { return clock },
 		Retention1m: 14 * 24 * time.Hour,
 		Retention1h: 90 * 24 * time.Hour,
@@ -124,7 +131,7 @@ func buildGateway90DayFixtureMode(t testing.TB, extreme bool) gateway90Fixture {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	check, err := Open(path, Options{Codec: zstd.New(zstd.Fastest), ReadOnly: true, Now: func() time.Time { return base }})
+	check, err := Open(path, Options{Codec: factory, ReadOnly: true, Now: func() time.Time { return base }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +199,12 @@ func gatewayDestMode(n int, extreme bool) string {
 
 func openGateway90Fixture(t testing.TB, fx gateway90Fixture, mmap bool) (*DB, *Series) {
 	t.Helper()
-	db, err := Open(fx.path, Options{Codec: zstd.New(zstd.Fastest), ReadOnly: true, UseMmap: mmap, Now: func() time.Time { return fx.now }})
+	return openGateway90FixtureWithCodec(t, fx, mmap, zstd.New(zstd.Fastest))
+}
+
+func openGateway90FixtureWithCodec(t testing.TB, fx gateway90Fixture, mmap bool, factory codec.Codec) (*DB, *Series) {
+	t.Helper()
+	db, err := Open(fx.path, Options{Codec: factory, ReadOnly: true, UseMmap: mmap, Now: func() time.Time { return fx.now }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,6 +658,83 @@ func BenchmarkGateway90OutboundLookup(b *testing.B) {
 						}
 					})
 				}
+			}
+		})
+	}
+}
+
+func BenchmarkGateway90CodecLatency(b *testing.B) {
+	requireGatewayStress(b)
+	for _, algorithm := range []struct {
+		name    string
+		factory codec.Codec
+	}{{"None", nil}, {"S2", s2.New(s2.Default)}, {"Zstd", zstd.New(zstd.Fastest)}} {
+		b.Run(algorithm.name, func(b *testing.B) {
+			for _, mode := range []struct {
+				name    string
+				extreme bool
+			}{{"Domain", false}, {"ExtremeDestIP", true}} {
+				b.Run(mode.name, func(b *testing.B) {
+					fx := buildGateway90DayFixtureWithCodec(b, mode.extreme, algorithm.factory)
+					db, s := openGateway90FixtureWithCodec(b, fx, false, algorithm.factory)
+					defer db.Close()
+					info, err := os.Stat(fx.path)
+					if err != nil {
+						b.Fatal(err)
+					}
+					to := fx.now.Add(time.Minute)
+					rowID := fx.rawRows - 6*30
+					dim, hit, miss := 0, gatewayDomain(rowID), "unknown.example"
+					if mode.extreme {
+						dim, hit, miss = 5, gatewayDestMode(rowID, true), "2001:db8:ffff::1"
+					}
+					run := func(name string, hit bool, query func(context.Context) (int, error)) {
+						b.Run(name, func(b *testing.B) {
+							ctx := b.Context()
+							b.ReportAllocs()
+							var count int
+							for b.Loop() {
+								n, err := query(ctx)
+								if err != nil {
+									b.Fatal(err)
+								}
+								count = n
+							}
+							if (count > 0) != hit {
+								b.Fatalf("%s returned %d rows, expected hit=%t", name, count, hit)
+							}
+							b.ReportMetric(float64(info.Size()), "db_bytes")
+						})
+					}
+					aggregate := func(name string, span time.Duration, value string) {
+						q := AggregateQuery{From: to.Add(-span), To: to, Filters: tagFilter(dim, TagEq, value), GroupDims: []int{2}}
+						run(name, value == hit, func(ctx context.Context) (int, error) {
+							res, err := s.Aggregate(ctx, q)
+							if err != nil {
+								return 0, err
+							}
+							n := len(res.Groups[0])
+							res.Release()
+							return n, nil
+						})
+					}
+					aggregate("15m/Hit", 15*time.Minute, hit)
+					aggregate("15m/Miss", 15*time.Minute, miss)
+					if mode.extreme {
+						return
+					}
+					aggregate("24h/Hit", 24*time.Hour, hit)
+					req := ReadRequest{From: to.Add(-15 * time.Minute), To: to, Filters: tagFilter(dim, TagEq, hit), Limit: 200}
+					run("Read15m/Hit", true, func(ctx context.Context) (int, error) {
+						page, err := s.Read(ctx, req)
+						if err != nil {
+							return 0, err
+						}
+						n := len(page.Rows)
+						page.Release()
+						return n, nil
+					})
+				})
 			}
 		})
 	}

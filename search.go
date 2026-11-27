@@ -24,22 +24,29 @@ type Filter struct {
 }
 
 type blockBitmap struct {
-	bits  []uint64
-	count int
+	bits       []uint64
+	count      int
+	base, span uint32
+	inline     [4]uint64
 }
 
-func newBlockBitmap(nBlocks int) *blockBitmap {
-	if nBlocks <= 0 {
-		return &blockBitmap{}
+func newBlockBitmap(base, span uint32) *blockBitmap {
+	bm := &blockBitmap{base: base, span: span}
+	words := (uint64(span) + 63) >> 6
+	if words <= uint64(len(bm.inline)) {
+		bm.bits = bm.inline[:words]
+	} else {
+		bm.bits = make([]uint64, words)
 	}
-	return &blockBitmap{bits: make([]uint64, (nBlocks+63)>>6)}
+	return bm
 }
 
 func (b *blockBitmap) set(pos uint32) {
-	w := pos >> 6
-	if int(w) >= len(b.bits) {
+	if pos < b.base || pos-b.base >= b.span {
 		return
 	}
+	pos -= b.base
+	w := pos >> 6
 	bit := uint64(1) << (pos & 63)
 	if b.bits[w]&bit == 0 {
 		b.bits[w] |= bit
@@ -47,6 +54,19 @@ func (b *blockBitmap) set(pos uint32) {
 	}
 }
 
+func (b *blockBitmap) has(pos uint32) bool {
+	return bitmapHas(b.bits, b.base, b.span, pos)
+}
+
+func bitmapHas(bits []uint64, base, span, pos uint32) bool {
+	if pos < base || pos-base >= span {
+		return false
+	}
+	pos -= base
+	return bits[pos>>6]&(uint64(1)<<(pos&63)) != 0
+}
+
+// Multi-filter intersections always use the full block range.
 func (b *blockBitmap) intersect(other *blockBitmap) {
 	n := min(len(b.bits), len(other.bits))
 	cnt := 0
@@ -117,11 +137,10 @@ func searchBounds(db *DB, series uint16) (int64, int64) {
 	return minTS, maxTS
 }
 
-func searchCandidatesSnap(snap *querySnapshot, filters []Filter, compiled []compiledFilter, hasLiveCandidate bool, slot *querySlot) (*blockBitmap, bool, error) {
+func searchCandidatesSnap(snap *querySnapshot, window [3][]uint32, filters []Filter, compiled []compiledFilter, hasLiveCandidate bool, slot *querySlot) (*blockBitmap, bool, error) {
 	series := snap.series.id
 	seriesBlocks := len(snap.fineAll) + len(snap.hourAll) + len(snap.dayAll)
 	totalSealed := len(snap.sealed)
-	invertSec := snap.head.sections[secTSInvert]
 
 	var sealed *blockBitmap
 	initializedSealed := false
@@ -141,20 +160,36 @@ func searchCandidatesSnap(snap *querySnapshot, filters []Filter, compiled []comp
 		if totalTags > 0 && len(ids)*5 >= totalTags*4 {
 			continue
 		}
-		unionBits, denseSealed, err := unionInvertBitmapSnap(snap.view, invertSec, snap.invert, series, uint8(f.Dim), ids, seriesBlocks, totalSealed, slot)
+		base, span := uint32(0), uint32(totalSealed)
+		if len(filters) == 1 && len(ids) == 1 {
+			first, last := uint32(totalSealed), uint32(0)
+			for _, indexes := range window {
+				if len(indexes) != 0 {
+					first = min(first, indexes[0])
+					last = max(last, indexes[len(indexes)-1])
+				}
+			}
+			if first <= last {
+				base, span = first, last-first+1
+			}
+		}
+		bm := newBlockBitmap(base, span)
+		globalCount, denseSealed, err := unionInvertBitmapSnap(snap.view, snap.invertSec, snap.invert, series, uint8(f.Dim), ids, seriesBlocks, totalSealed, slot, bm)
 		if err != nil {
 			return nil, false, err
 		}
 		if !denseSealed {
 			if !initializedSealed {
-				sealed = unionBits
+				sealed = bm
 				initializedSealed = true
 			} else {
-				sealed.intersect(unionBits)
+				sealed.intersect(bm)
 			}
 		}
 		if initializedSealed && sealed.count == 0 {
-			if !hasLiveCandidate {
+			// A key present only outside the window still leaves the window's
+			// coverage to the planner, as with a full-range bitmap.
+			if !hasLiveCandidate && (span == uint32(totalSealed) || globalCount == 0) {
 				return nil, true, nil
 			}
 			break
@@ -169,10 +204,22 @@ func searchCandidatesSnap(snap *querySnapshot, filters []Filter, compiled []comp
 	return sealed, false, nil
 }
 
-func unionInvertBitmapSnap(view *fileView, invertSec sectionDesc, invert []invertChunkMeta, series uint16, dim uint8, tags []uint32, seriesBlocks, totalSealed int, slot *querySlot) (*blockBitmap, bool, error) {
-	bm := newBlockBitmap(totalSealed)
+func unionInvertBitmapSnap(view *fileView, invertSec sectionDesc, invert []invertChunkMeta, series uint16, dim uint8, tags []uint32, seriesBlocks, totalSealed int, slot *querySlot, bm *blockBitmap) (int, bool, error) {
 	if len(invert) == 0 || totalSealed == 0 {
-		return bm, false, nil
+		return 0, false, nil
+	}
+	windowed := bm.span < uint32(totalSealed)
+	globalCount := 0
+	onPosting := func(_ uint64, blkID uint32) { bm.set(blkID) }
+	if windowed {
+		var last uint32
+		onPosting = func(_ uint64, blkID uint32) {
+			if blkID < uint32(totalSealed) && (globalCount == 0 || blkID != last) {
+				globalCount++
+				last = blkID
+				bm.set(blkID)
+			}
+		}
 	}
 	threshold := 0
 	if seriesBlocks >= 64 {
@@ -191,27 +238,28 @@ func unionInvertBitmapSnap(view *fileView, invertSec sectionDesc, invert []inver
 		}
 		plain, bufPtr, err := readInvertChunkFromView(view, invertSec, invert[index], totalSealed, slot)
 		if err != nil {
-			return nil, false, err
+			return 0, false, err
 		}
 		dense := false
-		err = decodeInvertChunkSorted(plain, prefixKey, tags[start:end], func(_ uint64, blkID uint32) {
-			bm.set(blkID)
-		}, func(_ uint64) {
+		err = decodeInvertChunkSorted(plain, prefixKey, tags[start:end], onPosting, func(_ uint64) {
 			dense = true
 		})
 		putReadBuf(bufPtr)
 		if err != nil {
-			return nil, false, err
+			return 0, false, err
 		}
-		if dense || (threshold > 0 && bm.count >= threshold) {
-			return nil, true, nil
+		if !windowed {
+			globalCount = bm.count
+		}
+		if dense || (threshold > 0 && globalCount >= threshold) {
+			return globalCount, true, nil
 		}
 		start = end
 	}
-	return bm, false, nil
+	return globalCount, false, nil
 }
 
-func matchingTagIDsSnap(d dictionary, series uint16, f Filter) ([]uint32, error) {
+func matchingTagIDsSnap(d dictionary, series uint16, f Filter, slot *querySlot) ([]uint32, error) {
 	if !d.snapshot || series != d.snapshotSeries || f.Dim < 0 || f.Dim >= 8 {
 		return nil, nil
 	}
@@ -223,7 +271,7 @@ func matchingTagIDsSnap(d dictionary, series uint16, f Filter) ([]uint32, error)
 		}
 		switch f.Op {
 		case TagEq:
-			id, err := dimSnap.lookup(value)
+			id, err := dimSnap.lookup(value, slot)
 			if err != nil {
 				return nil, err
 			}
@@ -232,7 +280,7 @@ func matchingTagIDsSnap(d dictionary, series uint16, f Filter) ([]uint32, error)
 			}
 		case TagPrefix:
 			var err error
-			ids, err = dimSnap.matchPrefixIDs(value, ids)
+			ids, err = dimSnap.matchPrefixIDs(value, ids, slot)
 			if err != nil {
 				return nil, err
 			}

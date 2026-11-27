@@ -239,7 +239,7 @@ func (dim *dictDim) lookupExt(value string) (uint32, bool, error) {
 	if id != 0 && !hasExtraOverride(dim.extra, id) {
 		return id, false, nil
 	}
-	id, err := dim.ext.lookupSST(value)
+	id, err := dim.ext.lookupSST(value, nil)
 	if err != nil {
 		return 0, false, err
 	}

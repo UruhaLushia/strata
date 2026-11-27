@@ -19,6 +19,19 @@ func applyMetricOp(dst *int64, v int64, op MetricOp) {
 	}
 }
 
+func initValTile(buf []int64, col decodedCol) bool {
+	switch col.mode {
+	case modeZero:
+	case modeConst:
+		for i := range buf {
+			buf[i] = int64(col.val)
+		}
+	default:
+		return true
+	}
+	return false
+}
+
 func aggregateRangeDenseAllSum(cols *[streamColumnCount]decodedCol, lo, hi, dim int, g *aggregateGroups) {
 	tagCol := cols[dim]
 	c0, c1, c2, c3 := cols[8], cols[9], cols[10], cols[11]
@@ -26,13 +39,26 @@ func aggregateRangeDenseAllSum(cols *[streamColumnCount]decodedCol, lo, hi, dim 
 	denseLen := uint32(len(dense))
 	var tagBuf [aggTileRows]uint32
 	var v0Buf, v1Buf, v2Buf, v3Buf [aggTileRows]int64
+	width := min(aggTileRows, max(0, hi-lo))
+	d0 := initValTile(v0Buf[:width], c0)
+	d1 := initValTile(v1Buf[:width], c1)
+	d2 := initValTile(v2Buf[:width], c2)
+	d3 := initValTile(v3Buf[:width], c3)
 	for base := lo; base < hi; base += aggTileRows {
 		n := min(aggTileRows, hi-base)
 		decodeTagRange(tagBuf[:n], tagCol, base)
-		decodeValRange(v0Buf[:n], c0, base)
-		decodeValRange(v1Buf[:n], c1, base)
-		decodeValRange(v2Buf[:n], c2, base)
-		decodeValRange(v3Buf[:n], c3, base)
+		if d0 {
+			decodeValRange(v0Buf[:n], c0, base)
+		}
+		if d1 {
+			decodeValRange(v1Buf[:n], c1, base)
+		}
+		if d2 {
+			decodeValRange(v2Buf[:n], c2, base)
+		}
+		if d3 {
+			decodeValRange(v3Buf[:n], c3, base)
+		}
 		for i := range n {
 			id := tagBuf[i]
 			if id >= denseLen {
@@ -60,13 +86,26 @@ func aggregateRangeDenseMixed(cols *[streamColumnCount]decodedCol, lo, hi, slotI
 	slotBase := uint64(slotIdx+1) << 32
 	var tagBuf [aggTileRows]uint32
 	var v0Buf, v1Buf, v2Buf, v3Buf [aggTileRows]int64
+	width := min(aggTileRows, max(0, hi-lo))
+	d0 := initValTile(v0Buf[:width], c0)
+	d1 := initValTile(v1Buf[:width], c1)
+	d2 := initValTile(v2Buf[:width], c2)
+	d3 := initValTile(v3Buf[:width], c3)
 	for pos, base := 0, lo; base < hi; pos, base = pos+aggTileRows, base+aggTileRows {
 		n := min(aggTileRows, hi-base)
 		decodeTagRange(tagBuf[:n], tagCol, base)
-		decodeValRange(v0Buf[:n], c0, base)
-		decodeValRange(v1Buf[:n], c1, base)
-		decodeValRange(v2Buf[:n], c2, base)
-		decodeValRange(v3Buf[:n], c3, base)
+		if d0 {
+			decodeValRange(v0Buf[:n], c0, base)
+		}
+		if d1 {
+			decodeValRange(v1Buf[:n], c1, base)
+		}
+		if d2 {
+			decodeValRange(v2Buf[:n], c2, base)
+		}
+		if d3 {
+			decodeValRange(v3Buf[:n], c3, base)
+		}
 		baseOrd := slotBase | uint64(orderOffset+pos+1)
 		for i := range n {
 			id := tagBuf[i]

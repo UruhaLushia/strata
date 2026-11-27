@@ -1,6 +1,7 @@
 package strata
 
 import (
+	"encoding/binary"
 	"math/bits"
 	"slices"
 )
@@ -139,70 +140,77 @@ func scanRangeAdaptive(col decodedCol, count, lo, hi int, f compiledFilter) rowS
 	if span <= 0 {
 		return rowSelection{}
 	}
-	p := getMatchIdx(min(span, 1024))
-	idx := *p
 	bitLimit := span / 4
 	if span <= 256 {
 		bitLimit = span
 	}
-	var bp *[]uint64
-	var b []uint64
-	cnt := 0
-	useBits := false
-	singleEq := !f.negate && len(f.ids) == 1
-	target := f.single
-	for r := lo; r < hi; r++ {
-		var ok bool
-		if singleEq {
-			ok = col.tagAt(r) == target
-		} else {
-			ok = matchesFilterID(col.tagAt(r), f)
+	var sel rowSelection
+	add := func(r int) {
+		sel.cnt++
+		if sel.mode == selBits {
+			sel.bits[r>>6] |= uint64(1) << (r & 63)
+			return
 		}
-		if !ok {
-			continue
+		if sel.idxPool == nil {
+			sel.mode = selIdx
+			sel.idxPool = getMatchIdx(min(span, 1024))
+			sel.idx = *sel.idxPool
 		}
-		cnt++
-		if !useBits {
-			idx = append(idx, int32(r))
-			if len(idx) > bitLimit {
-				bp = getRowBits((count + 63) >> 6)
-				b = *bp
-				for _, prev := range idx {
-					b[uint32(prev)>>6] |= uint64(1) << (uint32(prev) & 63)
-				}
-				*p = idx
-				putMatchIdx(p)
-				p, idx = nil, nil
-				useBits = true
+		sel.idx = append(sel.idx, int32(r))
+		if len(sel.idx) > bitLimit {
+			sel.bitsPool = getRowBits((count + 63) >> 6)
+			sel.bits = *sel.bitsPool
+			for _, prev := range sel.idx {
+				sel.bits[prev>>6] |= uint64(1) << (prev & 63)
 			}
-		} else {
-			b[uint32(r)>>6] |= uint64(1) << (uint32(r) & 63)
+			*sel.idxPool = sel.idx
+			putMatchIdx(sel.idxPool)
+			sel.idxPool, sel.idx, sel.mode = nil, nil, selBits
 		}
 	}
-	if cnt == 0 {
-		if useBits {
-			putRowBits(bp)
-		} else {
-			*p = idx
-			putMatchIdx(p)
+	if !f.negate && len(f.ids) == 1 {
+		target := f.single
+		switch col.mode {
+		case modeU8:
+			for i, v := range col.data[lo:hi] {
+				if uint32(v) == target {
+					add(lo + i)
+				}
+			}
+		case modeU16:
+			data := col.data[2*lo : 2*hi]
+			for i := range span {
+				if uint32(binary.LittleEndian.Uint16(data[2*i:])) == target {
+					add(lo + i)
+				}
+			}
+		case modeU32:
+			data := col.data[4*lo : 4*hi]
+			for i := range span {
+				if binary.LittleEndian.Uint32(data[4*i:]) == target {
+					add(lo + i)
+				}
+			}
+		case modeConst:
+			if uint32(col.val) == target {
+				return rowSelection{mode: selRange, lo: lo, hi: hi, cnt: span}
+			}
 		}
-		return rowSelection{}
+	} else {
+		for r := lo; r < hi; r++ {
+			if matchesFilterID(col.tagAt(r), f) {
+				add(r)
+			}
+		}
 	}
-	if cnt == span {
-		if useBits {
-			putRowBits(bp)
-		} else {
-			*p = idx
-			putMatchIdx(p)
-		}
+	if sel.idxPool != nil {
+		*sel.idxPool = sel.idx
+	}
+	if sel.cnt == span {
+		sel.release()
 		return rowSelection{mode: selRange, lo: lo, hi: hi, cnt: span}
 	}
-	if useBits {
-		*bp = b
-		return rowSelection{mode: selBits, cnt: cnt, bits: b, bitsPool: bp}
-	}
-	*p = idx
-	return rowSelection{mode: selIdx, cnt: cnt, idx: idx, idxPool: p}
+	return sel
 }
 
 func filterCols(count int, filters []compiledFilter, allowDim0BS bool, loadCol func(int) (decodedCol, error), modeOf func(int) (byte, uint64)) (rowSelection, error) {

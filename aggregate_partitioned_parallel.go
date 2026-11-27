@@ -19,7 +19,7 @@ func calcPartitionWorkers(policy memPolicy, maxWorkers, activeCount int, ops [4]
 }
 
 func runRemainingPartitions(ctx context.Context, pq *preparedQuery, activeParts []int, partBits []uint64, partWords, dim, topK, maxWorkers, arenaBudget int, ps *partState, h *topKHeap, slot *querySlot) error {
-	s, db := &pq.execSeries, pq.execDB
+	s, db := &pq.execSeries, &pq.exec
 	partWorkers := calcPartitionWorkers(db.policy, maxWorkers, len(activeParts), s.cfg.RowOps, arenaBudget)
 	ps.bitsRow = nil
 	ps.trackSummary = false
@@ -56,7 +56,7 @@ func runRemainingPartitions(ctx context.Context, pq *preparedQuery, activeParts 
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			ws := &querySlot{codecs: pq.execDB.codecs}
+			ws := &querySlot{codecs: db.codecs}
 			defer ws.close()
 			wReader := newDictTagReader(db.dict, s.id, dimU8, ws)
 			defer wReader.close()
@@ -125,7 +125,7 @@ func runOnePartition(ctx context.Context, pq *preparedQuery, part int, partBits 
 	ps.loID = uint32(part) << aggPartitionShift
 	ps.hiID = ps.loID + aggPartitionSize
 	wIdx, bit := part>>6, uint64(1)<<(part&63)
-	s, db, plans, filters := &pq.execSeries, pq.execDB, pq.plans, pq.compiled
+	s, plans, filters := &pq.execSeries, pq.plans, pq.compiled
 	for index := range plans {
 		if partBits[index*partWords+wIdx]&bit == 0 {
 			continue
@@ -136,7 +136,7 @@ func runOnePartition(ctx context.Context, pq *preparedQuery, part int, partBits 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		block, bufPtr, err := mergeSlot(db, plans[index].block, pq.sources, s)
+		block, bufPtr, err := mergeSlot(pq.exec.view, plans[index].block, pq.sources, s)
 		if err != nil {
 			putReadBuf(bufPtr)
 			return err

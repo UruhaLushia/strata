@@ -50,8 +50,7 @@ func (src *blockSource) isCandidate(pos uint32) bool {
 	if src.candBits == nil {
 		return true
 	}
-	w := pos >> 6
-	return int(w) < len(src.candBits) && (src.candBits[w]&(uint64(1)<<(pos&63))) != 0
+	return bitmapHas(src.candBits, src.candBase, src.candSpan, pos)
 }
 
 func (src *blockSource) eachSlotCandidate(start, end int64, res byte, rules []resetRule, onSealed func(sealedMeta), onLive func(*sealedBlock)) {

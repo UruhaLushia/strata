@@ -116,6 +116,126 @@ func TestColumnarFilterPushdownAndAdaptiveSelection(t *testing.T) {
 	}
 }
 
+func TestColumnarSingleEqRangeSelection(t *testing.T) {
+	const lo, hi = 11, 311
+	for _, colType := range []struct {
+		mode   byte
+		width  int
+		target uint32
+	}{
+		{modeU8, 1, 0x81}, {modeU16, 2, 0x8123}, {modeU32, 4, 0x81234567},
+	} {
+		for _, tc := range []struct {
+			stride int
+			hi     int
+			mode   selMode
+		}{{0, hi, selRange}, {10, hi, selIdx}, {2, hi, selBits}, {2, lo + 256, selIdx}, {1, hi, selRange}} {
+			data := make([]byte, (hi+1)*colType.width)
+			var want []int32
+			for i := lo; i < tc.hi && tc.stride != 0; i += tc.stride {
+				for j := range colType.width {
+					data[i*colType.width+j] = byte(colType.target >> (8 * j))
+				}
+				want = append(want, int32(i))
+			}
+			col := decodedCol{mode: colType.mode, data: data}
+			f := compiledFilter{ids: []uint32{colType.target}, single: colType.target}
+			sel := scanRangeAdaptive(col, hi+1, lo, tc.hi, f)
+			if sel.mode != tc.mode || sel.count() != len(want) {
+				t.Fatalf("width %d, stride %d: mode=%d count=%d", colType.width, tc.stride, sel.mode, sel.count())
+			}
+			isRange, start, got := sel.sliceRows(0, sel.count(), nil)
+			if isRange && len(want) > 0 && start != lo || !isRange && !slices.Equal(got, want) {
+				t.Fatalf("width %d, stride %d: rows at %d or %v, want %v", colType.width, tc.stride, start, got, want)
+			}
+			sel.release()
+			if colType.width < 4 && tc.stride == 1 {
+				f.single += 1 << (8 * colType.width)
+				f.ids[0] = f.single
+				miss := scanRangeAdaptive(col, hi+1, lo, hi, f)
+				if miss.count() != 0 || miss.idxPool != nil || miss.bitsPool != nil {
+					t.Fatalf("width %d accepted an oversized target", colType.width)
+				}
+			}
+		}
+	}
+}
+
+func TestAppendPageConstantTags(t *testing.T) {
+	const series = 1
+	d := dictionary{dims: map[dictDimKey]*dictDim{{series: series, dim: 1}: {extra: map[uint32]string{7: "fixed"}}}}
+	var cols [streamColumnCount]decodedCol
+	cols[0], cols[1] = decodedCol{mode: modeConst}, decodedCol{mode: modeConst, val: 7}
+	cols[8] = decodedCol{mode: modeU8, data: []byte{10, 20, 30, 40}}
+	for i := 9; i < 12; i++ {
+		cols[i] = decodedCol{mode: modeZero}
+	}
+	cols[12] = decodedCol{mode: modeConst, val: 1}
+	page := PageResult{Rows: make([]PageRow, 0, 2), tagBuf: make([]string, 0, 4)}
+	mustTestOK(t, appendPageFromCols(&cols, SegmentMeta{}, d, series, 2, false, 0, []int32{1, 3}, 2, &page))
+	for i, row := range page.Rows {
+		if !slices.Equal(row.Tags, []string{"", "fixed"}) || row.Values[0] != int64(20+i*20) || row.Mask != 1 {
+			t.Fatalf("row %d = %+v", i, row)
+		}
+	}
+	view := columnarBlockView{plain: []byte{0xff}, count: 4, codecID: codec.IDZstd}
+	view.descs[0] = columnStreamDesc{mode: modeConst}
+	view.descs[1] = columnStreamDesc{mode: modeConst, value: 7}
+	view.descs[8] = columnStreamDesc{mode: modeU8, width: 1, length: 1, rawLen: 4}
+	slot := &querySlot{codecs: testCodecTable(t, zstd.New(zstd.Fastest))}
+	defer slot.close()
+	page.Rows, page.tagBuf = page.Rows[:0], page.tagBuf[:0]
+	if err := appendPageFromStream(view, SegmentMeta{}, d, series, 2, true, 0, nil, 1, slot, &page); err == nil {
+		t.Fatal("constant tag materialization swallowed a column codec error")
+	}
+	d.dims[dictDimKey{series: series, dim: 1}] = &dictDim{
+		tailBase: 8, ext: &dictExtDim{baseNextID: 8, fwdPages: []dictPageDesc{{length: 1}}},
+	}
+	page.Rows, page.tagBuf = page.Rows[:0], page.tagBuf[:0]
+	mustTestOK(t, appendPageFromCols(&cols, SegmentMeta{}, d, series, 2, true, 0, nil, 0, &page))
+	if err := appendPageFromCols(&cols, SegmentMeta{}, d, series, 2, true, 0, nil, 1, &page); err == nil {
+		t.Fatal("constant tag resolution swallowed an unreadable dictionary page")
+	}
+}
+
+func TestDenseRangeConstantMetrics(t *testing.T) {
+	const lo, hi, slotIdx, orderOffset = 4, 133, 2, 17
+	var cols [streamColumnCount]decodedCol
+	tags, values := make([]byte, hi), make([]byte, hi)
+	for i := range tags {
+		tags[i], values[i] = byte(i%3), byte(i)
+	}
+	cols[0] = decodedCol{mode: modeU8, data: tags}
+	cols[8] = decodedCol{mode: modeConst, val: 7}
+	cols[9] = decodedCol{mode: modeConst, val: ^uint64(4)}
+	cols[10] = decodedCol{mode: modeZero}
+	cols[11] = decodedCol{mode: modeU8, data: values}
+	for _, ops := range [][4]MetricOp{{OpSum, OpSum, OpSum, OpSum}, {OpSum, OpMin, OpMax, OpLast}} {
+		newGroups := func() aggregateGroups {
+			lastCount, lastIdx := countLastOps(ops)
+			g := aggregateGroups{dense: make([]Summary, 2), lastCount: lastCount, lastIdx: lastIdx}
+			if lastCount == 1 {
+				g.denseLastOrder = make([]uint64, 2)
+			}
+			g.add(1, Summary{Values: [4]int64{9, 3, 0, 1}, Mask: 0xb}, ops, 1)
+			return g
+		}
+		got, want := newGroups(), newGroups()
+		for i := lo; i < hi; i++ {
+			order := uint64(slotIdx+1)<<32 | uint64(orderOffset+i-lo+1)
+			want.add(uint32(tags[i]), Summary{Values: [4]int64{7, -5, 0, int64(values[i])}, Mask: 0xf}, ops, order)
+		}
+		if got.lastCount == 0 {
+			aggregateRangeDenseAllSum(&cols, lo, hi, 0, &got)
+		} else {
+			aggregateRangeDenseMixed(&cols, lo, hi, slotIdx, orderOffset, 0, &got, ops)
+		}
+		if !slices.Equal(got.dense, want.dense) || !slices.Equal(got.denseLastOrder, want.denseLastOrder) {
+			t.Fatalf("ops %v: summaries %v/order %v, want %v/%v", ops, got.dense, got.denseLastOrder, want.dense, want.denseLastOrder)
+		}
+	}
+}
+
 func TestSoAScanBatchAndColCacheSelectivityFallback(t *testing.T) {
 	var view columnarBlockView
 	view.count = 10000

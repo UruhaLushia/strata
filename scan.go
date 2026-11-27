@@ -125,12 +125,12 @@ func (s *Series) scanWithDefaultWindow(ctx context.Context, q ScanQuery, default
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		block, bufPtr, err := mergeSlot(pq.execDB, plan.block, pq.sources, &pq.execSeries)
+		block, bufPtr, err := mergeSlot(pq.exec.view, plan.block, pq.sources, &pq.execSeries)
 		if err != nil {
 			putReadBuf(bufPtr)
 			return err
 		}
-		err = scanSlotBlock(ctx, block, plan.meta, pq.execDB, s.id, arity, dimMask, metricMask, batchSize, allowDim0BS, pq.compiled, slot, &rowIdxBuf, fn)
+		err = scanSlotBlock(ctx, block, plan.meta, &pq.exec, s.id, arity, dimMask, metricMask, batchSize, allowDim0BS, pq.compiled, slot, &rowIdxBuf, fn)
 		putReadBuf(bufPtr)
 		if err != nil {
 			if errors.Is(err, ErrStopScan) {
@@ -142,7 +142,7 @@ func (s *Series) scanWithDefaultWindow(ctx context.Context, q ScanQuery, default
 	return nil
 }
 
-func scanSlotBlock(ctx context.Context, block sealedBlock, meta SegmentMeta, db *DB, series uint16, arity int, dimMask, metricMask uint8, batchSize int, allowDim0BS bool, filters []compiledFilter, slot *querySlot, rowIdxBuf *[]int32, fn func(ScanBatch) error) error {
+func scanSlotBlock(ctx context.Context, block sealedBlock, meta SegmentMeta, db *queryExec, series uint16, arity int, dimMask, metricMask uint8, batchSize int, allowDim0BS bool, filters []compiledFilter, slot *querySlot, rowIdxBuf *[]int32, fn func(ScanBatch) error) error {
 	if block.encoded != nil {
 		if isStreamBlock(block.encoded) {
 			view, err := parseColumnarBlock(block.encoded, block.codecID)
@@ -160,7 +160,7 @@ func scanSlotBlock(ctx context.Context, block sealedBlock, meta SegmentMeta, db 
 	return scanIDRowsBlock(ctx, block.rows, block.summary, meta, db.dict, series, arity, dimMask, metricMask, batchSize, filters, slot, fn)
 }
 
-func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summary, meta SegmentMeta, db *DB, series uint16, arity int, dimMask, metricMask uint8, batchSize int, allowDim0BS bool, filters []compiledFilter, slot *querySlot, rowIdxBuf *[]int32, fn func(ScanBatch) error) error {
+func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summary, meta SegmentMeta, db *queryExec, series uint16, arity int, dimMask, metricMask uint8, batchSize int, allowDim0BS bool, filters []compiledFilter, slot *querySlot, rowIdxBuf *[]int32, fn func(ScanBatch) error) error {
 	colMask := uint16(dimMask) | (uint16(metricMask) << 8) | (uint16(1) << 12)
 	arenaBudget := clampInt(int(db.policy.queryBytes/8), 128<<10, 1<<20)
 	cache := newBlockColCache(view, colMask, filterColMask(filters), arenaBudget, slot)

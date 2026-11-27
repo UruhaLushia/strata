@@ -73,7 +73,7 @@ func (ps *partState) addRow(id uint32, v0, v1, v2, v3 int64, mask uint8, order u
 }
 
 func executePartitionedTopK(ctx context.Context, pq *preparedQuery, out *AggregateResult, dim, topK, maxWorkers int, slot *querySlot) ([]GroupRow, error) {
-	s, db, plans, filters := &pq.execSeries, pq.execDB, pq.plans, pq.compiled
+	s, db, plans, filters := &pq.execSeries, &pq.exec, pq.plans, pq.compiled
 	if len(plans) == 0 {
 		return make([]GroupRow, 0), nil
 	}
@@ -111,7 +111,7 @@ func executePartitionedTopK(ctx context.Context, pq *preparedQuery, out *Aggrega
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		block, bufPtr, err := mergeSlot(db, plans[index].block, pq.sources, s)
+		block, bufPtr, err := mergeSlot(db.view, plans[index].block, pq.sources, s)
 		if err != nil {
 			putReadBuf(bufPtr)
 			return nil, err

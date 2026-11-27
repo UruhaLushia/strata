@@ -7,13 +7,12 @@ import (
 )
 
 type aggSlotResult struct {
-	meta    SegmentMeta
 	summary Summary
 	matched bool
 	err     error
 }
 
-func executeAggregateSlots(ctx context.Context, res *queryResult, out *AggregateResult, plans []plannedSlot, sources querySources, s *Series, db *DB, filters []compiledFilter, groupDims []int, maxWorkers, candidateUpper int, slot *querySlot) ([]aggregateGroups, error) {
+func executeAggregateSlots(ctx context.Context, res *queryResult, out *AggregateResult, plans []plannedSlot, sources querySources, s *Series, db *queryExec, filters []compiledFilter, groupDims []int, maxWorkers, candidateUpper int, slot *querySlot) ([]aggregateGroups, error) {
 	filtered := filters != nil
 	var groupUpper int
 	if filtered && len(groupDims) == 1 && candidateUpper > 0 {
@@ -54,20 +53,16 @@ func executeAggregateSlots(ctx context.Context, res *queryResult, out *Aggregate
 	}
 	arenaBudget := clampInt(int(db.policy.queryBytes/int64(max(workers*4, 8))), 128<<10, 1<<20)
 
-	results := make([]aggSlotResult, len(plans))
-	runSlot := func(index int, localGroups []aggregateGroups, workerSlot *querySlot) {
+	runSlot := func(index int, localGroups []aggregateGroups, workerSlot *querySlot) aggSlotResult {
 		if err := ctx.Err(); err != nil {
-			results[index].err = err
-			return
+			return aggSlotResult{err: err}
 		}
-		plan := plans[index]
-		block, bufPtr, err := mergeSlot(db, plan.block, sources, s)
+		block, bufPtr, err := mergeSlot(db.view, plans[index].block, sources, s)
 		if bufPtr != nil {
 			defer putReadBuf(bufPtr)
 		}
 		if err != nil {
-			results[index].err = err
-			return
+			return aggSlotResult{err: err}
 		}
 		var summary Summary
 		var matched bool
@@ -76,77 +71,74 @@ func executeAggregateSlots(ctx context.Context, res *queryResult, out *Aggregate
 		} else {
 			summary, matched = aggregateDecodedRows(block.rows, block.summary, index, filters, localGroups, groupDims, s.cfg.Arity, s.cfg.RowOps)
 		}
-		results[index] = aggSlotResult{meta: plan.meta, summary: summary, matched: matched, err: err}
-	}
-
-	var mergedGroups []aggregateGroups
-	if workers <= 1 {
-		mergedGroups = makeGroups()
-		for i := range plans {
-			runSlot(i, mergedGroups, slot)
-			if results[i].err != nil {
-				return nil, results[i].err
-			}
-		}
-	} else {
-		workerGroups := make([][]aggregateGroups, workers)
-		var next atomic.Uint32
-		var wg sync.WaitGroup
-		wg.Add(workers)
-		for w := range workers {
-			go func(workerID int) {
-				defer wg.Done()
-				ws := slot
-				if workerID > 0 {
-					ws = &querySlot{codecs: db.codecs}
-					defer ws.close()
-				}
-				var local []aggregateGroups
-				for {
-					index := int(next.Add(1) - 1)
-					if index >= len(plans) {
-						return
-					}
-					if local == nil && len(groupDims) > 0 {
-						local = makeGroups()
-						workerGroups[workerID] = local
-					}
-					runSlot(index, local, ws)
-				}
-			}(w)
-		}
-		wg.Wait()
-		if len(groupDims) > 0 {
-			for _, wgLocal := range workerGroups {
-				if wgLocal == nil {
-					continue
-				}
-				if mergedGroups == nil {
-					mergedGroups = wgLocal
-					continue
-				}
-				for i := range mergedGroups {
-					mergedGroups[i].mergeFrom(&wgLocal[i], s.cfg.RowOps)
-				}
-			}
-			if mergedGroups == nil {
-				mergedGroups = makeGroups()
-			}
-		}
+		return aggSlotResult{summary: summary, matched: matched, err: err}
 	}
 
 	out.Segments = getSegmentSummarySlice(len(plans))
-	var order uint64
-	for _, sr := range results {
+	merge := func(index int, sr aggSlotResult) error {
 		if sr.err != nil {
-			return nil, sr.err
+			return sr.err
 		}
-		if !sr.matched {
+		if sr.matched {
+			out.Segments = append(out.Segments, SegmentSummary{Meta: plans[index].meta, Summary: sr.summary})
+			order := uint64(len(out.Segments))
+			mergeSummary(&res.Summary, sr.summary, s.cfg.SummaryOps, order, order-1)
+		}
+		return nil
+	}
+	if workers <= 1 {
+		groups := makeGroups()
+		for i := range plans {
+			if err := merge(i, runSlot(i, groups, slot)); err != nil {
+				return nil, err
+			}
+		}
+		return groups, nil
+	}
+
+	results := make([]aggSlotResult, len(plans))
+	workerGroups := make([][]aggregateGroups, workers)
+	var next atomic.Uint32
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Go(func() {
+			ws := slot
+			if w > 0 {
+				ws = &querySlot{codecs: db.codecs}
+				defer ws.close()
+			}
+			var local []aggregateGroups
+			for {
+				index := int(next.Add(1) - 1)
+				if index >= len(plans) {
+					return
+				}
+				if local == nil && len(groupDims) > 0 {
+					local = makeGroups()
+					workerGroups[w] = local
+				}
+				results[index] = runSlot(index, local, ws)
+			}
+		})
+	}
+	wg.Wait()
+	for i, sr := range results {
+		if err := merge(i, sr); err != nil {
+			return nil, err
+		}
+	}
+	var mergedGroups []aggregateGroups
+	for _, local := range workerGroups {
+		if local == nil {
 			continue
 		}
-		out.Segments = append(out.Segments, SegmentSummary{Meta: sr.meta, Summary: sr.summary})
-		order++
-		mergeSummary(&res.Summary, sr.summary, s.cfg.SummaryOps, order, order-1)
+		if mergedGroups == nil {
+			mergedGroups = local
+			continue
+		}
+		for i := range mergedGroups {
+			mergedGroups[i].mergeFrom(&local[i], s.cfg.RowOps)
+		}
 	}
 	return mergedGroups, nil
 }

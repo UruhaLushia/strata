@@ -2,7 +2,7 @@ package strata
 
 import "errors"
 
-func mergeSlot(db *DB, chosen sealedMeta, sources querySources, s *Series) (sealedBlock, *[]byte, error) {
+func mergeSlot(view *fileView, chosen sealedMeta, sources querySources, s *Series) (sealedBlock, *[]byte, error) {
 	var source *blockSource
 	switch chosen.res {
 	case resMinuteHR:
@@ -33,16 +33,16 @@ func mergeSlot(db *DB, chosen sealedMeta, sources querySources, s *Series) (seal
 		if first.live != nil {
 			return *first.live, nil, nil
 		}
-		if db.view == nil {
+		if view == nil {
 			return sealedBlock{}, nil, errors.New("strata: missing file view")
 		}
-		raw, bufPtr, err := db.view.readRawPooled(first.sealed.offset, first.sealed.length, first.sealed.crc)
+		raw, bufPtr, err := view.readRawPooled(first.sealed.offset, first.sealed.length, first.sealed.crc)
 		if err != nil {
 			return sealedBlock{}, nil, err
 		}
 		loaded := first.sealed.toBlock()
 		loaded.encoded = raw
-		loaded.codecID = db.view.blocks.codec
+		loaded.codecID = view.blocks.codec
 		return loaded, bufPtr, nil
 	}
 	var merged sealedBlock
@@ -54,7 +54,10 @@ func mergeSlot(db *DB, chosen sealedMeta, sources querySources, s *Series) (seal
 			b = *cand.live
 			b.rows = cloneRows(b.rows)
 		} else {
-			b, err = loadSealedBlockFromView(db.view, db.head.sections[secTSBlocks], cand.sealed)
+			if view == nil {
+				return sealedBlock{}, nil, errors.New("strata: missing source file view")
+			}
+			b, err = loadSealedBlockFromView(view, view.blocks, cand.sealed)
 			if err != nil {
 				return sealedBlock{}, nil, err
 			}

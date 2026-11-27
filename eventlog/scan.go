@@ -100,7 +100,13 @@ func (l *Log) Scan(ctx context.Context, opts ScanOptions, fn func(Record) error)
 		l.mu.Unlock()
 		return ScanResult{}, ErrClosed
 	}
-	shards := slices.Clone(l.shards)
+	var shardStack [4]shard
+	var shards []shard
+	if len(l.shards) <= len(shardStack) {
+		shards = shardStack[:copy(shardStack[:], l.shards)]
+	} else {
+		shards = slices.Clone(l.shards)
+	}
 	l.mu.Unlock()
 
 	var result ScanResult
@@ -219,11 +225,11 @@ func (l *Log) scanShard(ctx context.Context, f *os.File, s shard, opts ScanOptio
 				StreamID:    binary.LittleEndian.Uint16(header[12:]),
 				Payload:     body[start:end:end],
 			})
-			if errors.Is(err, ErrStopScan) {
-				r.Stopped = true
-				return nil
-			}
 			if err != nil {
+				if errors.Is(err, ErrStopScan) {
+					r.Stopped = true
+					return nil
+				}
 				return err
 			}
 		}

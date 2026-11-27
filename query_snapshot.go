@@ -15,10 +15,9 @@ type querySources struct {
 
 type querySnapshot struct {
 	from, to        int64
-	opts            Options
 	policy          memPolicy
 	codecs          *codecTable
-	head            superblock
+	invertSec       sectionDesc
 	view            *fileView
 	series          Series
 	dict            dictionary
@@ -38,22 +37,6 @@ func (s *querySnapshot) release() {
 		s.view.release()
 		s.view = nil
 	}
-}
-
-func (s *querySnapshot) buildExecDB() *DB {
-	execDB := &DB{
-		dict:   s.dict,
-		opts:   s.opts,
-		policy: s.policy,
-		codecs: s.codecs,
-		head:   s.head,
-		view:   s.view,
-	}
-	if s.view != nil {
-		execDB.data = s.view.data
-		execDB.mapped = s.view.mapped
-	}
-	return execDB
 }
 
 func dictionarySnapshotForQuery(d dictionary, series uint16, filters []Filter) dictionary {
@@ -157,9 +140,21 @@ func captureQuerySnapshot(db *DB, s *Series, ws windowSpec, filters []Filter) (q
 			return snap, planFrom, true, nil
 		case dim.ext == nil && len(dim.extra) == 0:
 			dim.revMu.RLock()
-			snap.livePreFiltered = dim.byKey != nil
-			if snap.livePreFiltered {
+			switch {
+			case dim.byKey != nil:
+				snap.livePreFiltered = true
 				snap.liveTagID = dim.byKey[val]
+			case dim.sorted != nil && dim.nextID-min(dim.nextID, max(dim.sortedNextID, 1)) <= 64:
+				snap.livePreFiltered = true
+				snap.liveTagID = dim.lookupLocked(val)
+			case dim.nextID > 0 && dim.nextID-1 <= 64:
+				snap.livePreFiltered = true
+				for id := uint32(1); id < dim.nextID; id++ {
+					if dim.resolveArena(id) == val {
+						snap.liveTagID = id
+						break
+					}
+				}
 			}
 			dim.revMu.RUnlock()
 			if snap.livePreFiltered && snap.liveTagID == 0 {
@@ -173,10 +168,9 @@ func captureQuerySnapshot(db *DB, s *Series, ws windowSpec, filters []Filter) (q
 	execSeries := *s
 	execSeries.rules = rules
 
-	snap.opts = db.opts
 	snap.policy = db.policy
 	snap.codecs = db.codecs
-	snap.head = db.head
+	snap.invertSec = db.head.sections[secTSInvert]
 	snap.view = db.view.acquire()
 	snap.series = execSeries
 	snap.sealed = db.sealed
@@ -274,10 +268,12 @@ func buildSummarySourcesLocked(db *DB, s *Series, from, to int64) querySources {
 
 func buildSealedQuerySources(sealed []sealedMeta, seriesID uint16, fineIdx, hourIdx, dayIdx []uint32, rules []resetRule, from, to int64, sealedBits *blockBitmap, liveFine []sealedBlock) querySources {
 	var candBits []uint64
+	var candBase, candSpan uint32
 	var fineCand, hourCand, dayCand []uint32
 	totalIdx := len(fineIdx) + len(hourIdx) + len(dayIdx)
 	if sealedBits != nil {
 		candBits = sealedBits.bits
+		candBase, candSpan = sealedBits.base, sealedBits.span
 		if sealedBits.count*4 < totalIdx {
 			fineCand = make([]uint32, 0)
 			hourCand = make([]uint32, 0)
@@ -285,9 +281,9 @@ func buildSealedQuerySources(sealed []sealedMeta, seriesID uint16, fineIdx, hour
 			for wIdx, word := range candBits {
 				for word != 0 {
 					tz := bits.TrailingZeros64(word)
-					pos := uint32(wIdx<<6 + tz)
+					pos := candBase + uint32(wIdx<<6+tz)
 					word &= word - 1
-					if int(pos) >= len(sealed) {
+					if !sealedBits.has(pos) || int(pos) >= len(sealed) {
 						break
 					}
 					b := &sealed[pos]
@@ -310,24 +306,21 @@ func buildSealedQuerySources(sealed []sealedMeta, seriesID uint16, fineIdx, hour
 					}
 				}
 			}
-			slices.Sort(fineCand)
-			slices.Sort(hourCand)
-			slices.Sort(dayCand)
 		}
 	}
 
 	return querySources{
 		fine: blockSource{
 			sealed: sealed, idx: fineIdx, candIdx: fineCand, live: liveFine,
-			candBits: candBits, filterFine: true, rules: rules,
+			candBits: candBits, candBase: candBase, candSpan: candSpan, filterFine: true, rules: rules,
 		},
 		hours: blockSource{
 			sealed: sealed, idx: hourIdx, candIdx: hourCand,
-			candBits: candBits, rules: rules,
+			candBits: candBits, candBase: candBase, candSpan: candSpan, rules: rules,
 		},
 		days: blockSource{
 			sealed: sealed, idx: dayIdx, candIdx: dayCand,
-			candBits: candBits, rules: rules,
+			candBits: candBits, candBase: candBase, candSpan: candSpan, rules: rules,
 		},
 	}
 }

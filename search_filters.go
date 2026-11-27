@@ -15,13 +15,13 @@ type compiledFilter struct {
 	bits     []uint64
 }
 
-func compileFiltersSnap(dict dictionary, series uint16, arity int, filters []Filter) ([]compiledFilter, error) {
+func compileFiltersSnap(dict dictionary, series uint16, arity int, filters []Filter, slot *querySlot) ([]compiledFilter, error) {
 	out := make([]compiledFilter, len(filters))
 	for i, filter := range filters {
 		var ids []uint32
 		if filter.Dim >= 0 && filter.Dim < arity {
 			var err error
-			ids, err = matchingTagIDsSnap(dict, series, filter)
+			ids, err = matchingTagIDsSnap(dict, series, filter, slot)
 			if err != nil {
 				return nil, err
 			}
@@ -51,6 +51,9 @@ func compileFiltersSnap(dict dictionary, series uint16, arity int, filters []Fil
 }
 
 func orderCompiledFilters(filters []Filter, compiled []compiledFilter) ([]Filter, []compiledFilter) {
+	if len(filters) <= 1 {
+		return filters, compiled
+	}
 	type pair struct {
 		filter   Filter
 		compiled compiledFilter
