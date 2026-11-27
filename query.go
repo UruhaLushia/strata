@@ -61,31 +61,46 @@ func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts query
 		Exact: true,
 	}
 
+	fineIdx := sealedRangeIndexes(snap.sealed, snap.fineAll, planFrom, pq.to)
+	hourIdx := sealedRangeIndexes(snap.sealed, snap.hourAll, planFrom, pq.to)
+	dayIdx := sealedRangeIndexes(snap.sealed, snap.dayAll, planFrom, pq.to)
 	var sealedBits *blockBitmap
 	if len(filters) > 0 {
-		compiled := compileFiltersSnap(snap.dict, snap.series.id, snap.series.cfg.Arity, filters)
-		ordered, orderedCompiled := orderCompiledFilters(filters, compiled)
+		ordered := filters
+		var compiled []compiledFilter
+		hasLiveCandidate := snap.hasLiveMatch
+		if snap.livePreFiltered {
+			id := snap.liveTagID
+			compiled = []compiledFilter{{dim: filters[0].Dim, ids: []uint32{id}, single: id}}
+		} else {
+			compiled = compileFiltersSnap(snap.dict, snap.series.id, snap.series.cfg.Arity, filters)
+			ordered, compiled = orderCompiledFilters(filters, compiled)
+		}
 		for i, f := range ordered {
-			if !f.Negate && len(orderedCompiled[i].ids) == 0 {
+			if !f.Negate && len(compiled[i].ids) == 0 {
 				pq.empty = true
 				return pq, nil
 			}
 		}
-		hasLiveCandidate := filterLiveCandidates(snap.liveFine, orderedCompiled)
-		var emptyCand bool
-		sealedBits, emptyCand, err = searchCandidatesSnap(&snap, ordered, orderedCompiled, hasLiveCandidate, slot)
-		if err != nil {
-			return preparedQuery{}, err
+		if !snap.livePreFiltered {
+			hasLiveCandidate = filterLiveCandidates(snap.liveFine, compiled)
+		}
+		emptyCand := !hasLiveCandidate
+		if len(fineIdx)+len(hourIdx)+len(dayIdx) != 0 {
+			sealedBits, emptyCand, err = searchCandidatesSnap(&snap, ordered, compiled, hasLiveCandidate, slot)
+			if err != nil {
+				return preparedQuery{}, err
+			}
 		}
 		if emptyCand {
 			pq.empty = true
 			return pq, nil
 		}
-		pq.compiled = orderedCompiled
+		pq.compiled = compiled
 		pq.qres.sparse = true
 	}
 
-	pq.sources = buildQuerySourcesFromSnap(&snap, planFrom, pq.to, sealedBits)
+	pq.sources = buildQuerySourcesFromSnap(&snap, fineIdx, hourIdx, dayIdx, planFrom, pq.to, sealedBits)
 	pq.execSeries = snap.series
 	pq.execDB = snap.buildExecDB()
 

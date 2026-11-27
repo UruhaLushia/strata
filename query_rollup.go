@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// RollupLocalHours merges hour-resolution SegmentSummary entries into local timezone buckets (DST-aware).
+// RollupLocalHours merges minute and hour segments into local hour buckets (DST-aware).
 func RollupLocalHours(segments []SegmentSummary, loc *time.Location, ops [4]MetricOp) []LocalHourBucket {
 	if len(segments) == 0 {
 		return nil
@@ -19,7 +19,7 @@ func RollupLocalHours(segments []SegmentSummary, loc *time.Location, ops [4]Metr
 	}
 	groups := make(map[key]*LocalHourBucket)
 	for _, seg := range segments {
-		if seg.Meta.Resolution != time.Hour {
+		if seg.Meta.Resolution != time.Minute && seg.Meta.Resolution != time.Hour {
 			continue
 		}
 		t := seg.Meta.CoveredFrom.In(loc)

@@ -42,16 +42,26 @@ func orderEntryBytes(ops [4]MetricOp) int64 {
 	}
 }
 
-func newAggregateGroups(d dictionary, series uint16, dim int, filtered bool, ops [4]MetricOp) aggregateGroups {
+func newAggregateGroups(d dictionary, series uint16, dim int, filtered bool, ops [4]MetricOp, groupUpper int, budget int64) aggregateGroups {
 	lastCount, lastIdx := countLastOps(ops)
 	maxID := d.dimMaxID(series, dim)
+	g := aggregateGroups{lastCount: lastCount, lastIdx: lastIdx}
+	if maxID > 128 && groupUpper > 0 && int64(groupUpper)*2 < int64(maxID) {
+		slots := 64
+		entryBytes := 40 + orderEntryBytes(ops)
+		for int64(slots)*7 <= int64(groupUpper)*10 && int64(slots)*2*entryBytes <= budget {
+			slots *= 2
+		}
+		g.open.init(slots, lastCount)
+		return g
+	}
 	limit := uint32(denseGroupLimitUnfiltered)
 	if filtered {
 		limit = denseGroupLimitFiltered
 	}
 	if maxID <= limit {
 		n := int(maxID) + 1
-		g := aggregateGroups{dense: make([]Summary, n), lastCount: lastCount, lastIdx: lastIdx}
+		g.dense = make([]Summary, n)
 		if lastCount == 1 {
 			g.denseLastOrder = make([]uint64, n)
 		} else if lastCount >= 2 {
@@ -59,7 +69,6 @@ func newAggregateGroups(d dictionary, series uint16, dim int, filtered bool, ops
 		}
 		return g
 	}
-	g := aggregateGroups{lastCount: lastCount, lastIdx: lastIdx}
 	g.open.lastCount = lastCount
 	return g
 }

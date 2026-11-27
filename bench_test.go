@@ -582,3 +582,67 @@ func BenchmarkGateway90ExtremeDestIPTopK(b *testing.B) {
 		res.Release()
 	}
 }
+
+func BenchmarkGateway90OutboundLookup(b *testing.B) {
+	requireGatewayStress(b)
+	const outboundDim = 2
+	for _, mode := range []struct {
+		name    string
+		extreme bool
+		dim     int
+		miss    string
+	}{
+		{"RealisticDomain", false, 0, "unknown.example"},
+		{"ExtremeDestIP", true, 5, "2001:db8:ffff::1"},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			fx := buildGateway90DayFixtureMode(b, mode.extreme)
+			db, s := openGateway90Fixture(b, fx, false)
+			defer db.Close()
+			dim := db.dict.dims[dictDimKey{series: s.id, dim: uint8(mode.dim)}]
+			if len(db.live) == 0 || dim == nil || (dim.ext != nil) != mode.extreme {
+				b.Fatal("fixture must include live rows and the expected dictionary backend")
+			}
+			// Pick a row five minutes before the end, in the sealed minute tier.
+			rowID := fx.rawRows - 6*30
+			hit := gatewayDomain(rowID)
+			if mode.extreme {
+				hit = gatewayDestMode(rowID, true)
+			}
+			for _, win := range []struct {
+				name string
+				span time.Duration
+			}{{"15m", 15 * time.Minute}, {"1h", time.Hour}, {"24h", 24 * time.Hour}, {"7d", 7 * 24 * time.Hour}} {
+				for _, lookup := range []struct {
+					name, value string
+					hit         bool
+				}{{"Hit", hit, true}, {"Miss", mode.miss, false}} {
+					b.Run(win.name+"/"+lookup.name, func(b *testing.B) {
+						ctx := b.Context()
+						to := fx.now.Add(time.Minute)
+						q := AggregateQuery{
+							From: to.Add(-win.span), To: to,
+							Filters: tagFilter(mode.dim, TagEq, lookup.value), GroupDims: []int{outboundDim},
+						}
+						b.ReportAllocs()
+						for b.Loop() {
+							res, err := s.Aggregate(ctx, q)
+							if err != nil {
+								b.Fatal(err)
+							}
+							res.Release()
+						}
+						res, err := s.Aggregate(ctx, q)
+						if err != nil {
+							b.Fatal(err)
+						}
+						defer res.Release()
+						if (len(res.Groups[0]) != 0) != lookup.hit {
+							b.Fatalf("lookup %q produced %d outbound groups", lookup.value, len(res.Groups[0]))
+						}
+					})
+				}
+			}
+		})
+	}
+}

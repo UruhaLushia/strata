@@ -14,19 +14,22 @@ type querySources struct {
 }
 
 type querySnapshot struct {
-	from, to int64
-	opts     Options
-	policy   memPolicy
-	head     superblock
-	view     *fileView
-	series   Series
-	dict     dictionary
-	sealed   []sealedMeta
-	invert   []invertChunkMeta
-	fineAll  []uint32
-	hourAll  []uint32
-	dayAll   []uint32
-	liveFine []sealedBlock
+	from, to        int64
+	opts            Options
+	policy          memPolicy
+	head            superblock
+	view            *fileView
+	series          Series
+	dict            dictionary
+	sealed          []sealedMeta
+	invert          []invertChunkMeta
+	fineAll         []uint32
+	hourAll         []uint32
+	dayAll          []uint32
+	liveFine        []sealedBlock
+	livePreFiltered bool
+	liveTagID       uint32
+	hasLiveMatch    bool
 }
 
 func (s *querySnapshot) release() {
@@ -140,6 +143,30 @@ func captureQuerySnapshot(db *DB, s *Series, ws windowSpec, filters []Filter) (q
 		}
 	}
 
+	if len(filters) == 1 && !filters[0].Negate && filters[0].Op == TagEq && len(filters[0].Values) == 1 {
+		f := filters[0]
+		dim := db.dict.dims[dictDimKey{series: s.id, dim: uint8(f.Dim)}]
+		val := f.Values[0]
+		switch {
+		case val == "":
+			snap.livePreFiltered = true
+		case dim == nil:
+			db.mu.RUnlock()
+			return snap, planFrom, true, nil
+		case dim.ext == nil && len(dim.extra) == 0:
+			dim.revMu.RLock()
+			snap.livePreFiltered = dim.byKey != nil
+			if snap.livePreFiltered {
+				snap.liveTagID = dim.byKey[val]
+			}
+			dim.revMu.RUnlock()
+			if snap.livePreFiltered && snap.liveTagID == 0 {
+				db.mu.RUnlock()
+				return snap, planFrom, true, nil
+			}
+		}
+	}
+
 	rules := slices.Clone(s.rules)
 	execSeries := *s
 	execSeries.rules = rules
@@ -159,12 +186,26 @@ func captureQuerySnapshot(db *DB, s *Series, ws windowSpec, filters []Filter) (q
 		if key.series != s.id || b.ts+60 <= planFrom || b.ts >= snap.to || blockExcludedRules(rules, b.ts, b.ts+60, b.epoch) {
 			continue
 		}
-		snap.liveFine = append(snap.liveFine, sealedBlock{
+		live := sealedBlock{
 			series: s.id, res: resMinuteHR, start: b.ts, end: b.ts + 60,
 			epoch: b.epoch, order: b.order, summary: b.summary,
-			rowCount: uint32(len(b.rows)), rows: cloneRows(b.rows),
-			candidate: true,
-		})
+			rowCount: uint32(len(b.rows)), candidate: true,
+		}
+		if snap.livePreFiltered {
+			for _, row := range b.rows {
+				if row.tags[filters[0].Dim] == snap.liveTagID {
+					live.rows = append(live.rows, row)
+				}
+			}
+			live.candidate = len(live.rows) != 0
+			snap.hasLiveMatch = snap.hasLiveMatch || live.candidate
+		} else {
+			live.rows = cloneRows(b.rows)
+		}
+		snap.liveFine = append(snap.liveFine, live)
+	}
+	if snap.livePreFiltered {
+		filters = nil
 	}
 	snap.dict = dictionarySnapshotForQuery(db.dict, s.id, filters)
 	db.mu.RUnlock()
@@ -192,13 +233,13 @@ func filterLiveCandidates(liveFine []sealedBlock, compiled []compiledFilter) boo
 	return hasLive
 }
 
-func buildQuerySourcesFromSnap(snap *querySnapshot, from, to int64, sealedBits *blockBitmap) querySources {
+func buildQuerySourcesFromSnap(snap *querySnapshot, fineIdx, hourIdx, dayIdx []uint32, from, to int64, sealedBits *blockBitmap) querySources {
 	if len(snap.liveFine) > 1 {
 		sortBlocks(snap.liveFine)
 	}
 	return buildSealedQuerySources(
 		snap.sealed, snap.series.id,
-		snap.fineAll, snap.hourAll, snap.dayAll,
+		fineIdx, hourIdx, dayIdx,
 		snap.series.rules, from, to, sealedBits, snap.liveFine,
 	)
 }
@@ -221,18 +262,14 @@ func buildSummarySourcesLocked(db *DB, s *Series, from, to int64) querySources {
 	}
 	return buildSealedQuerySources(
 		db.sealed, s.id,
-		db.sealedByRes[sealedResKey{series: s.id, res: resMinuteHR}],
-		db.sealedByRes[sealedResKey{series: s.id, res: resHour}],
-		db.sealedByRes[sealedResKey{series: s.id, res: resDay}],
+		sealedRangeIndexes(db.sealed, db.sealedByRes[sealedResKey{series: s.id, res: resMinuteHR}], from, to),
+		sealedRangeIndexes(db.sealed, db.sealedByRes[sealedResKey{series: s.id, res: resHour}], from, to),
+		sealedRangeIndexes(db.sealed, db.sealedByRes[sealedResKey{series: s.id, res: resDay}], from, to),
 		rules, from, to, nil, liveFine,
 	)
 }
 
-func buildSealedQuerySources(sealed []sealedMeta, seriesID uint16, fineAll, hourAll, dayAll []uint32, rules []resetRule, from, to int64, sealedBits *blockBitmap, liveFine []sealedBlock) querySources {
-	fineIdx := sealedRangeIndexes(sealed, fineAll, from, to)
-	hourIdx := sealedRangeIndexes(sealed, hourAll, from, to)
-	dayIdx := sealedRangeIndexes(sealed, dayAll, from, to)
-
+func buildSealedQuerySources(sealed []sealedMeta, seriesID uint16, fineIdx, hourIdx, dayIdx []uint32, rules []resetRule, from, to int64, sealedBits *blockBitmap, liveFine []sealedBlock) querySources {
 	var candBits []uint64
 	var fineCand, hourCand, dayCand []uint32
 	totalIdx := len(fineIdx) + len(hourIdx) + len(dayIdx)

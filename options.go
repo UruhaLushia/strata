@@ -16,13 +16,13 @@ func defaultOptions(o Options) (Options, memPolicy) {
 	if o.SyncInterval <= 0 {
 		o.SyncInterval = 5 * time.Minute
 	}
-	if o.Retention1m <= 0 {
+	if o.Retention1m == 0 {
 		o.Retention1m = 14 * 24 * time.Hour
 	}
-	if o.Retention1h <= 0 {
+	if o.Retention1h == 0 {
 		o.Retention1h = 90 * 24 * time.Hour
 	}
-	if o.Retention1d <= 0 {
+	if o.Retention1d == 0 {
 		o.Retention1d = 365 * 24 * time.Hour
 	}
 	if o.Now == nil {

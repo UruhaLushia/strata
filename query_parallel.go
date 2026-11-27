@@ -13,15 +13,26 @@ type aggSlotResult struct {
 	err     error
 }
 
-func executeAggregateSlots(ctx context.Context, res *queryResult, out *AggregateResult, plans []plannedSlot, sources querySources, s *Series, db *DB, filters []compiledFilter, groupDims []int, maxWorkers int, slot *querySlot) ([]aggregateGroups, error) {
+func executeAggregateSlots(ctx context.Context, res *queryResult, out *AggregateResult, plans []plannedSlot, sources querySources, s *Series, db *DB, filters []compiledFilter, groupDims []int, maxWorkers, candidateUpper int, slot *querySlot) ([]aggregateGroups, error) {
 	filtered := filters != nil
+	var groupUpper int
+	if filtered && len(groupDims) == 1 && candidateUpper > 0 {
+		groupUpper = candidateUpper
+		for _, f := range filters {
+			if f.dim == groupDims[0] && !f.negate && len(f.ids) > 0 && f.ids[0] != 0 {
+				groupUpper = min(groupUpper, len(f.ids))
+			}
+		}
+	}
+	workers := 1
+	groupBudget := max(db.policy.queryBytes-(1<<20), 512<<10)
 	makeGroups := func() []aggregateGroups {
 		if len(groupDims) == 0 {
 			return nil
 		}
 		g := make([]aggregateGroups, len(groupDims))
 		for i, dim := range groupDims {
-			g[i] = newAggregateGroups(db.dict, s.id, dim, filtered, s.cfg.RowOps)
+			g[i] = newAggregateGroups(db.dict, s.id, dim, filtered, s.cfg.RowOps, groupUpper, groupBudget/int64(workers))
 		}
 		return g
 	}
@@ -32,12 +43,10 @@ func executeAggregateSlots(ctx context.Context, res *queryResult, out *Aggregate
 	for _, plan := range plans {
 		estRows += int(plan.block.rowCount)
 	}
-	workers := 1
 	if len(plans) >= 8 && estRows >= 4096 && maxWorkers > 1 {
 		workers = min(maxWorkers, len(plans))
 		if len(groupDims) > 0 {
 			perWorker := estimateGroupBytes(db.dict, s.id, groupDims, filtered, s.cfg.RowOps)
-			groupBudget := max(db.policy.queryBytes-(1<<20), 512<<10)
 			if perWorker > 0 {
 				workers = clampInt(int(groupBudget/perWorker), 1, workers)
 			}

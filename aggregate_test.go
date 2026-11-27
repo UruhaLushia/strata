@@ -10,6 +10,66 @@ import (
 	"time"
 )
 
+func TestRollupLocalHoursMinuteAndMixedSegments(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 30, 0, 0, time.UTC)
+	db, s := testDB(t, &now, Options{})
+	defer db.Close()
+	hour := now.Truncate(time.Hour)
+	appendValue(t, s, hour.Add(time.Minute), 7)
+	appendValue(t, s, hour.Add(2*time.Minute), 3)
+	res, err := s.Aggregate(t.Context(), AggregateQuery{From: hour, To: now})
+	requireOK(t, err)
+	defer res.Release()
+	check := func(segments []SegmentSummary, values [4]int64) {
+		t.Helper()
+		buckets := RollupLocalHours(segments, time.UTC, s.cfg.SummaryOps)
+		if len(buckets) != 1 || buckets[0].Hour != 12 || buckets[0].Summary != (Summary{Values: values, Mask: 0x0f}) {
+			t.Fatalf("local buckets=%+v want=%v", buckets, values)
+		}
+	}
+	check(res.Segments, [4]int64{10, 3, 7, 3})
+	mixed := append(slices.Clone(res.Segments),
+		SegmentSummary{Meta: SegmentMeta{CoveredFrom: hour, Resolution: time.Hour}, Summary: Summary{Values: testValues(5)}},
+		SegmentSummary{Meta: SegmentMeta{CoveredFrom: hour, Resolution: 24 * time.Hour}, Summary: Summary{Values: testValues(99)}},
+	)
+	check(mixed, [4]int64{15, 3, 7, 5})
+}
+
+func TestSparseFilteredGroupUsesOpenAddressing(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	db, s := testDB(t, &now, Options{})
+	defer db.Close()
+	from := now.Add(-time.Hour)
+	seedHighCardMinute(t, s, from, 300, func(i int) []string { return []string{"route-" + strconv.Itoa(i), "tcp"} })
+	requireOK(t, s.Append(from.Add(time.Minute), Summary{Values: testValues(7)}, testRow(7, "route-42", "tcp")))
+	requireOK(t, db.Compact())
+
+	slot := newQuerySlot()
+	defer slot.close()
+	filters := tagFilter(0, TagEq, "route-42")
+	pq, err := prepareQuery(db, s, windowSpec{from: from, to: now}, filters, queryOptions{PreferFine: true}, slot)
+	requireOK(t, err)
+	defer pq.release()
+	upper, known := estimateCandidateRowUpperBound(pq.plans, pq.sources, &pq.execSeries)
+	if !known || upper < 300 {
+		t.Fatalf("fixture must need the filter ID bound: upper=%d known=%v", upper, known)
+	}
+	var res AggregateResult
+	defer res.Release()
+	groups, err := executeAggregateSlots(t.Context(), &pq.qres, &res, pq.plans, pq.sources, &pq.execSeries, pq.execDB, pq.compiled, []int{0}, 1, upper, slot)
+	requireOK(t, err)
+	if groups[0].dense != nil || len(groups[0].open.slots) != 64 {
+		t.Fatal("single matching ID should use a 64-slot open-addressing table")
+	}
+	got, err := s.Aggregate(t.Context(), AggregateQuery{From: from, To: now, Filters: filters, GroupDims: []int{0}, PreferFine: true})
+	requireOK(t, err)
+	defer got.Release()
+	want := GroupRow{Tag: "route-42", Summary: Summary{Values: [4]int64{8, 1, 7, 7}, Mask: 0x0f}}
+	if !slices.Equal(got.Groups[0], []GroupRow{want}) {
+		t.Fatalf("sparse aggregate groups=%+v want=%+v", got.Groups, want)
+	}
+}
+
 func TestAggregateParallelDeterministicAllOps(t *testing.T) {
 	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 	db, _ := testDB(t, &now, Options{})

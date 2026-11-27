@@ -19,6 +19,7 @@ func processDayWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, daySta
 		return nil
 	}
 
+	// A marked epoch rebuilds from lower tiers unless an intact day block is its base.
 	dayEpochs := make(map[uint64]bool)
 	for idx := oldLo; idx < oldHi; idx++ {
 		m := plan.oldSealed[idx]
@@ -33,14 +34,29 @@ func processDayWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, daySta
 		}
 	}
 	dayAcc := make(map[uint64]sealedBlock, len(dayEpochs))
+	preserve := opsHasLast(s.cfg.RowOps)
+	hasLast := preserve || opsHasLast(s.cfg.SummaryOps)
 
-	// Pass through unaffected resDay blocks for this day first.
 	for idx := oldLo; idx < oldHi; idx++ {
 		m := plan.oldSealed[idx]
 		if m.res != resDay {
 			continue
 		}
-		if !rm.day[blockIDKey{s.id, dayStart, m.epoch}] && keepPassthroughMeta(plan, s, m) {
+		if dayEpochs[m.epoch] {
+			if ruleIntersects(s.rules, m.start, m.end(), m.epoch) ||
+				hasLast && dayStart >= plan.ret1hCutoff && slices.ContainsFunc(plan.oldSealed[oldLo:oldHi], func(lower sealedMeta) bool {
+					return lower.epoch == m.epoch && (lower.res == resHour || lower.res == resMinuteHR)
+				}) {
+				continue
+			}
+			b, err := loadSealedBlockFromView(plan.sourceView, plan.oldHead.sections[secTSBlocks], m)
+			if err != nil {
+				return err
+			}
+			b.preserveOrder = preserve
+			dayAcc[m.epoch] = b
+			dayEpochs[m.epoch] = false
+		} else if keepPassthroughMeta(plan, s, m) {
 			if err := bw.writePassthrough(idx, m); err != nil {
 				return err
 			}
@@ -139,38 +155,56 @@ func processHourWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, hr in
 		return nil
 	}
 
+	hasLast := preserve || opsHasLast(s.cfg.SummaryOps)
 	hourFine := make(map[blockIDKey]sealedBlock)
+	hourAcc := make(map[uint64]sealedBlock)
+	var hourBase map[uint64]bool
 	passHourEpoch := make(map[uint64]bool)
 	for idx := oldLo; idx < oldHi; idx++ {
 		m := plan.oldSealed[idx]
-		if m.res == resDay {
+		if m.res != resHour || ruleIntersects(s.rules, m.start, m.end(), m.epoch) {
 			continue
 		}
-		if m.res == resHour {
-			hk := blockIDKey{s.id, hr, m.epoch}
-			if !rm.hour[hk] && !ruleIntersects(s.rules, m.start, m.end(), m.epoch) {
-				if keepPassthroughMeta(plan, s, m) {
-					if err := bw.writePassthrough(idx, m); err != nil {
-						return err
-					}
-				}
-				passHourEpoch[m.epoch] = true
-				if dayEpochs[m.epoch] {
-					b, err := loadSealedBlockFromView(plan.sourceView, plan.oldHead.sections[secTSBlocks], m)
-					if err != nil {
-						return err
-					}
-					foldIntoCoarse(dayAcc, b, resDay, dayTS(hr), 86400, s, preserve)
+		if rm.hour[blockIDKey{s.id, hr, m.epoch}] {
+			if hasLast && hr >= plan.ret1mCutoff && slices.ContainsFunc(plan.oldSealed[oldLo:oldHi], func(lower sealedMeta) bool {
+				return lower.epoch == m.epoch && lower.res == resMinuteHR
+			}) {
+				continue
+			}
+			b, err := loadSealedBlockFromView(plan.sourceView, plan.oldHead.sections[secTSBlocks], m)
+			if err != nil {
+				return err
+			}
+			b.preserveOrder = preserve
+			hourAcc[m.epoch] = b
+			if hourBase == nil {
+				hourBase = make(map[uint64]bool)
+			}
+			hourBase[m.epoch] = true
+		} else {
+			if keepPassthroughMeta(plan, s, m) {
+				if err := bw.writePassthrough(idx, m); err != nil {
+					return err
 				}
 			}
-			continue
+			passHourEpoch[m.epoch] = true
+			if dayEpochs[m.epoch] {
+				b, err := loadSealedBlockFromView(plan.sourceView, plan.oldHead.sections[secTSBlocks], m)
+				if err != nil {
+					return err
+				}
+				foldIntoCoarse(dayAcc, b, resDay, dayTS(hr), 86400, s, preserve)
+			}
 		}
-		if excludedByRuleSlice(s.rules, m.start, m.epoch) {
+	}
+	for idx := oldLo; idx < oldHi; idx++ {
+		m := plan.oldSealed[idx]
+		if m.res != resMinuteHR || excludedByRuleSlice(s.rules, m.start, m.epoch) {
 			continue
 		}
 		mk := blockIDKey{s.id, m.start, m.epoch}
 		hk := blockIDKey{s.id, hr, m.epoch}
-		needRollup := rm.hour[hk] || (dayEpochs[m.epoch] && !passHourEpoch[m.epoch])
+		needRollup := !hourBase[m.epoch] && (rm.hour[hk] || (dayEpochs[m.epoch] && !passHourEpoch[m.epoch]))
 		if !rm.fine[mk] {
 			if keepPassthroughMeta(plan, s, m) {
 				if err := bw.writePassthrough(idx, m); err != nil {
@@ -196,7 +230,7 @@ func processHourWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, hr in
 		}
 	}
 
-	// Stream ONLY the distinct WAL frames touching this (series, hour).
+	// Stream only the distinct WAL frames touching this (series, hour).
 	lastFrame := ^uint32(0)
 	for wi := walLo; wi < walHi; wi++ {
 		fIdx := plan.walRefs[wi].frameIdx
@@ -221,6 +255,12 @@ func processHourWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, hr in
 				series: x.series, res: resMinuteHR, start: x.ts, end: x.ts + 60,
 				epoch: x.epoch, order: x.order, summary: x.summary,
 				rows: x.rows, preserveOrder: preserve,
+			}
+			if hourBase[b.epoch] {
+				foldIntoCoarse(hourAcc, b, resHour, hr, 3600, s, preserve)
+			}
+			if fromFine, rebuild := dayEpochs[b.epoch]; rebuild && !fromFine {
+				foldIntoCoarse(dayAcc, b, resDay, dayTS(hr), 86400, s, preserve)
 			}
 			mk := blockIDKey{b.series, b.start, b.epoch}
 			if old, ok := hourFine[mk]; ok {
@@ -252,11 +292,10 @@ func processHourWindow(plan *compactPlan, rm *rebuildMarks, s *seriesSnap, hr in
 		return fineList[i].order < fineList[j].order
 	})
 
-	hourAcc := make(map[uint64]sealedBlock)
 	var freshFine []sealedBlock
 	for _, b := range fineList {
 		hk := blockIDKey{s.id, hr, b.epoch}
-		if rm.hour[hk] || (dayEpochs[b.epoch] && !passHourEpoch[b.epoch]) {
+		if !hourBase[b.epoch] && (rm.hour[hk] || (dayEpochs[b.epoch] && !passHourEpoch[b.epoch])) {
 			foldIntoCoarse(hourAcc, b, resHour, hr, 3600, s, preserve)
 		}
 		if !b.passthrough && (b.start >= plan.ret1mCutoff || ruleIntersects(s.rules, b.start, b.end, b.epoch)) {

@@ -101,8 +101,13 @@ func (s *Series) aggregateWithDefaultWindow(ctx context.Context, q AggregateQuer
 		return out, nil
 	}
 
-	if shouldPartitionTopK(pq.execDB.dict, s.id, q.GroupDims, pq.execSeries.cfg.Arity, q.TopK) &&
-		!canUseSinglePassHighCard(pq.plans, pq.sources, &pq.execSeries, pq.execDB.policy) {
+	partition := shouldPartitionTopK(pq.execDB.dict, s.id, q.GroupDims, pq.execSeries.cfg.Arity, q.TopK)
+	var candidateUpper int
+	var upperKnown bool
+	if partition || (len(q.GroupDims) == 1 && pq.compiled != nil && pq.execDB.dict.dimMaxID(s.id, q.GroupDims[0]) > 128) {
+		candidateUpper, upperKnown = estimateCandidateRowUpperBound(pq.plans, pq.sources, &pq.execSeries)
+	}
+	if partition && (!upperKnown || candidateUpper > maxSinglePassGroups(pq.execDB.policy, pq.execSeries.cfg.RowOps)) {
 		rows, err := executePartitionedTopK(ctx, &pq, out, q.GroupDims[0], q.TopK, maxWorkers, slot)
 		if err != nil {
 			out.Release()
@@ -115,7 +120,7 @@ func (s *Series) aggregateWithDefaultWindow(ctx context.Context, q AggregateQuer
 		return out, nil
 	}
 
-	groups, err := executeAggregateSlots(ctx, &pq.qres, out, pq.plans, pq.sources, &pq.execSeries, pq.execDB, pq.compiled, q.GroupDims, maxWorkers, slot)
+	groups, err := executeAggregateSlots(ctx, &pq.qres, out, pq.plans, pq.sources, &pq.execSeries, pq.execDB, pq.compiled, q.GroupDims, maxWorkers, candidateUpper, slot)
 	if err != nil {
 		out.Release()
 		return nil, err

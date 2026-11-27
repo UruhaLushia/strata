@@ -203,14 +203,6 @@ func shouldPartitionTopK(d dictionary, series uint16, groupDims []int, arity, to
 	return dim >= 0 && dim < arity && d.dimMaxID(series, dim) > highCardThreshold
 }
 
-func canUseSinglePassHighCard(plans []plannedSlot, sources querySources, s *Series, policy memPolicy) bool {
-	upper, ok := estimateCandidateRowUpperBound(plans, sources, s)
-	if !ok {
-		return false
-	}
-	return upper <= maxSinglePassGroups(policy, s.cfg.RowOps)
-}
-
 func metaBefore(left, right sealedMeta) bool {
 	if left.series != right.series {
 		return left.series < right.series

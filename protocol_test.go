@@ -24,6 +24,81 @@ func requireOK(t *testing.T, err error) {
 	}
 }
 
+func TestLateWritePreservesRetainedCoarseBlock(t *testing.T) {
+	day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		res       byte
+		retention Options
+		keepFine  bool
+		reset     bool
+	}{
+		{"day", resDay, Options{Retention1m: time.Hour, Retention1h: time.Hour, Retention1d: -time.Nanosecond}, false, false},
+		{"hour", resHour, Options{Retention1m: time.Hour, Retention1h: -time.Nanosecond, Retention1d: time.Hour}, false, false},
+		{"reverse write with fine data", resDay, Options{Retention1m: -1, Retention1h: -1, Retention1d: -1}, true, false},
+		{"day after reset", resDay, Options{Retention1m: time.Hour, Retention1h: time.Hour, Retention1d: -1}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := day.Add(370 * 24 * time.Hour)
+			db, s := testDB(t, &now, tc.retention)
+			defer db.Close()
+			first, late := 10*time.Minute, 20*time.Minute
+			if tc.keepFine {
+				first, late = 40*time.Minute, 10*time.Minute
+			}
+			appendValue(t, s, day.Add(first), 100)
+			requireOK(t, db.Compact())
+			if len(db.sealedByRes[sealedResKey{series: s.id, res: tc.res}]) != 1 ||
+				(len(db.sealedByRes[sealedResKey{series: s.id, res: resMinuteHR}]) != 0) != tc.keepFine {
+				t.Fatalf("unexpected retained blocks: %+v", db.sealed)
+			}
+			if tc.reset {
+				compactTime := now
+				now = day.Add(24*time.Hour - time.Minute)
+				requireOK(t, s.ResetCurrentDay(time.UTC))
+				now = compactTime
+			}
+			appendValue(t, s, day.Add(late), 1)
+			requireOK(t, db.Compact())
+
+			tiers := []byte{tc.res}
+			want := [4]int64{101, 1, 100, 1}
+			if tc.keepFine {
+				tiers = append(tiers, resHour)
+				want[3] = 100
+			}
+			if tc.reset {
+				want = testValues(1)
+			}
+			for _, tier := range tiers {
+				width := time.Duration(resWidth(tier)) * time.Second
+				to := day.Add(width)
+				res, err := s.Aggregate(t.Context(), AggregateQuery{From: day, To: to, GroupDims: []int{0}})
+				requireOK(t, err)
+				defer res.Release()
+				if !res.Exact || len(res.Segments) != 1 || res.Segments[0].Meta.Resolution != width ||
+					res.Summary.Values != want || len(res.Groups[0]) != 1 || res.Groups[0][0].Summary.Values != want {
+					t.Fatalf("%v late write summary=%+v groups=%+v segments=%+v want=%v", width, res.Summary, res.Groups, res.Segments, want)
+				}
+				page, err := s.Read(t.Context(), ReadRequest{From: day, To: to})
+				requireOK(t, err)
+				defer page.Release()
+				if len(page.Rows) != 1 || page.Rows[0].Resolution != width || page.Rows[0].Values != want {
+					t.Fatalf("%v late write rows=%+v want=%v", width, page.Rows, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRetentionCutoffSaturates(t *testing.T) {
+	if retentionCutoff(42, -time.Nanosecond) != math.MinInt64 ||
+		retentionCutoff(math.MinInt64+1, 2*time.Second) != math.MinInt64 ||
+		retentionCutoff(42, 1500*time.Millisecond) != 41 {
+		t.Fatal("retention cutoffs must preserve infinite retention, saturate, and truncate to seconds")
+	}
+}
+
 func testValues(n int64) [4]int64 { return [4]int64{n, n, n, n} }
 
 func testRow(n int64, tags ...string) Row { return Row{Tags: tags, Values: testValues(n)} }

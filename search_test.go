@@ -9,6 +9,53 @@ import (
 	"time"
 )
 
+func TestTagEqLiveWindowSkipsSealedInversion(t *testing.T) {
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	db, s := testDB(t, &now, Options{})
+	defer db.Close()
+	appendValue(t, s, now.Add(-time.Hour), 100)
+	requireOK(t, db.Compact())
+	if len(db.invert) == 0 {
+		t.Fatal("fixture must have an inverted index outside the query window")
+	}
+	from := now.Add(-3 * time.Minute)
+	requireOK(t, s.Append(from, Summary{Values: testValues(27)}, testRow(7, "a", "b"), testRow(20, "other", "b")))
+	requireOK(t, s.Append(from.Add(time.Minute), Summary{Values: testValues(40)}, testRow(40, "other", "b")))
+	to := from.Add(2 * time.Minute)
+	filters := tagFilter(0, TagEq, "a")
+	ws := windowSpec{from: from, to: to}
+	snap, _, empty, err := captureQuerySnapshot(db, s, ws, filters)
+	requireOK(t, err)
+	defer snap.release()
+	if empty || !snap.livePreFiltered || !snap.hasLiveMatch || len(snap.liveFine) != 2 {
+		t.Fatalf("fixture did not take the live fast path: empty=%v live=%+v", empty, snap.liveFine)
+	}
+	for _, b := range snap.liveFine {
+		if b.start == from.Unix() {
+			if !b.candidate || b.rowCount != 2 || len(b.rows) != 1 || b.rows[0].values[0] != 7 || b.summary.Values[0] != 27 {
+				t.Fatalf("matching live bucket=%+v", b)
+			}
+		} else if b.candidate || b.rows != nil || b.rowCount != 1 || b.summary.Values[0] != 40 {
+			t.Fatalf("nonmatching live bucket lost coverage or summary: %+v", b)
+		}
+	}
+
+	// Detach the view so a sealed inversion read fails, even though the index exists.
+	view := db.view
+	db.view = nil
+	defer func() { db.view = view }()
+	q := AggregateQuery{From: from, To: to, Filters: filters, RequireExact: true}
+	assertQuerySum(t, s, q, 7)
+	q.Filters = tagFilter(0, TagEq, "missing")
+	miss, _, empty, err := captureQuerySnapshot(db, s, ws, q.Filters)
+	requireOK(t, err)
+	defer miss.release()
+	if !empty || miss.dict.snapshot || len(miss.liveFine) != 0 {
+		t.Fatal("unknown tag did not return before snapshot construction")
+	}
+	assertQuerySum(t, s, q, 0)
+}
+
 func TestInvertedSearchEqualsFullScanFuzz(t *testing.T) {
 	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
 	db, _ := testDB(t, &now, Options{})

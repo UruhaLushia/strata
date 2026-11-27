@@ -2,6 +2,7 @@ package strata
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -114,9 +115,9 @@ func (db *DB) Compact() error {
 		walRefs:         walRefs,
 		hourTarget:      hourTarget,
 		dayTarget:       dayTarget,
-		ret1mCutoff:     nowSec - int64(db.opts.Retention1m/time.Second),
-		ret1hCutoff:     nowSec - int64(db.opts.Retention1h/time.Second),
-		ret1dCutoff:     nowSec - int64(db.opts.Retention1d/time.Second),
+		ret1mCutoff:     retentionCutoff(nowSec, db.opts.Retention1m),
+		ret1hCutoff:     retentionCutoff(nowSec, db.opts.Retention1h),
+		ret1dCutoff:     retentionCutoff(nowSec, db.opts.Retention1d),
 		kvBlocks:        kvBlocks,
 		catalogRaw:      catalogRaw,
 		kvPassthrough:   kvPass,
@@ -237,4 +238,15 @@ func (db *DB) Compact() error {
 	}
 	db.mu.Unlock()
 	return errors.Join(loadOrOpenErr, syncErr)
+}
+
+func retentionCutoff(nowSec int64, d time.Duration) int64 {
+	if d < 0 {
+		return math.MinInt64
+	}
+	seconds := int64(d / time.Second)
+	if nowSec < math.MinInt64+seconds {
+		return math.MinInt64
+	}
+	return nowSec - seconds
 }
