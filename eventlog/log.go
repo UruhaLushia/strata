@@ -49,7 +49,7 @@ type Log struct {
 	writeErr      error
 	closing, done chan struct{}
 	scans         sync.WaitGroup
-	scanSem       chan struct{}
+	scanSem       chan *scanSlot
 	pending       []byte
 	count         int
 	inFlightBytes int
@@ -66,20 +66,33 @@ type Log struct {
 
 // Open acquires the directory lock and recovers the newest shard.
 func Open(dir string, opts Options) (*Log, error) {
-	if opts.MaxRecordBytes == 0 {
-		opts.MaxRecordBytes = 4 << 10
+	if dir == "" || opts.MaxRecordBytes < 0 || opts.MaxRecordBytes > maxRecordBytes ||
+		opts.MaxBatchBytes < 0 || opts.MaxBatchBytes > maxFrameBytes || opts.MaxBatchCount < 0 ||
+		opts.ShardMaxBytes < 0 || opts.MaxTotalBytes < 0 || opts.MaxShards < 0 || opts.MaxConcurrentScans < 0 {
+		return nil, ErrInvalidOption
 	}
+	const defaultRecordBytes = 4 << 10
 	if opts.MaxBatchBytes == 0 {
-		opts.MaxBatchBytes = 64 << 10
+		rec := opts.MaxRecordBytes
+		if rec == 0 {
+			rec = defaultRecordBytes
+		}
+		opts.MaxBatchBytes = max(64<<10, minFrameSize+rec)
+		if room := opts.MaxTotalBytes - fileHeaderSize; opts.MaxTotalBytes != 0 && room < int64(opts.MaxBatchBytes) {
+			opts.MaxBatchBytes = int(room)
+		}
+	}
+	if opts.MaxRecordBytes == 0 && opts.MaxBatchBytes >= minFrameSize {
+		opts.MaxRecordBytes = min(defaultRecordBytes, opts.MaxBatchBytes-minFrameSize)
+	}
+	if opts.MaxTotalBytes == 0 {
+		opts.MaxTotalBytes = max(32<<20, opts.ShardMaxBytes, int64(fileHeaderSize+opts.MaxBatchBytes))
+	}
+	if opts.ShardMaxBytes == 0 {
+		opts.ShardMaxBytes = min(4<<20, opts.MaxTotalBytes)
 	}
 	if opts.MaxBatchCount == 0 {
 		opts.MaxBatchCount = 1024
-	}
-	if opts.ShardMaxBytes == 0 {
-		opts.ShardMaxBytes = 4 << 20
-	}
-	if opts.MaxTotalBytes == 0 {
-		opts.MaxTotalBytes = 32 << 20
 	}
 	if opts.MaxShards == 0 {
 		opts.MaxShards = 16
@@ -87,11 +100,9 @@ func Open(dir string, opts Options) (*Log, error) {
 	if opts.MaxConcurrentScans == 0 {
 		opts.MaxConcurrentScans = 2
 	}
-	if dir == "" || opts.MaxRecordBytes < 0 || opts.MaxRecordBytes > maxRecordBytes ||
-		opts.MaxBatchBytes < minFrameSize+opts.MaxRecordBytes || opts.MaxBatchBytes > maxFrameBytes ||
+	if opts.MaxBatchBytes < minFrameSize+opts.MaxRecordBytes ||
 		opts.ShardMaxBytes < fileHeaderSize+minFrameSize || opts.ShardMaxBytes > opts.MaxTotalBytes ||
-		opts.MaxTotalBytes < int64(fileHeaderSize+opts.MaxBatchBytes) ||
-		opts.MaxBatchCount < 0 || opts.MaxShards < 0 || opts.MaxConcurrentScans < 0 {
+		opts.MaxTotalBytes < int64(fileHeaderSize+opts.MaxBatchBytes) {
 		return nil, ErrInvalidOption
 	}
 	dir, err := filepath.Abs(dir)
@@ -108,11 +119,14 @@ func Open(dir string, opts Options) (*Log, error) {
 	l := &Log{
 		dir: dir, opts: opts, lock: lock, nextID: 1,
 		closing: make(chan struct{}), done: make(chan struct{}),
-		scanSem: make(chan struct{}, opts.MaxConcurrentScans),
+		scanSem: make(chan *scanSlot, opts.MaxConcurrentScans),
 	}
 	if err := l.loadShards(); err != nil {
 		_ = lock.Close()
 		return nil, err
+	}
+	for range cap(l.scanSem) {
+		l.scanSem <- nil
 	}
 	return l, nil
 }
@@ -190,6 +204,9 @@ func (l *Log) Close() error {
 	err := errors.Join(l.sync(true), l.closeActive())
 	l.ioMu.Unlock()
 	l.scans.Wait()
+	close(l.scanSem)
+	for range l.scanSem {
+	}
 	err = errors.Join(err, l.lock.Close())
 	close(l.done)
 	return err

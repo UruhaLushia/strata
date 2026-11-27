@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -150,6 +151,66 @@ func TestOpenReusesNewestShard(t *testing.T) {
 	}
 	if got := timestamps(t, l); !slices.Equal(got, []int64{4, 3, 2, 1, 0}) {
 		t.Fatalf("reopened history = %v", got)
+	}
+}
+
+func TestScanWindows(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		frames, rows, payload int
+	}{
+		{"WindowBoundaries", 104, 20, 64},
+		{"OversizeFrame", 1, 1280, 50},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l, err := Open(dir, Options{MaxBatchBytes: 128 << 10, MaxBatchCount: tc.rows})
+			check(t, err)
+			rows := slices.Repeat([]Record{{Payload: make([]byte, tc.payload)}}, tc.rows)
+			for i := range tc.frames {
+				for j := range rows {
+					rows[j].TimestampNS = int64(i*tc.rows + j)
+				}
+				check(t, l.Append(rows...))
+				check(t, l.Flush())
+			}
+			check(t, l.Close())
+			l, err = Open(dir, Options{})
+			check(t, err)
+			defer l.Close()
+
+			frameBytes := int64(frameOverhead + tc.rows*(recordHeaderSize+tc.payload))
+			totalBytes := int64(tc.frames) * frameBytes
+			for _, budget := range []int64{totalBytes - 1, totalBytes} {
+				next := int64(tc.frames * tc.rows)
+				r, err := l.Scan(t.Context(), ScanOptions{MaxBytes: budget}, func(row Record) error {
+					next--
+					if row.TimestampNS != next || len(row.Payload) != tc.payload {
+						t.Fatalf("unexpected record: timestamp=%d want=%d, payload=%d bytes", row.TimestampNS, next, len(row.Payload))
+					}
+					return nil
+				})
+				check(t, err)
+				frames := budget / frameBytes
+				if r.Records != int(frames)*tc.rows || r.BytesRead != frames*frameBytes || r.LimitReached != (budget < totalBytes) {
+					t.Fatalf("budget %d: %+v", budget, r)
+				}
+			}
+			if len(l.scanSem) != cap(l.scanSem) {
+				t.Fatal("Scan did not return its slot")
+			}
+			for range cap(l.scanSem) {
+				slot := <-l.scanSem
+				l.scanSem <- slot
+				if slot != nil && (cap(slot.buf) > scanWindowBytes || cap(slot.offsets) > 1024) {
+					t.Fatal("Scan retained an oversized buffer")
+				}
+			}
+			check(t, l.Close())
+			if len(l.scanSem) != 0 {
+				t.Fatal("Close did not release scan slots")
+			}
+		})
 	}
 }
 
@@ -343,9 +404,38 @@ func TestStorageBudgets(t *testing.T) {
 }
 
 func TestAdmissionAndDirectoryLock(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		opts    Options
+		payload int
+	}{
+		{"TotalBudget", Options{MaxTotalBytes: 1 << 20}, 4 << 10},
+		{"TotalBelowDefaultBatch", Options{MaxTotalBytes: 8 << 10}, 4 << 10},
+		{"TotalBelowDefaultRecord", Options{MaxTotalBytes: 1024}, 1024 - fileHeaderSize - minFrameSize},
+		{"LargeRecord", Options{MaxRecordBytes: 64 << 10}, 64 << 10},
+		{"SmallBatch", Options{MaxBatchBytes: 2 << 10}, (2 << 10) - minFrameSize},
+		{"LargeShard", Options{ShardMaxBytes: 64 << 20}, 4 << 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l, err := Open(t.TempDir(), tc.opts)
+			check(t, err)
+			defer l.Close()
+			check(t, l.Append(Record{TimestampNS: 1, Payload: make([]byte, tc.payload)}))
+			check(t, l.Flush())
+			if got := timestamps(t, l); !slices.Equal(got, []int64{1}) {
+				t.Fatalf("written history = %v", got)
+			}
+		})
+	}
 	dir := t.TempDir()
-	_, err := Open(dir, Options{MaxRecordBytes: 8, MaxBatchBytes: 45})
-	wantError(t, err, ErrInvalidOption)
+	for _, opts := range []Options{
+		{MaxRecordBytes: 8, MaxBatchBytes: 45},
+		{MaxTotalBytes: 32},
+		{MaxTotalBytes: 1 << 20, ShardMaxBytes: 2 << 20},
+	} {
+		_, err := Open(dir, opts)
+		wantError(t, err, ErrInvalidOption)
+	}
 	l, err := Open(dir, Options{MaxRecordBytes: 8, MaxBatchBytes: 64, MaxBatchCount: 2})
 	check(t, err)
 	defer l.Close()
@@ -438,7 +528,74 @@ func TestConcurrentAppendFlushScanClose(t *testing.T) {
 	}
 }
 
-func check(t *testing.T, err error) {
+func BenchmarkEventlogAppendFlush(b *testing.B) {
+	const batchSize, payloadBytes = 256, 64
+	l, err := Open(b.TempDir(), Options{})
+	check(b, err)
+	b.Cleanup(func() { check(b, l.Close()) })
+	records := slices.Repeat([]Record{{Payload: make([]byte, payloadBytes)}}, batchSize)
+	b.ReportAllocs()
+	b.SetBytes(batchSize * payloadBytes)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for b.Loop() {
+		if err := l.Append(records...); err != nil {
+			b.Fatal(err)
+		}
+		if err := l.Flush(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	events := float64(b.N) * batchSize
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/events, "ns/event")
+	b.ReportMetric(float64(after.TotalAlloc-before.TotalAlloc)/events, "B/event")
+	b.ReportMetric(float64(after.Mallocs-before.Mallocs)/events, "allocs/event")
+}
+
+func BenchmarkEventlogScanRecent(b *testing.B) {
+	run := func(b *testing.B, batchSize int) {
+		const shardBytes, payloadBytes = 4 << 20, 64
+		frameBytes := frameOverhead + batchSize*(recordHeaderSize+payloadBytes)
+		batches := (shardBytes - fileHeaderSize) / frameBytes
+		l, err := Open(b.TempDir(), Options{ShardMaxBytes: shardBytes})
+		check(b, err)
+		b.Cleanup(func() { check(b, l.Close()) })
+		records := slices.Repeat([]Record{{Payload: make([]byte, payloadBytes)}}, batchSize)
+		for range batches {
+			check(b, l.Append(records...))
+			check(b, l.Flush())
+		}
+		check(b, l.Sync())
+
+		for _, tc := range []struct {
+			name  string
+			limit int
+			want  int
+		}{
+			{"Recent200", 200, 200},
+			{"All", 0, batches * batchSize},
+		} {
+			b.Run(tc.name, func(b *testing.B) {
+				b.ReportAllocs()
+				ctx := b.Context()
+				opts := ScanOptions{MaxRecords: tc.limit}
+				visit := func(Record) error { return nil }
+				for b.Loop() {
+					result, err := l.Scan(ctx, opts, visit)
+					if err != nil || result.Records != tc.want {
+						b.Fatalf("scan: got %d records, want %d, error = %v", result.Records, tc.want, err)
+					}
+				}
+			})
+		}
+	}
+	run(b, 256)
+	b.Run("SmallFrames", func(b *testing.B) { run(b, 20) })
+}
+
+func check(t testing.TB, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)

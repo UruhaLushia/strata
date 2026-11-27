@@ -58,6 +58,9 @@ func decodeFrame(b []byte, offsets *[]uint32) error {
 	}
 	if offsets != nil {
 		*offsets = (*offsets)[:0]
+		if cap(*offsets) < int(count) {
+			*offsets = make([]uint32, 0, int(count))
+		}
 	}
 	pos := frameHeaderSize
 	end := len(b) - trailerSize

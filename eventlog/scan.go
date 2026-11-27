@@ -21,6 +21,22 @@ type ScanResult struct {
 	Truncated    bool
 }
 
+const scanWindowBytes = 64 << 10
+
+type scanSlot struct {
+	buf     []byte
+	offsets []uint32
+}
+
+func (s *scanSlot) read(f *os.File, start, end int64) error {
+	n := int(end - start)
+	if cap(s.buf) < n {
+		s.buf = make([]byte, n, max(n, min(2*cap(s.buf), scanWindowBytes)))
+	}
+	s.buf = s.buf[:n]
+	return readAt(f, s.buf, start)
+}
+
 // Scan visits flushed records in reverse append order. The callback must not
 // call Close or wait for a nested Scan that could exhaust MaxConcurrentScans.
 func (l *Log) Scan(ctx context.Context, opts ScanOptions, fn func(Record) error) (ScanResult, error) {
@@ -33,27 +49,38 @@ func (l *Log) Scan(ctx context.Context, opts ScanOptions, fn func(Record) error)
 	if err := ctx.Err(); err != nil {
 		return ScanResult{}, err
 	}
+	var slot *scanSlot
 	select {
 	case <-ctx.Done():
 		return ScanResult{}, ctx.Err()
 	case <-l.closing:
 		return ScanResult{}, ErrClosed
-	case l.scanSem <- struct{}{}:
+	case slot = <-l.scanSem:
 	}
-	defer func() { <-l.scanSem }()
 	l.mu.Lock()
 	if l.closed {
+		// Close owns the remaining slots once scans can no longer register.
 		l.mu.Unlock()
 		return ScanResult{}, ErrClosed
 	}
 	l.scans.Add(1)
 	shards := slices.Clone(l.shards)
 	l.mu.Unlock()
-	defer l.scans.Done()
+	if slot == nil {
+		slot = new(scanSlot)
+	}
+	defer func() {
+		if cap(slot.buf) > scanWindowBytes {
+			slot.buf = nil
+		}
+		if cap(slot.offsets) > 1024 {
+			slot.offsets = nil
+		}
+		l.scanSem <- slot
+		l.scans.Done()
+	}()
 
 	var result ScanResult
-	var raw []byte
-	var offsets []uint32
 	for _, s := range slices.Backward(shards) {
 		if s.size == fileHeaderSize {
 			continue
@@ -74,7 +101,7 @@ func (l *Log) Scan(ctx context.Context, opts ScanOptions, fn func(Record) error)
 			}
 			return result, err
 		}
-		err = scanShard(ctx, f, s, opts, fn, &result, &raw, &offsets)
+		err = scanShard(ctx, f, s, opts, fn, &result, slot)
 		if err != nil || result.LimitReached || result.Stopped {
 			return result, err
 		}
@@ -88,16 +115,24 @@ func (l *Log) published(id uint64) bool {
 	return slices.ContainsFunc(l.shards, func(s shard) bool { return s.id == id })
 }
 
-func scanShard(ctx context.Context, f *os.File, s shard, opts ScanOptions, fn func(Record) error, r *ScanResult, raw *[]byte, offsets *[]uint32) (err error) {
+func scanShard(ctx context.Context, f *os.File, s shard, opts ScanOptions, fn func(Record) error, r *ScanResult, slot *scanSlot) (err error) {
 	defer func() {
 		if closeErr := f.Close(); err == nil {
 			err = closeErr
 		}
 	}()
-	if err := checkHeader(f, s.id); err != nil {
+	winStart := s.size
+	if s.size <= scanWindowBytes {
+		winStart = 0
+		if err := slot.read(f, 0, s.size); err != nil {
+			return err
+		}
+		if !validHeader(slot.buf, s.id) {
+			return ErrCorrupt
+		}
+	} else if err := checkHeader(f, s.id); err != nil {
 		return err
 	}
-	var trailer [trailerSize]byte
 	for end := s.size; end > fileHeaderSize; {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -110,10 +145,14 @@ func scanShard(ctx context.Context, f *os.File, s shard, opts ScanOptions, fn fu
 		if end-fileHeaderSize < minFrameSize {
 			return ErrCorrupt
 		}
-		if err := readAt(f, trailer[:], end-trailerSize); err != nil {
-			return err
+		if end-trailerSize < winStart {
+			winStart = max(fileHeaderSize, end-scanWindowBytes)
+			if err := slot.read(f, winStart, end); err != nil {
+				return err
+			}
 		}
-		size := int64(binary.LittleEndian.Uint32(trailer[:]))
+		trailer := slot.buf[end-winStart-trailerSize : end-winStart]
+		size := int64(binary.LittleEndian.Uint32(trailer))
 		if string(trailer[4:]) != tailMagic || size < minFrameSize || size > maxFrameBytes || size > end-fileHeaderSize {
 			return ErrCorrupt
 		}
@@ -121,18 +160,20 @@ func scanShard(ctx context.Context, f *os.File, s shard, opts ScanOptions, fn fu
 			r.LimitReached = true
 			return nil
 		}
-		end -= size
-		*raw = resizeFrame(*raw, int(size))
-		bodyEnd := int(size) - trailerSize
-		if err := readAt(f, (*raw)[:bodyEnd], end); err != nil {
-			return err
+		start := end - size
+		if start < winStart {
+			winStart = max(fileHeaderSize, end-max(size, scanWindowBytes))
+			if err := slot.read(f, winStart, end); err != nil {
+				return err
+			}
 		}
-		copy((*raw)[bodyEnd:], trailer[:])
+		frame := slot.buf[start-winStart : end-winStart]
+		end = start
 		r.BytesRead += size
-		if err := decodeFrame(*raw, offsets); err != nil {
+		if err := decodeFrame(frame, &slot.offsets); err != nil {
 			return err
 		}
-		for _, off := range slices.Backward(*offsets) {
+		for _, off := range slices.Backward(slot.offsets) {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -141,14 +182,14 @@ func scanShard(ctx context.Context, f *os.File, s shard, opts ScanOptions, fn fu
 				return nil
 			}
 			pos := int(off)
-			header := (*raw)[pos : pos+recordHeaderSize]
+			header := frame[pos : pos+recordHeaderSize]
 			start := pos + recordHeaderSize
 			end := start + int(binary.LittleEndian.Uint32(header[8:]))
 			r.Records++
 			err := fn(Record{
 				TimestampNS: int64(binary.LittleEndian.Uint64(header)),
 				StreamID:    binary.LittleEndian.Uint16(header[12:]),
-				Payload:     (*raw)[start:end:end],
+				Payload:     frame[start:end:end],
 			})
 			if errors.Is(err, ErrStopScan) {
 				r.Stopped = true

@@ -108,10 +108,14 @@ func checkHeader(f *os.File, id uint64) error {
 	if err := readAt(f, header[:], 0); err != nil {
 		return err
 	}
-	if string(header[:8]) != fileMagic || binary.LittleEndian.Uint64(header[8:]) != id {
+	if !validHeader(header[:], id) {
 		return ErrCorrupt
 	}
 	return nil
+}
+
+func validHeader(header []byte, id uint64) bool {
+	return string(header[:8]) == fileMagic && binary.LittleEndian.Uint64(header[8:]) == id
 }
 
 func (l *Log) closeActive() error {
