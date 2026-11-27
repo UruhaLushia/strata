@@ -17,6 +17,7 @@ type querySnapshot struct {
 	from, to        int64
 	opts            Options
 	policy          memPolicy
+	codecs          *codecTable
 	head            superblock
 	view            *fileView
 	series          Series
@@ -44,6 +45,7 @@ func (s *querySnapshot) buildExecDB() *DB {
 		dict:   s.dict,
 		opts:   s.opts,
 		policy: s.policy,
+		codecs: s.codecs,
 		head:   s.head,
 		view:   s.view,
 	}
@@ -173,6 +175,7 @@ func captureQuerySnapshot(db *DB, s *Series, ws windowSpec, filters []Filter) (q
 
 	snap.opts = db.opts
 	snap.policy = db.policy
+	snap.codecs = db.codecs
 	snap.head = db.head
 	snap.view = db.view.acquire()
 	snap.series = execSeries

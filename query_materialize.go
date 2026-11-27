@@ -42,6 +42,7 @@ func mergeSlot(db *DB, chosen sealedMeta, sources querySources, s *Series) (seal
 		}
 		loaded := first.sealed.toBlock()
 		loaded.encoded = raw
+		loaded.codecID = db.view.blocks.codec
 		return loaded, bufPtr, nil
 	}
 	var merged sealedBlock

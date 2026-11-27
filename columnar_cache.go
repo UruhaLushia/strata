@@ -162,15 +162,19 @@ func (c *blockColCache) load(idx int) (decodedCol, error) {
 	if c.arenaUsed+expected <= c.arenaCap {
 		off := c.arenaUsed
 		dst := c.arena[off : off : off+expected]
-		plain, err := c.slot.decodeZstdInto(c.view.plain[start:end], dst)
+		plain, err := c.slot.decodeInto(c.view.codecID, c.view.plain[start:end], dst, expected)
 		if err != nil {
 			return decodedCol{}, err
 		}
 		if len(plain) != expected {
 			return decodedCol{}, errors.New("strata: invalid column stream length")
 		}
+		stored := c.arena[off : off+expected]
+		if len(plain) != 0 && &plain[0] != &stored[0] {
+			copy(stored, plain)
+		}
 		c.arenaUsed += expected
-		col := decodedCol{mode: d.mode, width: d.width, data: plain}
+		col := decodedCol{mode: d.mode, width: d.width, data: stored}
 		c.cols[idx], c.cached[idx], c.cachedOffs[idx] = col, true, off
 		return col, nil
 	}

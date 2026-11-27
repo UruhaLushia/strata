@@ -5,7 +5,7 @@ import (
 	"os"
 	"slices"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
 
 const (
@@ -165,10 +165,12 @@ func (b *invertExternalBuilder) spillRun() error {
 	return nil
 }
 
-func (b *invertExternalBuilder) addPassthroughFromInvert(src *osFile, invertDesc sectionDesc, mapped []byte, chunks []invertChunkMeta, passOldToWrite []int32, passSeriesCount map[uint16]uint32) error {
+func (b *invertExternalBuilder) addPassthroughFromInvert(view *fileView, invertDesc sectionDesc, chunks []invertChunkMeta, passOldToWrite []int32, passSeriesCount map[uint16]uint32) error {
+	slot := querySlot{codecs: view.codecs}
+	defer slot.close()
 	stickyAdded := make(map[uint64]struct{})
 	for _, chunk := range chunks {
-		plain, err := readInvertChunkFromSlot(src, invertDesc, mapped, chunk, nil)
+		plain, bufPtr, err := readInvertChunkFromView(view, invertDesc, chunk, len(passOldToWrite), &slot)
 		if err != nil {
 			return err
 		}
@@ -191,6 +193,7 @@ func (b *invertExternalBuilder) addPassthroughFromInvert(src *osFile, invertDesc
 				}
 			}
 		})
+		putReadBuf(bufPtr)
 		if err != nil {
 			return err
 		}
@@ -201,8 +204,8 @@ func (b *invertExternalBuilder) addPassthroughFromInvert(src *osFile, invertDesc
 	return nil
 }
 
-func (b *invertExternalBuilder) writeSection(tf *osFile, pos int64, writeToFinal []uint32, seriesBlocks map[uint16]uint32, enc *zstd.Encoder, onKey func(uint64)) (int64, sectionDesc, error) {
-	sink := &invertChunkSink{chunkPath: b.chunkPath, rawChunk: make([]byte, 0, invertChunkTargetSize), enc: enc}
+func (b *invertExternalBuilder) writeSection(tf *osFile, pos int64, writeToFinal []uint32, seriesBlocks map[uint16]uint32, enc codec.Encoder, id uint8, onKey func(uint64)) (int64, sectionDesc, error) {
+	sink := &invertChunkSink{chunkPath: b.chunkPath, rawChunk: make([]byte, 0, invertChunkTargetSize), enc: enc, codecID: id}
 	defer sink.close()
 
 	var sc invertRecordScratch

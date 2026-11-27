@@ -12,7 +12,7 @@
 - **内置多级汇总**：自动按 `1m` / `1h` / `1d` 降采样并按层级过期，内置本地时区按小时聚合（`RollupLocalHours`）。
 - **标签检索**：`STR2` 列式分块、5 模式自适应倒排索引、内联与外置分页混合词典、内置下推过滤（`TagEq`、`TagPrefix`、`TagSuffix`、`TagContains`、`TagCIDR`），以及防止首屏小页被重查询阻塞的 1 槽有界轻读通道。
 - **同文件事务 KV**：在同一单文件内提供纯字节事务 KV 分区（`Region`、`Batch`、`Scan`、`ScanSeq`），支持 TTL、CAS 与快照无锁流式扫描。
-- **内存优先**：提供 `MemoryBalanced` / `MemoryConstrained` 双档预算、零指针（`noscan`）索引结构、显式 `Client.Reclaim()`（Unix 下触发 `MADV_DONTNEED`），外部依赖仅 `klauspost/compress` 与 `golang.org/x/sys`。
+- **内存优先与可插拔压缩**：提供 `MemoryBalanced` / `MemoryConstrained` 双档预算、零指针（`noscan`）索引结构、显式 `Client.Reclaim()`（Unix 下触发 `MADV_DONTNEED`），并通过 `strata/codec` 支持可插拔压缩（默认不压缩、零外部压缩依赖；按需导入 `codec/zstd`、`codec/s2`、`codec/flate` 或自定义实现）。
 
 v0.2.0 根包使用 `UNIDBv02` 文件格式，打开 v0.1.0 数据库会报错。
 
@@ -69,7 +69,7 @@ client.Reclaim()
 
 ## 可选事件历史
 
-按需导入 `github.com/UruhaLushia/strata/eventlog`，在本地保留有界的结构化事件历史。根包与 `eventlog` 双向零依赖，应用未导入该子包时没有事件历史开销。记录直接存盘，无 Zstd 和常驻块目录开销。
+按需导入 `github.com/UruhaLushia/strata/eventlog`，在本地保留有界的结构化事件历史。根包与 `eventlog` 双向零依赖，未导入时不产生额外开销；同样通过 `Options.Codec` 支持可选压缩（默认不压缩、无常驻块目录）。
 
 `Open` 返回 `(*eventlog.Log, error)`。`Append`、`Flush()`、`Sync()` 和 `Close()` 均返回 `error`。`Scan` 按追加顺序倒序扫描，限制扫描范围并返回 `(eventlog.ScanResult, error)`。
 
@@ -125,15 +125,23 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 | `AggregateDomain`（5K 域名） | 5.47 ms / 1.13 MiB / 72 allocs | — |
 | `ExtremeDestIPTopK`（106 万 IPv6 精确 Top-50） | — | 38.30 ms / 2.41 MiB / 218 allocs |
 
-### `eventlog` 体积与吞吐
+### 编译体积与 `eventlog` 吞吐
 
-纯 Go 裁剪编译体积（`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`）：仅根包 `2.46 MiB`，根包 + 链接未打开 `eventlog` **`+0 B`**，根包 + 启用 `eventlog` **`+96 KiB`**，单用 `eventlog` `1.49 MiB`（零 Zstd 依赖）。
+纯 Go 裁剪编译体积（`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`，根包测试含 `OpenClient` + `Compact`）：
 
-| `eventlog` 基准（64B 载荷，4 MiB 分片） | 耗时 | 内存 / 分配 | 吞吐 |
+| 编译组合 | 二进制大小 | 相对 `zstd` 缩减 |
+|---|---:|---:|
+| `strata`（`None`，默认） | 2.14 MiB | -976 KiB |
+| `strata` + `codec/flate`（标准库） | 2.44 MiB | -672 KiB |
+| `strata` + `codec/s2` | 2.75 MiB | -356 KiB |
+| `strata` + `codec/zstd` | 3.09 MiB | — |
+| 单用 `eventlog`（`None`） | 1.50 MiB | -1.59 MiB |
+
+| `eventlog` 基准（64B 载荷，4 MiB 分片，`None`） | 耗时 | 内存 / 分配 | 吞吐 |
 |---|---:|---:|---:|
-| `AppendFlush`（批量写盘） | 42.1 ns/event | 0 allocs/op | 1,522 MB/s |
-| `ScanRecent`（最近 200 条，~1.5 KiB 小帧） | 14.0 µs | 345 B / 6 allocs | — |
-| `ScanRecent`（4 MiB 全分片，~1.5 KiB 小帧） | 1.16 ms | 344 B / 6 allocs | ~3.5 GB/s |
+| `AppendFlush`（批量写盘） | 45.0 ns/event | 0 allocs/op | 1,423 MB/s |
+| `ScanRecent`（最近 200 条，~1.5 KiB 小帧） | 14.8 µs | 345 B / 6 allocs | — |
+| `ScanRecent`（4 MiB 全分片，~1.5 KiB 小帧） | 1.40 ms | 344 B / 6 allocs | ~2.9 GB/s |
 
 8 并发重查询饱和压测下（`mmap=true`），`SummaryOnly` 稳定在 `p99 <= 183 µs`，有界小页 `Read` 稳定在 `p99 <= 424 µs`（`MemoryConstrained` 下 `<= 303 µs`）。
 

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
 func benchSeriesConfig() SeriesConfig {
@@ -51,6 +53,7 @@ func buildGateway90DayFixtureMode(t testing.TB, extreme bool) gateway90Fixture {
 	clock := base
 	path := filepath.Join(t.TempDir(), "strata.db")
 	db, err := Open(path, Options{
+		Codec:       zstd.New(zstd.Fastest),
 		Now:         func() time.Time { return clock },
 		Retention1m: 14 * 24 * time.Hour,
 		Retention1h: 90 * 24 * time.Hour,
@@ -121,7 +124,7 @@ func buildGateway90DayFixtureMode(t testing.TB, extreme bool) gateway90Fixture {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	check, err := Open(path, Options{ReadOnly: true, Now: func() time.Time { return base }})
+	check, err := Open(path, Options{Codec: zstd.New(zstd.Fastest), ReadOnly: true, Now: func() time.Time { return base }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +192,7 @@ func gatewayDestMode(n int, extreme bool) string {
 
 func openGateway90Fixture(t testing.TB, fx gateway90Fixture, mmap bool) (*DB, *Series) {
 	t.Helper()
-	db, err := Open(fx.path, Options{ReadOnly: true, UseMmap: mmap, Now: func() time.Time { return fx.now }})
+	db, err := Open(fx.path, Options{Codec: zstd.New(zstd.Fastest), ReadOnly: true, UseMmap: mmap, Now: func() time.Time { return fx.now }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,6 +303,7 @@ func logIncrementalCompactTelemetry(t *testing.T, fixtureName string, fx gateway
 		}
 		clock := fx.now.Add(20 * time.Minute)
 		db, err := Open(dst, Options{
+			Codec:         zstd.New(zstd.Fastest),
 			Now:           func() time.Time { return clock },
 			MemoryProfile: tc.profile,
 			Retention1m:   14 * 24 * time.Hour,

@@ -3,8 +3,6 @@ package strata
 import (
 	"bytes"
 	"unsafe"
-
-	"github.com/klauspost/compress/zstd"
 )
 
 // dictTagReader is a query-local tag resolver for TopK tie-breaking and materialization.
@@ -12,8 +10,9 @@ import (
 // buffer using the query's decoder, bypassing the global FIFO dictPageCache completely.
 type dictTagReader struct {
 	snap       dictDimSnap
-	dec        *zstd.Decoder
-	ownedDec   bool
+	slot       *querySlot
+	ownedSlot  bool
+	err        error
 	extPageIdx int
 	extPageBuf []byte
 }
@@ -34,29 +33,21 @@ func newDictTagReader(d dictionary, series uint16, dim uint8, slot *querySlot) d
 			}
 		}
 	}
-	var dec *zstd.Decoder
-	ownedDec := false
-	if snap.ext != nil {
-		if slot != nil {
-			dec = slot.ensureDec()
-		} else {
-			dec = getZstdDecoder()
-			ownedDec = true
-		}
+	ownedSlot := slot == nil && snap.ext != nil
+	if ownedSlot {
+		slot = &querySlot{codecs: snap.ext.view.codecs}
 	}
 	return dictTagReader{
 		snap:       snap,
-		dec:        dec,
-		ownedDec:   ownedDec,
+		slot:       slot,
+		ownedSlot:  ownedSlot,
 		extPageIdx: -1,
 	}
 }
 
 func (r *dictTagReader) close() {
-	if r.ownedDec && r.dec != nil {
-		putZstdDecoder(r.dec)
-		r.dec = nil
-		r.ownedDec = false
+	if r.ownedSlot {
+		r.slot.close()
 	}
 	r.extPageBuf = nil
 	r.extPageIdx = -1
@@ -66,7 +57,7 @@ func (r *dictTagReader) close() {
 // priority as dictDimSnap.resolve: extra > external forward pages > tail/inline arena.
 // The returned slice may be invalidated by subsequent resolveBytes calls on the same reader.
 func (r *dictTagReader) resolveBytes(id uint32) []byte {
-	if id == 0 {
+	if id == 0 || r.err != nil {
 		return nil
 	}
 	// Priority 1: extra overrides.
@@ -86,8 +77,9 @@ func (r *dictTagReader) resolveBytes(id uint32) []byte {
 			return nil
 		}
 		if pageIdx != r.extPageIdx {
-			plain, err := r.snap.ext.readPageInto(r.snap.ext.fwdStartOff, r.snap.ext.fwdPages[pageIdx], &r.extPageBuf, r.dec)
+			plain, err := r.snap.ext.readPageInto(r.snap.ext.fwdStartOff, r.snap.ext.fwdPages[pageIdx], &r.extPageBuf, r.slot)
 			if err != nil {
+				r.err = err
 				r.extPageIdx = -1
 				return nil
 			}
@@ -123,7 +115,7 @@ func newTopKHeap(limit int, reader *dictTagReader) topKHeap {
 }
 
 func (h *topKHeap) push(id uint32, sum Summary) {
-	if h.limit <= 0 {
+	if h.limit <= 0 || h.reader.err != nil {
 		return
 	}
 	if len(h.items) < h.limit {

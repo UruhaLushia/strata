@@ -97,13 +97,9 @@ func executeAggregateSlots(ctx context.Context, res *queryResult, out *Aggregate
 			go func(workerID int) {
 				defer wg.Done()
 				ws := slot
-				var ownedDec bool
 				if workerID > 0 {
-					ws = &querySlot{dec: getZstdDecoder()}
-					ownedDec = true
-				}
-				if ownedDec {
-					defer putZstdDecoder(ws.dec)
+					ws = &querySlot{codecs: db.codecs}
+					defer ws.close()
 				}
 				var local []aggregateGroups
 				for {

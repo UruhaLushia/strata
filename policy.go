@@ -3,8 +3,9 @@ package strata
 import (
 	"context"
 	"runtime"
+	"sync/atomic"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
 
 const (
@@ -23,7 +24,7 @@ type memPolicy struct {
 	compactWorkers       int
 	queryBatchRows       int
 	maxConcurrentQueries int
-	zstdEncoderWindow    int
+	encoderWindow        int
 	dictPageCacheBytes   int
 	dictHotBytes         int
 	allowWriterMmap      bool
@@ -88,9 +89,9 @@ func compileMemPolicy(opts Options) memPolicy {
 	p.queryBatchRows = clampInt(p.queryBatchRows, 64, 4096)
 	p.maxConcurrentQueries = clampInt(int(p.queryBytes/(3<<20)), 1, 4)
 	if p.compactBytes <= 8<<20 {
-		p.zstdEncoderWindow = 64 << 10
+		p.encoderWindow = 64 << 10
 	} else {
-		p.zstdEncoderWindow = 128 << 10
+		p.encoderWindow = 128 << 10
 	}
 	return p
 }
@@ -121,26 +122,33 @@ type querySlot struct {
 	tagIDs     [8][]uint32
 	values     [4][]int64
 	masks      []uint8
-	dec        *zstd.Decoder
+	codecs     *codecTable
+	decID      uint8
+	dec        codec.Decoder
+	tagErr     atomic.Pointer[error]
 }
 
 func newQuerySlot() *querySlot {
 	return &querySlot{}
 }
 
-func (s *querySlot) ensureDec() *zstd.Decoder {
-	if s.dec == nil {
-		s.dec, _ = zstd.NewReader(nil, zstd.WithDecoderLowmem(true))
+func (s *querySlot) decodeInto(id uint8, raw, dst []byte, maxRaw int) ([]byte, error) {
+	if s.dec == nil || s.decID != id {
+		if s.dec != nil {
+			_ = s.dec.Close()
+		}
+		var err error
+		s.dec, err = s.codecs.newDecoder(id)
+		if err != nil {
+			return nil, err
+		}
+		s.decID = id
 	}
-	return s.dec
+	return s.dec.Decode(dst[:0], raw, maxRaw)
 }
 
-func (s *querySlot) decodeZstdInto(raw, dst []byte) ([]byte, error) {
-	return s.ensureDec().DecodeAll(raw, dst[:0])
-}
-
-func (s *querySlot) decodeZstd(raw []byte) ([]byte, error) {
-	plain, err := s.ensureDec().DecodeAll(raw, s.colScratch[:0])
+func (s *querySlot) decode(id uint8, raw []byte, maxRaw int) ([]byte, error) {
+	plain, err := s.decodeInto(id, raw, s.colScratch, maxRaw)
 	if cap(plain) <= maxActiveScratchCap {
 		s.colScratch = plain[:0]
 	} else {
@@ -184,6 +192,7 @@ func (s *querySlot) ensureArena(size int) []byte {
 }
 
 func (s *querySlot) resetAfterQuery() {
+	s.tagErr.Store(nil)
 	if cap(s.colScratch) > maxRetainedScratchCap {
 		s.colScratch = nil
 	} else {
@@ -243,7 +252,7 @@ func (db *DB) acquireQuery(ctx context.Context) (workers int, batchRows int, slo
 	select {
 	case slot = <-db.querySlots:
 	default:
-		slot = newQuerySlot()
+		slot = &querySlot{codecs: db.codecs}
 	}
 	workers = db.policy.queryWorkers
 	batchRows = db.policy.queryBatchRows
@@ -254,12 +263,7 @@ func (db *DB) acquireQuery(ctx context.Context) (workers int, batchRows int, slo
 		}
 	}
 	release = func() {
-		slot.resetAfterQuery()
-		select {
-		case db.querySlots <- slot:
-		default:
-			slot.close()
-		}
+		db.releaseQuerySlot(db.querySlots, slot)
 		<-db.querySem
 	}
 	return workers, batchRows, slot, release, nil
@@ -280,18 +284,27 @@ func (db *DB) acquireLightRead(ctx context.Context) (slot *querySlot, release fu
 	select {
 	case slot = <-db.lightReadSlots:
 	default:
-		slot = newQuerySlot()
+		slot = &querySlot{codecs: db.codecs}
 	}
 	release = func() {
-		slot.resetAfterQuery()
-		select {
-		case db.lightReadSlots <- slot:
-		default:
-			slot.close()
-		}
+		db.releaseQuerySlot(db.lightReadSlots, slot)
 		<-db.lightReadSem
 	}
 	return slot, release, nil
+}
+
+func (db *DB) releaseQuerySlot(ch chan *querySlot, slot *querySlot) {
+	slot.resetAfterQuery()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if !db.closed {
+		select {
+		case ch <- slot:
+			return
+		default:
+		}
+	}
+	slot.close()
 }
 
 func drainSlotChan(ch chan *querySlot) {

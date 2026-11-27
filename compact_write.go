@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
 
 type compactBlockWriter struct {
@@ -22,26 +22,18 @@ type compactBlockWriter struct {
 	passOldToWrite  []int32
 	passSeriesCount map[uint16]uint32
 	inv             *invertExternalBuilder
-	mainEnc         *zstd.Encoder
-	workerEncs      []*zstd.Encoder
+	mainEnc         codec.Encoder
+	workerEncs      []codec.Encoder
 	policy          memPolicy
+	plan            *compactPlan
 }
 
-func newCompactBlockWriter(tf *osFile, pos int64, plan *compactPlan, inv *invertExternalBuilder, mainEnc *zstd.Encoder) *compactBlockWriter {
+func newCompactBlockWriter(tf *osFile, pos int64, plan *compactPlan, inv *invertExternalBuilder, mainEnc codec.Encoder) (*compactBlockWriter, error) {
 	passOld := make([]int32, len(plan.oldSealed))
 	for i := range passOld {
 		passOld[i] = -1
 	}
-	workers := max(plan.policy.compactWorkers, 1)
-	var workerEncs []*zstd.Encoder
-	if workers > 1 {
-		workerEncs = make([]*zstd.Encoder, workers)
-		workerEncs[0] = mainEnc
-		for w := 1; w < workers; w++ {
-			workerEncs[w] = newZstdEncoder(plan.level, plan.policy.zstdEncoderWindow)
-		}
-	}
-	return &compactBlockWriter{
+	w := &compactBlockWriter{
 		tf:              tf,
 		source:          plan.sourceView.data,
 		sourceBlocks:    plan.oldHead.sections[secTSBlocks],
@@ -54,9 +46,22 @@ func newCompactBlockWriter(tf *osFile, pos int64, plan *compactPlan, inv *invert
 		passSeriesCount: make(map[uint16]uint32, len(plan.series)),
 		inv:             inv,
 		mainEnc:         mainEnc,
-		workerEncs:      workerEncs,
 		policy:          plan.policy,
+		plan:            plan,
 	}
+	if workers := plan.policy.compactWorkers; workers > 1 {
+		w.workerEncs = make([]codec.Encoder, workers)
+		w.workerEncs[0] = mainEnc
+		for i := 1; i < workers; i++ {
+			enc, err := plan.codecs.newEncoder(plan.policy.encoderWindow)
+			if err != nil {
+				w.close()
+				return nil, err
+			}
+			w.workerEncs[i] = enc
+		}
+	}
+	return w, nil
 }
 
 func (w *compactBlockWriter) close() {
@@ -69,6 +74,14 @@ func (w *compactBlockWriter) close() {
 }
 
 func (w *compactBlockWriter) writePassthrough(oldIdx int, meta sealedMeta) error {
+	if w.sourceBlocks.codec != w.plan.codecs.target {
+		b, err := loadSealedBlockFromView(w.plan.sourceView, w.sourceBlocks, meta)
+		if err != nil {
+			return err
+		}
+		b.preserveOrder = opsHasLast(w.plan.series[meta.series].cfg.RowOps)
+		return w.writeFresh(b)
+	}
 	writeID := uint32(len(w.metas))
 	if err := copyPassthroughBlock(w.tf, w.source, w.sourceBlocks, meta, w.pos, w.blockHash, w.passBuf); err != nil {
 		return err
@@ -145,7 +158,7 @@ func (w *compactBlockWriter) writeFreshBatch(batch []sealedBlock) error {
 		active := min(len(w.workerEncs), n)
 		for wi := range active {
 			wg.Add(1)
-			go func(enc *zstd.Encoder) {
+			go func(enc codec.Encoder) {
 				defer wg.Done()
 				for idx := range jobs {
 					raw, err := encodeBlockWithEncoder(batch[idx], enc)
@@ -181,10 +194,10 @@ func (w *compactBlockWriter) writeFreshBatch(batch []sealedBlock) error {
 	return nil
 }
 
-func (w *compactBlockWriter) finalizeIndex() ([]byte, uint32, []uint32, map[uint16]uint32) {
+func (w *compactBlockWriter) finalizeIndex() ([]byte, []uint32, map[uint16]uint32) {
 	n := len(w.metas)
 	if n == 0 {
-		return nil, 0, nil, nil
+		return nil, nil, nil
 	}
 	order := make([]uint32, n)
 	for i := range order {
@@ -215,23 +228,27 @@ func (w *compactBlockWriter) finalizeIndex() ([]byte, uint32, []uint32, map[uint
 			binary.LittleEndian.PutUint64(entry[48+j*8:56+j*8], uint64(value))
 		}
 	}
-	idxData := w.mainEnc.EncodeAll(idx, nil)
-	return idxData, uint32(len(idx)), writeToFinal, seriesBlocks
+	return idx, writeToFinal, seriesBlocks
 }
 
 func writeCompactFile(tf *osFile, plan *compactPlan) (int64, [12]sectionDesc, dictLiveBits, map[dictDimKey]bool, error) {
 	var ds [12]sectionDesc
-	mainEnc := newZstdEncoder(plan.level, plan.policy.zstdEncoderWindow)
-	defer mainEnc.Close()
+	target := plan.codecs.target
+	mainEnc, err := plan.codecs.newEncoder(plan.policy.encoderWindow)
+	if err != nil {
+		return 0, ds, nil, nil, err
+	}
+	if mainEnc != nil {
+		defer mainEnc.Close()
+	}
 
 	var pos int64
 	var kvDesc [3]sectionDesc
 	var blobDesc sectionDesc
-	var err error
 	if plan.kvPassthrough {
 		pos, kvDesc, blobDesc, err = copyPassthroughKVSections(tf, plan.sourceView.data, plan.oldHead)
 	} else {
-		pos, kvDesc, blobDesc, err = writeKVSections(tf, int64(dataStart), plan.kvBlocks, plan.catalogRaw, mainEnc)
+		pos, kvDesc, blobDesc, err = writeKVSections(tf, int64(dataStart), plan.kvBlocks, plan.catalogRaw, mainEnc, target)
 	}
 	if err != nil {
 		return 0, ds, nil, nil, err
@@ -241,21 +258,32 @@ func writeCompactFile(tf *osFile, plan *compactPlan) (int64, [12]sectionDesc, di
 	inv := newInvertExternalBuilder(plan.dbPath, plan.invertRunBytes)
 	defer inv.close()
 
-	bw := newCompactBlockWriter(tf, pos, plan, inv, mainEnc)
+	bw, err := newCompactBlockWriter(tf, pos, plan, inv, mainEnc)
+	if err != nil {
+		return 0, ds, nil, nil, err
+	}
 	defer bw.close()
 
 	if err = streamCompactBlocks(plan, bw); err != nil {
 		return 0, ds, nil, nil, err
 	}
 	pos = bw.pos
-	idxData, idxRawLen, writeToFinal, seriesBlocks := bw.finalizeIndex()
-	if len(idxData) > 0 {
+	idxRaw, writeToFinal, seriesBlocks := bw.finalizeIndex()
+	if len(idxRaw) > 0 {
+		idxData, compressed, err := encodeSmaller(mainEnc, nil, idxRaw, maxSectionRawBytes)
+		if err != nil {
+			return 0, ds, nil, nil, err
+		}
+		var idxCodec uint8
+		if compressed {
+			idxCodec = target
+		}
 		blockLen := pos - bw.blockStart
 		if _, err = tf.WriteAt(idxData, pos); err != nil {
 			return 0, ds, nil, nil, err
 		}
-		ds[3] = sectionDesc{kind: 3, codec: 1, count: uint32(len(bw.metas)), offset: uint64(bw.blockStart), length: uint64(blockLen), rawLen: uint32(blockLen), crc: bw.blockHash.Sum32()}
-		ds[4] = sectionDesc{kind: 4, codec: 1, count: uint32(len(bw.metas)), offset: uint64(pos), length: uint64(len(idxData)), rawLen: idxRawLen, crc: crc(idxData)}
+		ds[3] = sectionDesc{kind: 3, codec: target, count: uint32(len(bw.metas)), offset: uint64(bw.blockStart), length: uint64(blockLen), rawLen: uint32(blockLen), crc: bw.blockHash.Sum32()}
+		ds[4] = sectionDesc{kind: 4, codec: idxCodec, count: uint32(len(bw.metas)), offset: uint64(pos), length: uint64(len(idxData)), rawLen: uint32(len(idxRaw)), crc: crc(idxData)}
 		pos += int64(len(idxData))
 	}
 	liveBits := newDictLiveBits(plan.dictSnap)
@@ -266,17 +294,13 @@ func writeCompactFile(tf *osFile, plan *compactPlan) (int64, [12]sectionDesc, di
 			liveBits.mark(dictDimKey{series: ik.series, dim: ik.dim}, ik.tag)
 		}
 	}
-	if len(plan.oldInvert) > 0 {
-		var mapped []byte
-		if plan.sourceView.mapped != nil {
-			mapped = plan.sourceView.mapped.bytes()
-		}
-		if err = inv.addPassthroughFromInvert(plan.sourceView.data, plan.oldHead.sections[secTSInvert], mapped, plan.oldInvert, bw.passOldToWrite, bw.passSeriesCount); err != nil {
+	if len(plan.oldInvert) > 0 && len(bw.passSeriesCount) > 0 {
+		if err = inv.addPassthroughFromInvert(plan.sourceView, plan.oldHead.sections[secTSInvert], plan.oldInvert, bw.passOldToWrite, bw.passSeriesCount); err != nil {
 			return 0, ds, nil, nil, err
 		}
 	}
 	var invDesc sectionDesc
-	pos, invDesc, err = inv.writeSection(tf, pos, writeToFinal, seriesBlocks, mainEnc, onInvKey)
+	pos, invDesc, err = inv.writeSection(tf, pos, writeToFinal, seriesBlocks, mainEnc, target, onInvKey)
 	if err != nil {
 		return 0, ds, nil, nil, err
 	}
@@ -290,7 +314,7 @@ func writeCompactFile(tf *osFile, plan *compactPlan) (int64, [12]sectionDesc, di
 			}
 		}
 		var dictDesc sectionDesc
-		pos, dictDesc, prunedDims, err = writeDictSection(tf, pos, plan.dictSnap, plan.sourceView, mainEnc, liveBits)
+		pos, dictDesc, prunedDims, err = writeDictSection(tf, pos, plan.dictSnap, plan.sourceView, mainEnc, target, liveBits)
 		if err != nil {
 			return 0, ds, nil, nil, err
 		}

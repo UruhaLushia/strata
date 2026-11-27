@@ -5,7 +5,7 @@ import (
 	"hash/crc32"
 	"os"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
 
 type invertChunkDir struct {
@@ -26,7 +26,8 @@ type invertChunkSink struct {
 	hasKeys    bool
 	recCount   uint32
 	totalRaw   uint32
-	enc        *zstd.Encoder
+	enc        codec.Encoder
+	codecID    uint8
 }
 
 func (s *invertChunkSink) close() {
@@ -57,7 +58,10 @@ func (s *invertChunkSink) flushChunk() error {
 	if len(s.rawChunk) == 0 {
 		return nil
 	}
-	comp := s.enc.EncodeAll(s.rawChunk, nil)
+	comp, err := encodePayload(s.enc, nil, s.rawChunk)
+	if err != nil {
+		return err
+	}
 	s.dir = append(s.dir, invertChunkDir{
 		first: s.chunkFirst, last: s.chunkLast,
 		length: uint32(len(comp)), crc: crc(comp),
@@ -139,7 +143,7 @@ func (s *invertChunkSink) writeTo(tf *osFile, pos int64) (int64, sectionDesc, er
 		writePos += int64(len(s.memChunks))
 	}
 	desc := sectionDesc{
-		kind: secTSInvert, codec: 1, count: s.recCount,
+		kind: secTSInvert, codec: s.codecID, count: s.recCount,
 		offset: uint64(pos), length: uint64(writePos - pos),
 		rawLen: s.totalRaw, crc: hash.Sum32(),
 	}

@@ -3,9 +3,6 @@ package strata
 import "time"
 
 func defaultOptions(o Options) (Options, memPolicy) {
-	if o.CompressionLevel > CompressionBest {
-		o.CompressionLevel = CompressionFastest
-	}
 	policy := compileMemPolicy(o)
 	if o.WALCompactBytes <= 0 {
 		o.WALCompactBytes = policy.walCompactBytes

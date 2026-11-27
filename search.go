@@ -189,7 +189,7 @@ func unionInvertBitmapSnap(view *fileView, invertSec sectionDesc, invert []inver
 		for end < len(tags) && invertChunkIndex(invert, prefixKey|uint64(tags[end])) == index {
 			end++
 		}
-		plain, err := readInvertChunkFromView(view, invertSec, invert[index], slot)
+		plain, bufPtr, err := readInvertChunkFromView(view, invertSec, invert[index], totalSealed, slot)
 		if err != nil {
 			return nil, false, err
 		}
@@ -199,6 +199,7 @@ func unionInvertBitmapSnap(view *fileView, invertSec sectionDesc, invert []inver
 		}, func(_ uint64) {
 			dense = true
 		})
+		putReadBuf(bufPtr)
 		if err != nil {
 			return nil, false, err
 		}
@@ -210,9 +211,9 @@ func unionInvertBitmapSnap(view *fileView, invertSec sectionDesc, invert []inver
 	return bm, false, nil
 }
 
-func matchingTagIDsSnap(d dictionary, series uint16, f Filter) []uint32 {
+func matchingTagIDsSnap(d dictionary, series uint16, f Filter) ([]uint32, error) {
 	if !d.snapshot || series != d.snapshotSeries || f.Dim < 0 || f.Dim >= 8 {
-		return nil
+		return nil, nil
 	}
 	dimSnap := &d.snapshotDims[f.Dim]
 	ids := make([]uint32, 0)
@@ -222,16 +223,28 @@ func matchingTagIDsSnap(d dictionary, series uint16, f Filter) []uint32 {
 		}
 		switch f.Op {
 		case TagEq:
-			if id := dimSnap.lookup(value); id != 0 {
+			id, err := dimSnap.lookup(value)
+			if err != nil {
+				return nil, err
+			}
+			if id != 0 {
 				ids = append(ids, id)
 			}
 		case TagPrefix:
-			ids = dimSnap.matchPrefixIDs(value, ids)
+			var err error
+			ids, err = dimSnap.matchPrefixIDs(value, ids)
+			if err != nil {
+				return nil, err
+			}
 		default:
-			ids = dimSnap.matchScanIDs(f.Op, value, ids)
+			var err error
+			ids, err = dimSnap.matchScanIDs(f.Op, value, ids)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-	return dedupeUint32(ids)
+	return dedupeUint32(ids), nil
 }
 
 func tagMatches(op TagOp, tag, value string) bool {

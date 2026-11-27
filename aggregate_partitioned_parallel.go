@@ -56,8 +56,8 @@ func runRemainingPartitions(ctx context.Context, pq *preparedQuery, activeParts 
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			ws := &querySlot{dec: getZstdDecoder()}
-			defer putZstdDecoder(ws.dec)
+			ws := &querySlot{codecs: pq.execDB.codecs}
+			defer ws.close()
 			wReader := newDictTagReader(db.dict, s.id, dimU8, ws)
 			defer wReader.close()
 			wh := newTopKHeap(topK, &wReader)
@@ -148,7 +148,7 @@ func runOnePartition(ctx context.Context, pq *preparedQuery, part int, partBits 
 		}
 	}
 	pushDenseToHeap(h, ps.dense, ps.loID)
-	return nil
+	return h.reader.err
 }
 
 func updatePartDenseFullMask(ps *partState, idx uint32, v0, v1, v2, v3 int64, ord uint64) {

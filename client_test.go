@@ -81,11 +81,11 @@ func TestResultReleaseIdempotentAndBounded(t *testing.T) {
 	}
 
 	reclaimPools()
-	scratch := make([]byte, 0, maxZstdScratchCap+1)
+	scratch := make([]byte, 0, maxDecodeScratchCap+1)
 	read := make([]byte, 0, maxReadBufCap+1)
-	putZstdScratch(&scratch, scratch)
+	putDecodeScratch(&scratch, scratch)
 	putReadBuf(&read)
-	if zstdDecodeScratchPool.Get() != nil || readBufPool.Get() != nil {
+	if decodeScratchPool.Get() != nil || readBufPool.Get() != nil {
 		t.Fatal("Release pooled an oversized buffer")
 	}
 }
@@ -149,7 +149,7 @@ func TestMemoryProfileBudgetAndCtxCancel(t *testing.T) {
 	constrained := compileMemPolicy(Options{MemoryProfile: MemoryConstrained})
 	if balanced.queryBytes != 8<<20 || constrained.queryBytes != 2<<20 ||
 		constrained.queryWorkers != 1 || constrained.compactWorkers != 1 ||
-		constrained.queryBatchRows != 512 || constrained.zstdEncoderWindow != 64<<10 {
+		constrained.queryBatchRows != 512 || constrained.encoderWindow != 64<<10 {
 		t.Fatalf("MemoryProfile policies: balanced=%+v constrained=%+v", balanced, constrained)
 	}
 	custom := compileMemPolicy(Options{

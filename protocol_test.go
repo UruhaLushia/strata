@@ -2,11 +2,13 @@ package strata
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -15,12 +17,177 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/UruhaLushia/strata/codec"
+	"github.com/UruhaLushia/strata/codec/flate"
+	"github.com/UruhaLushia/strata/codec/s2"
+	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
 func requireOK(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+type allocatingCodec struct {
+	codec.Codec
+	fail *bool
+}
+
+func (allocatingCodec) ID() uint8 { return 128 }
+
+func (c allocatingCodec) NewDecoder() (codec.Decoder, error) {
+	if *c.fail {
+		return nil, os.ErrInvalid
+	}
+	d, err := c.Codec.NewDecoder()
+	if err != nil {
+		return nil, err
+	}
+	return allocatingDecoder{d}, nil
+}
+
+type allocatingDecoder struct{ codec.Decoder }
+
+func (d allocatingDecoder) Decode(_ []byte, src []byte, limit int) ([]byte, error) {
+	return d.Decoder.Decode(nil, src, limit)
+}
+
+func TestCodecsRoundTripAndMigration(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	small, large := now.Add(-6*time.Minute), now.Add(-5*time.Minute)
+	var failDecode bool
+	z, sn := zstd.New(zstd.Fastest), s2.New(s2.Default)
+	var blob = make([]byte, 48<<10)
+	rng := rand.NewChaCha8([32]byte{3})
+	_, err := rng.Read(blob)
+	requireOK(t, err)
+	for _, tc := range []struct {
+		name string
+		c    codec.Codec
+	}{
+		{"none", nil},
+		{"zstd", z},
+		{"s2", sn},
+		{"flate", flate.New(-1)},
+		{"allocating", allocatingCodec{Codec: z, fail: &failDecode}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, s := testDB(t, &now, Options{Codec: tc.c})
+			defer func() { _ = db.Close() }()
+			id, cfg := s.id, s.cfg
+			appendValue(t, s, small, 5)
+			seedHighCardMinute(t, s, large, 17000, func(i int) []string {
+				return []string{fmt.Sprintf("codec-%05d.example.invalid", i), "net"}
+			})
+			requireOK(t, s.Append(large, Summary{}, testRow(9, "codec-00100.example.invalid", "watch"), testRow(7, "codec-00000.example.invalid", "watch")))
+			requireOK(t, mustRegion(t, db, "codec").Put("blob", blob))
+			requireOK(t, db.Compact())
+
+			check := func(target uint8) {
+				t.Helper()
+				for _, sec := range db.head.sections[:secTSInvert+1] {
+					if sec.length != 0 && sec.codec != 0 && sec.codec != target {
+						t.Fatalf("unexpected codec after compaction: %+v", sec)
+					}
+				}
+				if db.head.sections[secTSBlocks].codec != target || db.dict.dims[dictDimKey{series: id, dim: 0}].ext == nil || len(db.invert) == 0 {
+					t.Fatal("missing target codec, external dictionary, or inverted index")
+				}
+				r := mustRegion(t, db, "codec")
+				assertKV(t, r, "blob", blob, true)
+				entries, err := db.readKVBlock(db.kvSST[0])
+				requireOK(t, err)
+				if len(entries) != 1 || !entries[0].rawBlob {
+					t.Fatal("incompressible large value did not use the raw blob path")
+				}
+				assertQuerySum(t, s, AggregateQuery{From: small, To: large, Filters: tagFilter(0, TagEq, "a")}, 5)
+				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(0, TagEq, "codec-00000.example.invalid")}, 8)
+				filters := tagFilter(1, TagEq, "watch")
+				agg, err := s.Aggregate(t.Context(), AggregateQuery{AllTime: true, Filters: filters, GroupDims: []int{1}, TopK: 1})
+				requireOK(t, err)
+				defer agg.Release()
+				want := [4]int64{16, 7, 9, 7}
+				if agg.Summary.Values != want || !slices.Equal(agg.Groups[0], []GroupRow{{Tag: "watch", Summary: Summary{Values: want, Mask: 0x0f}}}) {
+					t.Fatalf("lost aggregate values or OpLast order: %+v", agg)
+				}
+				page, err := s.Read(t.Context(), ReadRequest{AllTime: true, Filters: filters, Limit: 2})
+				requireOK(t, err)
+				defer page.Release()
+				if len(page.Rows) != 2 || page.Rows[0].Tags[0] != "codec-00100.example.invalid" || page.Rows[1].Tags[0] != "codec-00000.example.invalid" {
+					t.Fatalf("lost raw row order: %+v", page.Rows)
+				}
+				count, sum, err := scanCountSumErr(t.Context(), s, ScanQuery{AllTime: true, Filters: filters})
+				requireOK(t, err)
+				if count != 2 || sum != 16 {
+					t.Fatalf("Scan count=%d sum=%d", count, sum)
+				}
+			}
+			db = reopenTestDB(t, db, db.path, db.opts)
+			s = mustSeries(t, db, id, cfg)
+			check(db.codecs.target)
+			if tc.c == nil {
+				var previous codec.Codec
+				for _, target := range []codec.Codec{z, sn, nil} {
+					opts := Options{Codec: target, Now: func() time.Time { return now }}
+					if previous != nil {
+						opts.Codecs = []codec.Codec{previous}
+					}
+					db = reopenTestDB(t, db, db.path, opts)
+					requireOK(t, db.Compact())
+					opts.Codecs = nil
+					db = reopenTestDB(t, db, db.path, opts)
+					s = mustSeries(t, db, id, cfg)
+					check(db.codecs.target)
+					previous = target
+				}
+			}
+			if tc.name == "allocating" {
+				db.reclaim()
+				failDecode = true
+				defer func() { failDecode = false }()
+				dim := db.dict.dims[dictDimKey{series: id, dim: 0}]
+				nextID := dim.nextID
+				if err := s.Append(now, Summary{}, testRow(1, "codec-00000.example.invalid", "new")); !errors.Is(err, os.ErrInvalid) || dim.nextID != nextID {
+					t.Fatalf("failed reverse lookup allocated a tag ID: err=%v next=%d", err, dim.nextID)
+				}
+				q := AggregateQuery{AllTime: true, Filters: tagFilter(0, TagEq, "codec-00000.example.invalid")}
+				if _, err := s.Aggregate(t.Context(), q); !errors.Is(err, os.ErrInvalid) {
+					t.Fatalf("dictionary failure returned as a miss: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestMissingCodecPreservesRefreshView(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	db, s := testDB(t, &now, Options{})
+	defer func() { _ = db.Close() }()
+	appendValue(t, s, now.Add(-5*time.Minute), 7)
+	requireOK(t, db.Compact())
+	ro := reopenTestDB(t, nil, db.path, Options{ReadOnly: true, UseMmap: true})
+	defer ro.Close()
+	reader := mustSeries(t, ro, s.id, s.cfg)
+	view := ro.view
+	db = reopenTestDB(t, db, db.path, Options{Codec: zstd.New(zstd.Fastest), Now: db.opts.Now})
+	requireOK(t, db.Compact())
+	if err := ro.Refresh(); !errors.Is(err, codec.ErrUnsupportedCodec) || ro.view != view {
+		t.Fatalf("Refresh changed the old view: %v", err)
+	}
+	if other, err := Open(db.path, Options{ReadOnly: true}); !errors.Is(err, codec.ErrUnsupportedCodec) {
+		if other != nil {
+			_ = other.Close()
+		}
+		t.Fatalf("Open without decoder: %v", err)
+	}
+	page, err := reader.Read(t.Context(), ReadRequest{AllTime: true, Limit: 1})
+	requireOK(t, err)
+	defer page.Release()
+	if len(page.Rows) != 1 || page.Rows[0].Values[0] != 7 {
+		t.Fatalf("old view lost sealed rows: %+v", page.Rows)
 	}
 }
 
@@ -136,7 +303,9 @@ func TestPackageBoundaries(t *testing.T) {
 		f, err := parser.ParseFile(fset, name, nil, 0)
 		requireOK(t, err)
 		for _, imp := range f.Imports {
-			if strings.Contains(imp.Path.Value, "/internal/") {
+			path := strings.Trim(imp.Path.Value, "\"")
+			if strings.Contains(path, "/internal/") || !strings.HasSuffix(name, "_test.go") &&
+				(strings.HasPrefix(path, "github.com/klauspost/compress") || path == "github.com/UruhaLushia/strata/eventlog") {
 				t.Errorf("%s imports %s", name, imp.Path.Value)
 			}
 		}
@@ -316,8 +485,6 @@ func TestRejectLegacyFormats(t *testing.T) {
 	requireOK(t, db.Close())
 	base, err := os.ReadFile(db.path)
 	requireOK(t, err)
-	enc := newZstdEncoder(CompressionDefault, 64<<10)
-	defer enc.Close()
 	for _, size := range []int{64, 104, 0} {
 		path := filepath.Join(t.TempDir(), "legacy.db")
 		requireOK(t, os.WriteFile(path, base, 0o600))
@@ -330,26 +497,23 @@ func TestRejectLegacyFormats(t *testing.T) {
 			if d.count == 0 {
 				t.Fatal("missing TS index")
 			}
-			packed, err := sectionRaw(f, *d, nil)
-			requireOK(t, err)
-			current, err := zstdDecompress(packed)
+			current, err := sectionRaw(f, *d, nil)
 			requireOK(t, err)
 			raw := make([]byte, int(d.count)*size)
 			for i := range int(d.count) {
 				copy(raw[i*size:i*size+52], current[i*tsIndexEntryBytes:i*tsIndexEntryBytes+52])
 			}
-			z := enc.EncodeAll(raw, nil)
 			end := fileSize(t, path)
-			_, err = f.WriteAt(z, end)
+			_, err = f.WriteAt(raw, end)
 			requireOK(t, err)
-			d.offset, d.length, d.rawLen, d.crc = uint64(end), uint64(len(z)), uint32(len(raw)), crc(z)
+			d.offset, d.length, d.rawLen, d.crc = uint64(end), uint64(len(raw)), uint32(len(raw)), crc(raw)
 		})
 		reader, err := Open(path, Options{ReadOnly: true})
 		if err == nil {
 			_ = reader.Close()
 		}
 		if size == 0 {
-			check(err, "unsupported dictionary codec")
+			check(err, "unsupported codec")
 		} else {
 			check(err, "invalid TS index entry size")
 		}
@@ -358,17 +522,18 @@ func TestRejectLegacyFormats(t *testing.T) {
 	legacyRow := make([]byte, 68+1+65)
 	binary.LittleEndian.PutUint16(legacyRow, 7)
 	legacyRow[2], legacyRow[35], legacyRow[68], legacyRow[69], legacyRow[133] = resMinuteHR, 0x0f, 1, 1, 0x0f
-	wrappedRow := enc.EncodeAll(legacyRow, nil)
-	_, err = decodeBlock(wrappedRow)
+	wrappedRow := append([]byte{blockTagRawSmall}, legacyRow...)
+	_, err = decodeBlock(wrappedRow, 0, nil)
 	check(err, "invalid block marker")
 	slot := newQuerySlot()
 	defer slot.close()
-	_, _, err = decodeSmallBlockCols(wrappedRow, slot)
+	_, _, err = decodeSmallBlockCols(wrappedRow, 0, slot)
 	check(err, "invalid small column block")
-	stream, err := encodeBlockLevel(sealedBlock{series: 7, res: resMinuteHR, rows: make([]idRow, 256)}, CompressionFastest)
+	stream, err := encodeBlockLevel(sealedBlock{series: 7, res: resMinuteHR, rows: make([]idRow, 256)}, zstd.Fastest)
 	requireOK(t, err)
-	_, err = decodeBlock(enc.EncodeAll(stream[len(blockStreamsMagic):], nil))
-	check(err, "invalid block marker")
+	stream[0] = blockTagRawSmall
+	_, err = decodeBlock(stream, 0, nil)
+	check(err, "block row count too large")
 
 	legacyDelta := []byte{0, 0xd2, 0x8f, 0x53, 0x32, 0}
 	if _, _, err := decodeDelta(legacyDelta); err == nil {
@@ -384,10 +549,8 @@ func TestRejectLegacyFormats(t *testing.T) {
 			t.Fatal("accepted old batch magic or truncated key")
 		}
 	}
-	block := encodeKVBlockWithEncoder([]kvSSTEntry{{region: 1, key: []byte("k"), value: []byte("v"), modRev: 1}}, enc)
-	plain, err := zstdDecompress(block)
-	requireOK(t, err)
-	if _, err := decodeKVBlock(enc.EncodeAll(append([]byte{0xb7, 0x4b, 0x56, 0x32}, plain...), nil)); err == nil {
+	plain := encodeKVBlock([]kvSSTEntry{{region: 1, key: []byte("k"), value: []byte("v"), modRev: 1}})
+	if _, err := decodeKVBlock(append([]byte{0xb7, 0x4b, 0x56, 0x32}, plain...)); err == nil {
 		t.Fatal("accepted old KV block magic")
 	}
 }

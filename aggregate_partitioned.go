@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"bytes"
 	"context"
 )
 
@@ -132,6 +131,9 @@ func executePartitionedTopK(ctx context.Context, pq *preparedQuery, out *Aggrega
 		}
 	}
 	pushDenseToHeap(&h, dense, 0)
+	if reader.err != nil {
+		return nil, reader.err
+	}
 
 	var activeParts []int
 	for part := 1; part < numParts; part++ {
@@ -166,8 +168,8 @@ func aggregateBlockPart(block sealedBlock, slotIdx int, filters []compiledFilter
 		return sum, matched, nil
 	}
 	allowDim0BS := ps.lastCount == 0
-	if !bytes.HasPrefix(block.encoded, blockStreamsMagic[:]) {
-		count, cols, err := decodeSmallBlockCols(block.encoded, slot)
+	if !isStreamBlock(block.encoded) {
+		count, cols, err := decodeSmallBlockCols(block.encoded, block.codecID, slot)
 		if err != nil {
 			return Summary{}, false, err
 		}
@@ -189,7 +191,7 @@ func aggregateBlockPart(block sealedBlock, slotIdx int, filters []compiledFilter
 		}
 		return ps.summary, true, nil
 	}
-	view, err := parseColumnarBlock(block.encoded)
+	view, err := parseColumnarBlock(block.encoded, block.codecID)
 	if err != nil {
 		return Summary{}, false, err
 	}

@@ -49,8 +49,8 @@ func (c decodedCol) maskAt(row int) byte {
 	return c.data[row]
 }
 
-func decodeSmallBlockCols(raw []byte, slot *querySlot) (int, [streamColumnCount]decodedCol, error) {
-	plain, err := slot.decodeZstd(raw)
+func decodeSmallBlockCols(raw []byte, id uint8, slot *querySlot) (int, [streamColumnCount]decodedCol, error) {
+	plain, err := smallBlockPlain(raw, id, slot)
 	if err != nil {
 		return 0, [streamColumnCount]decodedCol{}, err
 	}
@@ -75,7 +75,7 @@ func smallBlockPrefix(plain []byte) (int, int, error) {
 		return 0, 0, errors.New("strata: invalid column row count")
 	}
 	off += n
-	if count > 1<<20 || off >= len(plain) {
+	if count >= 256 || off >= len(plain) {
 		return 0, 0, errors.New("strata: invalid column row count")
 	}
 	if plain[off] != blockColumnarMarker {
@@ -182,8 +182,8 @@ func appendPageFromStream(view columnarBlockView, meta SegmentMeta, d dictionary
 	return appendPage(&view, nil, meta, d, series, arity, isRange, rangeLo, rows, n, slot, page)
 }
 
-func appendPageFromCols(cols *[streamColumnCount]decodedCol, meta SegmentMeta, d dictionary, series uint16, arity int, isRange bool, rangeLo int, rows []int32, n int, page *PageResult) {
-	_ = appendPage(nil, cols, meta, d, series, arity, isRange, rangeLo, rows, n, nil, page)
+func appendPageFromCols(cols *[streamColumnCount]decodedCol, meta SegmentMeta, d dictionary, series uint16, arity int, isRange bool, rangeLo int, rows []int32, n int, page *PageResult) error {
+	return appendPage(nil, cols, meta, d, series, arity, isRange, rangeLo, rows, n, nil, page)
 }
 
 func appendPage(view *columnarBlockView, cols *[streamColumnCount]decodedCol, meta SegmentMeta, d dictionary, series uint16, arity int, isRange bool, rangeLo int, rows []int32, n int, slot *querySlot, page *PageResult) error {
@@ -208,7 +208,11 @@ func appendPage(view *columnarBlockView, cols *[streamColumnCount]decodedCol, me
 			if !isRange {
 				r = int(rows[i])
 			}
-			outRows[i].Tags[dim] = d.resolve(series, uint8(dim), col.tagAt(r))
+			tag, err := d.resolve(series, uint8(dim), col.tagAt(r))
+			if err != nil {
+				return err
+			}
+			outRows[i].Tags[dim] = tag
 		}
 	}
 	for m := range 4 {

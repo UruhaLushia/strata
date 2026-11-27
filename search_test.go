@@ -258,9 +258,6 @@ func TestExternalDictThreeTierPriority(t *testing.T) {
 	base := now.Add(-6 * time.Hour)
 	seedHighCardMinute(t, s, base, 17000, func(i int) []string { return []string{fmt.Sprintf("m-ext-%05d", i)} })
 	mustTestOK(t, db.Compact())
-	if db.head.sections[secTSDict].codec != 1 {
-		t.Fatal("fixture did not seal an external dictionary")
-	}
 	seedHighCardMinute(t, s, base.Add(time.Hour), 100, func(i int) []string { return []string{fmt.Sprintf("b-tail-%03d", i)} })
 	dim := db.dict.dims[dictDimKey{series: s.id, dim: 0}]
 	if dim == nil || dim.ext == nil || dim.tailBase != 17001 {
@@ -274,7 +271,9 @@ func TestExternalDictThreeTierPriority(t *testing.T) {
 		1: "m-ext-00000", 513: "a-extra-ext-513", 16385: "a-extra-ext-16k",
 		17000: "m-ext-16999", 17001: "b-tail-000", 17005: "a-extra-tail-005", 17100: "b-tail-099",
 	} {
-		if got := string(reader.resolveBytes(id)); got != want || snap.resolve(s.id, 0, id) != want {
+		resolved, err := snap.resolve(s.id, 0, id)
+		requireOK(t, err)
+		if got := string(reader.resolveBytes(id)); got != want || resolved != want || reader.err != nil {
 			t.Fatalf("resolveBytes(%d)=%q want=%q", id, got, want)
 		}
 	}

@@ -21,8 +21,9 @@ func decodeDict(f *osFile, desc sectionDesc, mapped []byte, view *fileView, d *d
 		return errors.New("strata: invalid dict magic")
 	}
 	dirCompLen := binary.LittleEndian.Uint32(trRaw[4:8])
+	dirRawLen := binary.LittleEndian.Uint32(trRaw[8:12])
 	dirCRC := binary.LittleEndian.Uint32(trRaw[12:16])
-	if uint64(dirCompLen)+16 > desc.length {
+	if dirRawLen > maxSectionRawBytes || uint64(dirCompLen)+16 > desc.length {
 		return errors.New("strata: invalid dict directory length")
 	}
 	dirOff := desc.offset + desc.length - 16 - uint64(dirCompLen)
@@ -36,9 +37,15 @@ func decodeDict(f *osFile, desc sectionDesc, mapped []byte, view *fileView, d *d
 	if crc(dirComp) != dirCRC {
 		return errors.New("strata: dictionary CRC mismatch")
 	}
-	raw, err := zstdDecompress(dirComp)
-	if err != nil {
-		return err
+	raw := dirComp
+	if dirRawLen != 0 {
+		raw, err = view.codecs.decode(desc.codec, nil, dirComp, int(dirRawLen))
+		if err != nil {
+			return err
+		}
+		if len(raw) != int(dirRawLen) {
+			return errors.New("strata: invalid dict directory length")
+		}
 	}
 	return parseDictDir(raw, desc, view, d, series)
 }

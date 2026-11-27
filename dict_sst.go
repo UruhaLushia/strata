@@ -5,7 +5,7 @@ import (
 	"hash"
 	"slices"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
 
 type dictSSTWriter struct {
@@ -13,7 +13,7 @@ type dictSSTWriter struct {
 	areaStart  int64
 	pos        int64
 	secHash    hash.Hash32
-	enc        *zstd.Encoder
+	enc        codec.Encoder
 	rawBuf     []byte
 	compBuf    []byte
 	prevKey    []byte
@@ -24,7 +24,7 @@ type dictSSTWriter struct {
 	blocks     []dictPageDesc
 }
 
-func newDictSSTWriter(tf *osFile, pos int64, secHash hash.Hash32, enc *zstd.Encoder) *dictSSTWriter {
+func newDictSSTWriter(tf *osFile, pos int64, secHash hash.Hash32, enc codec.Encoder) *dictSSTWriter {
 	return &dictSSTWriter{
 		tf:        tf,
 		areaStart: pos,
@@ -74,11 +74,13 @@ func (w *dictSSTWriter) flush() error {
 	copy(plain, hdr[:hn])
 	copy(plain[hn:], w.rawBuf)
 
-	w.compBuf = w.enc.EncodeAll(plain, w.compBuf[:0])
-	out := plain
+	out, compressed, err := encodeSmaller(w.enc, w.compBuf[:0], plain, maxDictPageRawBytes)
+	if err != nil {
+		return err
+	}
 	var rawLen uint32
-	if len(w.compBuf) < len(plain) {
-		out = w.compBuf
+	if compressed {
+		w.compBuf = out
 		rawLen = uint32(len(plain))
 	}
 	relOff := uint64(w.pos - w.areaStart)
@@ -104,7 +106,7 @@ type dictSSTEntry struct {
 
 type dictSSTStream struct {
 	ext      *dictExtDim
-	dec      *zstd.Decoder
+	slot     querySlot
 	blkIdx   int
 	plainBuf []byte
 	keyBuf   []byte
@@ -113,14 +115,11 @@ type dictSSTStream struct {
 }
 
 func newDictSSTStream(ext *dictExtDim) *dictSSTStream {
-	return &dictSSTStream{ext: ext, dec: getZstdDecoder()}
+	return &dictSSTStream{ext: ext, slot: querySlot{codecs: ext.view.codecs}}
 }
 
 func (s *dictSSTStream) close() {
-	if s.dec != nil {
-		putZstdDecoder(s.dec)
-		s.dec = nil
-	}
+	s.slot.close()
 }
 
 func (s *dictSSTStream) next() (dictSSTEntry, bool, error) {
@@ -128,7 +127,7 @@ func (s *dictSSTStream) next() (dictSSTEntry, bool, error) {
 		if s.ext == nil || s.blkIdx >= len(s.ext.sstBlocks) {
 			return dictSSTEntry{}, false, nil
 		}
-		plain, err := s.ext.readPageInto(s.ext.sstStartOff, s.ext.sstBlocks[s.blkIdx], &s.plainBuf, s.dec)
+		plain, err := s.ext.readPageInto(s.ext.sstStartOff, s.ext.sstBlocks[s.blkIdx], &s.plainBuf, &s.slot)
 		if err != nil {
 			return dictSSTEntry{}, false, err
 		}
@@ -166,7 +165,7 @@ func streamCopyDictRange(tf *osFile, pos int64, secHash hash.Hash32, src *osFile
 	return pos, nil
 }
 
-func encodeFwdPage(vals []string, plainBuf, compBuf *[]byte, enc *zstd.Encoder) []byte {
+func encodeFwdPage(vals []string, plainBuf *[]byte, compBuf []byte, enc codec.Encoder) ([]byte, bool, error) {
 	count := len(vals)
 	totalStr := 0
 	for _, v := range vals {
@@ -188,11 +187,10 @@ func encodeFwdPage(vals []string, plainBuf, compBuf *[]byte, enc *zstd.Encoder) 
 		strOff += uint32(len(v))
 	}
 	binary.LittleEndian.PutUint32(p[2+count*4:6+count*4], strOff)
-	*compBuf = enc.EncodeAll(p, (*compBuf)[:0])
-	return *compBuf
+	return encodeSmaller(enc, compBuf[:0], p, maxDictPageRawBytes)
 }
 
-func writeExtDimMergedSST(tf *osFile, pos int64, secHash hash.Hash32, enc *zstd.Encoder, oldExt *dictExtDim, tail []dictSSTEntry, overridden map[uint32]string, keepBits []uint64) (int64, []byte, []uint32, []dictPageDesc, error) {
+func writeExtDimMergedSST(tf *osFile, pos int64, secHash hash.Hash32, enc codec.Encoder, oldExt *dictExtDim, tail []dictSSTEntry, overridden map[uint32]string, keepBits []uint64) (int64, []byte, []uint32, []dictPageDesc, error) {
 	slices.SortFunc(tail, func(a, b dictSSTEntry) int {
 		if a.key < b.key {
 			return -1

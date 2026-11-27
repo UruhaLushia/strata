@@ -564,11 +564,12 @@ func TestQueryFilterCompileDoesNotBlockAppendAndCompact(t *testing.T) {
 			}{
 				{0, "svc-00000", "override-alt", 1}, {2, "app-149", "override-app", 113},
 			} {
-				id := db.dict.lookup(s.id, tc.dim, tc.old)
+				id, err := db.dict.lookup(s.id, tc.dim, tc.old)
+				requireOK(t, err)
 				if id == 0 {
 					t.Fatalf("missing override source %q", tc.old)
 				}
-				db.dict.apply(dictEntry{id: id, series: s.id, dim: tc.dim, value: tc.new})
+				requireOK(t, db.dict.apply(dictEntry{id: id, series: s.id, dim: tc.dim, value: tc.new}))
 				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(int(tc.dim), TagEq, tc.old)}, 0)
 				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(int(tc.dim), TagEq, tc.new)}, tc.want)
 				assertQuerySum(t, s, AggregateQuery{AllTime: true, Filters: tagFilter(int(tc.dim), TagPrefix, tc.old)}, 0)

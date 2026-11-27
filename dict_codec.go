@@ -50,13 +50,13 @@ func readDictInt64(raw []byte, off *int) (int64, error) {
 	return int64(value), err
 }
 
-func (s *dictDimSnap) lookup(value string) uint32 {
+func (s *dictDimSnap) lookup(value string) (uint32, error) {
 	if (s.count == 0 && len(s.extra) == 0) || value == "" {
-		return 0
+		return 0, nil
 	}
 	for id, v := range s.extra {
 		if v == value {
-			return id
+			return id, nil
 		}
 	}
 	if s.ext != nil {
@@ -65,14 +65,19 @@ func (s *dictDimSnap) lookup(value string) uint32 {
 				continue
 			}
 			if v := s.resolveArena(id); len(v) == len(value) && v == value {
-				return id
+				return id, nil
 			}
 		}
-		if id := s.ext.lookupSST(value); id != 0 && !hasExtraOverride(s.extra, id) {
-			return id
+		id, err := s.ext.lookupSST(value)
+		if err != nil || id != 0 && !hasExtraOverride(s.extra, id) {
+			return id, err
 		}
-		return 0
+		return 0, nil
 	}
+	return s.lookupInline(value), nil
+}
+
+func (s *dictDimSnap) lookupInline(value string) uint32 {
 	if s.sorted != nil {
 		idx := sort.Search(len(s.sorted), func(i int) bool {
 			return s.resolveArena(s.sorted[i]) >= value
@@ -109,12 +114,16 @@ func (s *dictDimSnap) lookup(value string) uint32 {
 	return 0
 }
 
-func (s *dictDimSnap) matchPrefixIDs(prefix string, dst []uint32) []uint32 {
+func (s *dictDimSnap) matchPrefixIDs(prefix string, dst []uint32) ([]uint32, error) {
 	if s.count == 0 && len(s.extra) == 0 {
-		return dst
+		return dst, nil
 	}
 	if s.ext != nil {
-		dst = s.ext.matchPrefixSST(prefix, s.extra, dst)
+		var err error
+		dst, err = s.ext.matchPrefixSST(prefix, s.extra, dst)
+		if err != nil {
+			return nil, err
+		}
 		for id := s.tailBase; id < s.nextID; id++ {
 			if hasExtraOverride(s.extra, id) {
 				continue
@@ -128,7 +137,7 @@ func (s *dictDimSnap) matchPrefixIDs(prefix string, dst []uint32) []uint32 {
 				dst = append(dst, id)
 			}
 		}
-		return dst
+		return dst, nil
 	}
 	if s.sorted != nil {
 		idx := sort.Search(len(s.sorted), func(i int) bool {
@@ -158,22 +167,30 @@ func (s *dictDimSnap) matchPrefixIDs(prefix string, dst []uint32) []uint32 {
 				dst = append(dst, id)
 			}
 		}
-		return dst
+		return dst, nil
 	}
 	for id := uint32(1); id < s.nextID; id++ {
-		if v := s.resolve(id); v != "" && strings.HasPrefix(v, prefix) {
+		v, overridden := s.extra[id]
+		if !overridden {
+			v = s.resolveArena(id)
+		}
+		if v != "" && strings.HasPrefix(v, prefix) {
 			dst = append(dst, id)
 		}
 	}
-	return dst
+	return dst, nil
 }
 
-func (s *dictDimSnap) matchScanIDs(op TagOp, target string, dst []uint32) []uint32 {
+func (s *dictDimSnap) matchScanIDs(op TagOp, target string, dst []uint32) ([]uint32, error) {
 	if s.count == 0 && len(s.extra) == 0 {
-		return dst
+		return dst, nil
 	}
 	if s.ext != nil {
-		dst = s.ext.matchScanFwd(op, target, s.extra, dst)
+		var err error
+		dst, err = s.ext.matchScanFwd(op, target, s.extra, dst)
+		if err != nil {
+			return nil, err
+		}
 		for id := s.tailBase; id < s.nextID; id++ {
 			if hasExtraOverride(s.extra, id) {
 				continue
@@ -187,14 +204,18 @@ func (s *dictDimSnap) matchScanIDs(op TagOp, target string, dst []uint32) []uint
 				dst = append(dst, id)
 			}
 		}
-		return dst
+		return dst, nil
 	}
 	for id := uint32(1); id < s.nextID; id++ {
-		if v := s.resolve(id); v != "" && tagMatches(op, v, target) {
+		v, overridden := s.extra[id]
+		if !overridden {
+			v = s.resolveArena(id)
+		}
+		if v != "" && tagMatches(op, v, target) {
 			dst = append(dst, id)
 		}
 	}
-	return dst
+	return dst, nil
 }
 
 func dedupeUint32(ids []uint32) []uint32 {

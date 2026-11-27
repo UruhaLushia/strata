@@ -201,13 +201,15 @@ func (c *Client) Scan(ctx context.Context, seriesID uint16, q ScanQuery, fn func
 
 func (c *Client) ScanSeq(ctx context.Context, seriesID uint16, q ScanQuery) iter.Seq2[ScanBatch, error] {
 	return func(yield func(ScanBatch, error) bool) {
+		stopped := false
 		err := c.Scan(ctx, seriesID, q, func(batch ScanBatch) error {
 			if !yield(batch, nil) {
+				stopped = true
 				return ErrStopScan
 			}
 			return nil
 		})
-		if err != nil {
+		if err != nil && !stopped {
 			yield(ScanBatch{}, err)
 		}
 	}

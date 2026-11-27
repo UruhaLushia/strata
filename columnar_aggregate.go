@@ -1,13 +1,11 @@
 package strata
 
-import "bytes"
-
 func aggregateEncodedBlock(block sealedBlock, slotIdx, arity int, filters []compiledFilter, groups []aggregateGroups, groupDims []int, ops [4]MetricOp, slot *querySlot, arenaBudget int) (Summary, bool, error) {
 	allowDim0BS := !opsHasLast(ops)
-	if !bytes.HasPrefix(block.encoded, blockStreamsMagic[:]) {
-		return aggregateSmallEncodedBlock(block.encoded, block.summary, slotIdx, arity, filters, groups, groupDims, ops, allowDim0BS, slot)
+	if !isStreamBlock(block.encoded) {
+		return aggregateSmallEncodedBlock(block.encoded, block.codecID, block.summary, slotIdx, arity, filters, groups, groupDims, ops, allowDim0BS, slot)
 	}
-	view, err := parseColumnarBlock(block.encoded)
+	view, err := parseColumnarBlock(block.encoded, block.codecID)
 	if err != nil {
 		return Summary{}, false, err
 	}
@@ -136,8 +134,8 @@ func sumStreamMetricsCached(cache *blockColCache, sel rowSelection) (Summary, er
 	return sum, nil
 }
 
-func aggregateSmallEncodedBlock(raw []byte, blockSummary Summary, slotIdx, arity int, filters []compiledFilter, groups []aggregateGroups, groupDims []int, ops [4]MetricOp, allowDim0BS bool, slot *querySlot) (Summary, bool, error) {
-	count, cols, parseErr := decodeSmallBlockCols(raw, slot)
+func aggregateSmallEncodedBlock(raw []byte, id uint8, blockSummary Summary, slotIdx, arity int, filters []compiledFilter, groups []aggregateGroups, groupDims []int, ops [4]MetricOp, allowDim0BS bool, slot *querySlot) (Summary, bool, error) {
+	count, cols, parseErr := decodeSmallBlockCols(raw, id, slot)
 	if parseErr != nil {
 		return Summary{}, false, parseErr
 	}

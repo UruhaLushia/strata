@@ -224,42 +224,45 @@ func (dim *dictDim) cacheHot(value string, id uint32, budget int) {
 	dim.revMu.Unlock()
 }
 
-func (dim *dictDim) lookupExt(value string) (uint32, bool) {
+func (dim *dictDim) lookupExt(value string) (uint32, bool, error) {
 	for id, v := range dim.extra {
 		if v == value {
-			return id, false
+			return id, false, nil
 		}
 	}
 	if id := dim.tailByKey[value]; id != 0 && !hasExtraOverride(dim.extra, id) {
-		return id, false
+		return id, false, nil
 	}
 	dim.revMu.RLock()
 	id := dim.hot.get(value)
 	dim.revMu.RUnlock()
 	if id != 0 && !hasExtraOverride(dim.extra, id) {
-		return id, false
+		return id, false, nil
 	}
-	if id = dim.ext.lookupSST(value); id != 0 && !hasExtraOverride(dim.extra, id) {
-		return id, true
+	id, err := dim.ext.lookupSST(value)
+	if err != nil {
+		return 0, false, err
 	}
-	return 0, false
+	if id != 0 && !hasExtraOverride(dim.extra, id) {
+		return id, true, nil
+	}
+	return 0, false, nil
 }
 
-func (d *dictionary) internExt(dim *dictDim, value string) (uint32, bool) {
-	if id, fromSST := dim.lookupExt(value); id != 0 {
-		if fromSST {
-			dim.cacheHot(value, id, d.hotBudget)
-		}
-		return id, false
+func (d *dictionary) internExtTail(dim *dictDim, value string) (uint32, bool, error) {
+	if id := dim.tailByKey[value]; id != 0 && !hasExtraOverride(dim.extra, id) {
+		return id, false, nil
 	}
 	id := dim.nextID
-	dim.appendValue(id, value)
+	if err := dim.appendValue(id, value); err != nil {
+		return 0, false, err
+	}
 	if dim.tailByKey == nil {
 		dim.tailByKey = make(map[string]uint32)
 	}
 	dim.tailByKey[value] = id
 	dim.cacheHot(value, id, d.hotBudget)
-	return id, true
+	return id, true, nil
 }
 
 func (d *dictionary) reclaim() {

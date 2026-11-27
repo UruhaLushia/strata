@@ -9,12 +9,27 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/UruhaLushia/strata/codec"
+	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
-func encodeBlockLevel(b sealedBlock, level CompressionLevel) ([]byte, error) {
-	enc := newZstdEncoder(level, 128<<10)
+func encodeBlockLevel(b sealedBlock, level zstd.Level) ([]byte, error) {
+	enc, err := zstd.New(level).NewEncoder(128 << 10)
+	if err != nil {
+		return nil, err
+	}
 	defer enc.Close()
 	return encodeBlockWithEncoder(b, enc)
+}
+
+func testCodecTable(t testing.TB, c codec.Codec) *codecTable {
+	t.Helper()
+	table, err := newCodecTable(Options{Codec: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return table
 }
 
 func dictionarySnapshot(d dictionary, series uint16) dictionary {

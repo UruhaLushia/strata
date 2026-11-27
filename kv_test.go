@@ -12,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/UruhaLushia/strata/codec"
+	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
 func mustTestOK(t *testing.T, err error) {
@@ -369,7 +372,7 @@ func TestKVSectionPassthrough(t *testing.T) {
 		now := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
 		db, s := testDB(t, &now, Options{})
 		defer db.Close()
-		if !canPassthroughKV(db.head, 0) {
+		if !canPassthroughKV(db.head, 0, db.codecs.target) {
 			t.Fatal("empty KV is not eligible for passthrough")
 		}
 		r := mustRegion(t, db, "catalog")
@@ -377,7 +380,7 @@ func TestKVSectionPassthrough(t *testing.T) {
 		mustTestOK(t, db.Compact())
 		saved := db.head
 		if saved.sections[secKVSSTBlocks].length != 0 || saved.sections[secKVLargeBlobs].length != 0 ||
-			saved.sections[secKVSSTIndex].length == 0 || !canPassthroughKV(saved, saved.sealedKVRev) {
+			saved.sections[secKVSSTIndex].length == 0 || !canPassthroughKV(saved, saved.sealedKVRev, db.codecs.target) {
 			t.Fatalf("invalid catalog-only sections: %+v", saved.sections[:3])
 		}
 		appendValue(t, s, now.Add(-time.Hour), 1)
@@ -400,7 +403,7 @@ func TestKVSectionPassthrough(t *testing.T) {
 		mustTestOK(t, r.NewBatch().Put("big", blob).Put("delete", nil).In(other).Put("clear", nil).Commit())
 		mustTestOK(t, db.Compact())
 		saved := db.head
-		if saved.sections[secKVLargeBlobs].length <= 64<<10 || !canPassthroughKV(saved, saved.sealedKVRev) {
+		if saved.sections[secKVLargeBlobs].length <= 64<<10 || !canPassthroughKV(saved, saved.sealedKVRev, db.codecs.target) {
 			t.Fatalf("invalid passthrough fixture: %+v", saved.sections[:3])
 		}
 
@@ -451,7 +454,7 @@ func TestKVSectionPassthrough(t *testing.T) {
 		check := func(wantFlags uint8, wantCopy bool) {
 			t.Helper()
 			flags := db.head.sections[secKVSSTIndex].flags
-			if flags&(kvFlagTTLChecked|kvFlagHasLiveTTL) != wantFlags || canPassthroughKV(db.head, db.head.sealedKVRev) != wantCopy {
+			if flags&(kvFlagTTLChecked|kvFlagHasLiveTTL) != wantFlags || canPassthroughKV(db.head, db.head.sealedKVRev, db.codecs.target) != wantCopy {
 				t.Fatalf("flags=%#x want=%#x passthrough want=%v", flags, wantFlags, wantCopy)
 			}
 		}
@@ -478,7 +481,7 @@ func TestKVSectionPassthrough(t *testing.T) {
 
 func TestKVSSTIndexCompressionAndCodecError(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
-	db, s := testDB(t, &now, Options{})
+	db, s := testDB(t, &now, Options{Codec: zstd.New(zstd.Fastest)})
 	defer func() { _ = db.Close() }()
 	r := mustRegion(t, db, "idx")
 	mustTestOK(t, r.Put("a", []byte("1")))
@@ -528,7 +531,7 @@ func TestKVSSTIndexCompressionAndCodecError(t *testing.T) {
 		_ = bad.Close()
 		t.Fatal("Open accepted unsupported KV index codec")
 	}
-	if !strings.Contains(err.Error(), "unsupported KV index codec") {
+	if !errors.Is(err, codec.ErrUnsupportedCodec) {
 		t.Fatalf("unsupported codec err=%v", err)
 	}
 }

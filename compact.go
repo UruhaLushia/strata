@@ -71,7 +71,7 @@ func (db *DB) Compact() error {
 		db.mu.Unlock()
 		return err
 	}
-	kvPass := canPassthroughKV(oldHead, sealedKVRev)
+	kvPass := canPassthroughKV(oldHead, sealedKVRev, db.codecs.target)
 	var kvBlocks []kvSSTBlock
 	var catalogRaw []byte
 	if !kvPass {
@@ -123,7 +123,7 @@ func (db *DB) Compact() error {
 		kvPassthrough:   kvPass,
 		dictSnap:        dictSnap,
 		optional:        optional,
-		level:           db.opts.CompressionLevel,
+		codecs:          db.codecs,
 		policy:          db.policy,
 		invertRunBytes:  runBytes,
 	}
@@ -218,7 +218,7 @@ func (db *DB) Compact() error {
 			_ = newData.Close()
 		} else {
 			db.data, db.head, db.mapped = newData, newHead, newMapped
-			db.view = newFileView(newData, newMapped, newHead.sections[secTSBlocks])
+			db.view = newFileView(newData, newMapped, newHead.sections[secTSBlocks], db.codecs)
 			if previousView != nil {
 				previousView.release()
 			}

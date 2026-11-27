@@ -11,11 +11,12 @@ type fileView struct {
 	data   *osFile
 	mapped mapView
 	blocks sectionDesc
+	codecs *codecTable
 	refs   atomic.Int32
 }
 
-func newFileView(data *osFile, mapped mapView, blocks sectionDesc) *fileView {
-	view := &fileView{data: data, mapped: mapped, blocks: blocks}
+func newFileView(data *osFile, mapped mapView, blocks sectionDesc, codecs *codecTable) *fileView {
+	view := &fileView{data: data, mapped: mapped, blocks: blocks, codecs: codecs}
 	view.refs.Store(1)
 	return view
 }

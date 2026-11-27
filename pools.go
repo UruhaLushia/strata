@@ -1,14 +1,10 @@
 package strata
 
-import (
-	"sync"
-
-	"github.com/klauspost/compress/zstd"
-)
+import "sync"
 
 const (
 	maxReadBufCap        = 256 << 10
-	maxZstdScratchCap    = 512 << 10
+	maxDecodeScratchCap  = 512 << 10
 	maxMatchIdxCap       = 32 << 10 // 32768 * 4B = 128 KiB
 	maxRowBitWordsCap    = 16 << 10 // 16384 * 8B = 128 KiB (up to 1M rows)
 	maxPooledPageRowCap  = 1024     // ~104 KiB
@@ -19,46 +15,31 @@ const (
 )
 
 var (
-	zstdDecoderPool       sync.Pool
-	zstdDecodeScratchPool sync.Pool
-	readBufPool           sync.Pool
-	matchIdxPool          sync.Pool
-	rowBitsPool           sync.Pool
-	pageRowSlicePool      sync.Pool
-	tagSlicePool          sync.Pool
-	segmentSummaryPool    sync.Pool
-	groupRowPool          sync.Pool
+	decodeScratchPool  sync.Pool
+	readBufPool        sync.Pool
+	matchIdxPool       sync.Pool
+	rowBitsPool        sync.Pool
+	pageRowSlicePool   sync.Pool
+	tagSlicePool       sync.Pool
+	segmentSummaryPool sync.Pool
+	groupRowPool       sync.Pool
 )
 
-func getZstdDecoder() *zstd.Decoder {
-	if v := zstdDecoderPool.Get(); v != nil {
-		return v.(*zstd.Decoder)
-	}
-	d, _ := zstd.NewReader(nil, zstd.WithDecoderLowmem(true))
-	return d
-}
-
-func putZstdDecoder(dec *zstd.Decoder) {
-	if dec != nil {
-		zstdDecoderPool.Put(dec)
-	}
-}
-
-func getZstdScratch() *[]byte {
-	if v := zstdDecodeScratchPool.Get(); v != nil {
+func getDecodeScratch() *[]byte {
+	if v := decodeScratchPool.Get(); v != nil {
 		return v.(*[]byte)
 	}
 	buf := make([]byte, 0, 64<<10)
 	return &buf
 }
 
-func putZstdScratch(p *[]byte, buf []byte) {
+func putDecodeScratch(p *[]byte, buf []byte) {
 	if p == nil {
 		return
 	}
-	if cap(buf) <= maxZstdScratchCap {
+	if cap(buf) <= maxDecodeScratchCap {
 		*p = buf[:0]
-		zstdDecodeScratchPool.Put(p)
+		decodeScratchPool.Put(p)
 		return
 	}
 	*p = nil
@@ -256,7 +237,7 @@ func drainPool(p *sync.Pool) {
 }
 
 func reclaimPools() {
-	drainPool(&zstdDecodeScratchPool)
+	drainPool(&decodeScratchPool)
 	drainPool(&readBufPool)
 	drainPool(&matchIdxPool)
 	drainPool(&rowBitsPool)
@@ -264,11 +245,4 @@ func reclaimPools() {
 	drainPool(&tagSlicePool)
 	drainPool(&segmentSummaryPool)
 	drainPool(&groupRowPool)
-	for range maxPoolDrainSteps {
-		v := zstdDecoderPool.Get()
-		if v == nil {
-			break
-		}
-		v.(*zstd.Decoder).Close()
-	}
 }

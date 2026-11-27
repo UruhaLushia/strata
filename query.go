@@ -73,7 +73,10 @@ func prepareQuery(db *DB, s *Series, ws windowSpec, filters []Filter, opts query
 			id := snap.liveTagID
 			compiled = []compiledFilter{{dim: filters[0].Dim, ids: []uint32{id}, single: id}}
 		} else {
-			compiled = compileFiltersSnap(snap.dict, snap.series.id, snap.series.cfg.Arity, filters)
+			compiled, err = compileFiltersSnap(snap.dict, snap.series.id, snap.series.cfg.Arity, filters)
+			if err != nil {
+				return preparedQuery{}, err
+			}
 			ordered, compiled = orderCompiledFilters(filters, compiled)
 		}
 		for i, f := range ordered {

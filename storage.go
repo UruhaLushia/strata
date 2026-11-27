@@ -9,6 +9,10 @@ import (
 
 func Open(path string, opts Options) (*DB, error) {
 	opts, policy := defaultOptions(opts)
+	codecs, err := newCodecTable(opts)
+	if err != nil {
+		return nil, err
+	}
 	if path == "" {
 		return nil, errors.New("strata: empty path")
 	}
@@ -16,7 +20,6 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	var lk fileLock
-	var err error
 	if !opts.ReadOnly {
 		lk, err = openLock(path + ".lock")
 		if err != nil {
@@ -40,6 +43,7 @@ func Open(path string, opts Options) (*DB, error) {
 		path:           path,
 		opts:           opts,
 		policy:         policy,
+		codecs:         codecs,
 		querySem:       make(chan struct{}, policy.maxConcurrentQueries),
 		querySlots:     make(chan *querySlot, policy.maxConcurrentQueries),
 		lightReadSem:   make(chan struct{}, 1),
@@ -71,11 +75,15 @@ func Open(path string, opts Options) (*DB, error) {
 		_ = db.Close()
 		return nil, ErrReadOnlyCompat
 	}
+	if err = db.codecs.checkSections(db.head); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if db.mapped, err = mapPrefix(f, db.head.walOffset, db.shouldMmap()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	db.view = newFileView(db.data, db.mapped, db.head.sections[secTSBlocks])
+	db.view = newFileView(db.data, db.mapped, db.head.sections[secTSBlocks], db.codecs)
 	if err = db.loadLocked(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -111,11 +119,8 @@ func (db *DB) loadLocked() error {
 		}
 	}
 	if d := db.head.sections[5]; d.length > 0 {
-		if d.codec != 1 {
-			return errors.New("strata: unsupported dictionary codec")
-		}
 		if err := decodeDict(db.data, d, mapped, db.view, &db.dict, db.series); err != nil {
-			return errors.New("strata: decode dictionary: " + err.Error())
+			return err
 		}
 	}
 	for id, fresh := range db.series {
@@ -139,7 +144,7 @@ func (db *DB) loadLocked() error {
 		}
 	}
 	var blocks []sealedMeta
-	if blocks, err = decodeBlocks(db.data, db.head, mapped); err != nil {
+	if blocks, err = decodeBlocks(db.data, db.head, mapped, db.codecs); err != nil {
 		return err
 	}
 	db.sealed = blocks
@@ -202,7 +207,9 @@ func (db *DB) applyFrame(fr walFrame) error {
 			return err
 		}
 		for _, d := range ds {
-			db.dict.apply(d)
+			if err := db.dict.apply(d); err != nil {
+				return err
+			}
 		}
 		for _, b := range bs {
 			s := db.series[b.series]

@@ -6,16 +6,16 @@ import (
 	"sort"
 	"strings"
 	"unsafe"
-
-	"github.com/klauspost/compress/zstd"
 )
+
+const maxDictPageRawBytes = 16 << 20
 
 // dictPageDesc is a 16-byte pointer-free (noscan) descriptor for one external
 // forward dictionary page or reverse SST block.
 type dictPageDesc struct {
 	relOff uint64
 	length uint32
-	rawLen uint32 // 0 means stored uncompressed; >0 means zstd-compressed
+	rawLen uint32 // 0 means stored uncompressed; >0 means compressed
 }
 
 // dictExtDim holds immutable directory metadata for one high-cardinality external
@@ -46,7 +46,7 @@ func (e *dictExtDim) sstFirstKey(idx int) string {
 	return unsafe.String(&e.sstFirstArena[lo], hi-lo)
 }
 
-func (e *dictExtDim) readPageInto(areaStart uint64, desc dictPageDesc, plainBuf *[]byte, dec *zstd.Decoder) ([]byte, error) {
+func (e *dictExtDim) readPageInto(areaStart uint64, desc dictPageDesc, plainBuf *[]byte, slot *querySlot) ([]byte, error) {
 	if desc.length == 0 {
 		if plainBuf != nil {
 			*plainBuf = (*plainBuf)[:0]
@@ -55,6 +55,9 @@ func (e *dictExtDim) readPageInto(areaStart uint64, desc dictPageDesc, plainBuf 
 	}
 	if e == nil || e.view == nil || e.view.data == nil {
 		return nil, errors.New("strata: missing file view for external dict")
+	}
+	if desc.rawLen > maxDictPageRawBytes {
+		return nil, errors.New("strata: invalid dictionary page length")
 	}
 	absOff := e.secDesc.offset + areaStart + desc.relOff
 	raw, bufPtr, err := sectionBlockPooled(e.view.data, e.secDesc, absOff, desc.length, e.view.mappedBytes())
@@ -73,15 +76,20 @@ func (e *dictExtDim) readPageInto(areaStart uint64, desc dictPageDesc, plainBuf 
 		copy(out, raw)
 		return out, nil
 	}
-	var dst []byte
+	var dst, plain []byte
 	if plainBuf != nil {
 		dst = (*plainBuf)[:0]
-	} else {
-		dst = make([]byte, 0, desc.rawLen)
 	}
-	plain, err := dec.DecodeAll(raw, dst)
+	if slot == nil {
+		plain, err = e.view.codecs.decode(e.secDesc.codec, dst, raw, int(desc.rawLen))
+	} else {
+		plain, err = slot.decodeInto(e.secDesc.codec, raw, dst, int(desc.rawLen))
+	}
 	if err != nil {
 		return nil, err
+	}
+	if len(plain) != int(desc.rawLen) {
+		return nil, errors.New("strata: invalid dictionary page length")
 	}
 	if plainBuf != nil {
 		*plainBuf = plain
@@ -107,7 +115,7 @@ func decodeFwdPageAt(plain []byte, slot int) string {
 	}
 	lo := binary.LittleEndian.Uint32(plain[2+slot*4 : 6+slot*4])
 	hi := binary.LittleEndian.Uint32(plain[2+(slot+1)*4 : 6+(slot+1)*4])
-	if lo == hi || hdrEnd+int(hi) > len(plain) {
+	if lo >= hi || uint64(hi) > uint64(len(plain)-hdrEnd) {
 		return ""
 	}
 	return string(plain[hdrEnd+int(lo) : hdrEnd+int(hi)])
@@ -124,33 +132,31 @@ func decodeFwdPageSlice(plain []byte, slot int) []byte {
 	}
 	lo := binary.LittleEndian.Uint32(plain[2+slot*4 : 6+slot*4])
 	hi := binary.LittleEndian.Uint32(plain[2+(slot+1)*4 : 6+(slot+1)*4])
-	if lo == hi || hdrEnd+int(hi) > len(plain) {
+	if lo >= hi || uint64(hi) > uint64(len(plain)-hdrEnd) {
 		return nil
 	}
 	return plain[hdrEnd+int(lo) : hdrEnd+int(hi)]
 }
 
-func (e *dictExtDim) resolve(id uint32) string {
+func (e *dictExtDim) resolve(id uint32) (string, error) {
 	if e == nil || id == 0 || id >= e.baseNextID {
-		return ""
+		return "", nil
 	}
 	pageIdx := int(id-1) / dictFwdPageSize
 	slot := int(id-1) % dictFwdPageSize
 	if pageIdx >= len(e.fwdPages) || e.fwdPages[pageIdx].length == 0 {
-		return ""
+		return "", nil
 	}
 	ck := dictCacheKey{series: e.series, dim: e.dim, page: uint32(pageIdx)}
 	if page, ok := e.cache.get(ck); ok {
-		return decodeFwdPageAt(page, slot)
+		return decodeFwdPageAt(page, slot), nil
 	}
-	dec := getZstdDecoder()
-	plain, err := e.readPageInto(e.fwdStartOff, e.fwdPages[pageIdx], nil, dec)
-	putZstdDecoder(dec)
+	plain, err := e.readPageInto(e.fwdStartOff, e.fwdPages[pageIdx], nil, nil)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	e.cache.put(ck, plain)
-	return decodeFwdPageAt(plain, slot)
+	return decodeFwdPageAt(plain, slot), nil
 }
 
 func decodeSSTBlock(plain []byte, keyBuf *[]byte, yield func(key []byte, id uint32) bool) error {
@@ -183,32 +189,32 @@ func decodeSSTBlock(plain []byte, keyBuf *[]byte, yield func(key []byte, id uint
 	return nil
 }
 
-func (e *dictExtDim) lookupSST(value string) uint32 {
+func (e *dictExtDim) lookupSST(value string) (uint32, error) {
 	if e == nil || len(e.sstBlocks) == 0 || value == "" {
-		return 0
+		return 0, nil
 	}
 	if value < e.sstFirstKey(0) {
-		return 0
+		return 0, nil
 	}
 	idx := sort.Search(len(e.sstBlocks), func(i int) bool {
 		return e.sstFirstKey(i) > value
 	}) - 1
 	if idx < 0 {
-		return 0
+		return 0, nil
 	}
-	dec := getZstdDecoder()
-	defer putZstdDecoder(dec)
-	plainPtr := getZstdScratch()
+	slot := querySlot{codecs: e.view.codecs}
+	defer slot.close()
+	plainPtr := getDecodeScratch()
 	defer func() {
-		putZstdScratch(plainPtr, *plainPtr)
+		putDecodeScratch(plainPtr, *plainPtr)
 	}()
-	plain, err := e.readPageInto(e.sstStartOff, e.sstBlocks[idx], plainPtr, dec)
+	plain, err := e.readPageInto(e.sstStartOff, e.sstBlocks[idx], plainPtr, &slot)
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	var keyBuf []byte
 	var found uint32
-	_ = decodeSSTBlock(plain, &keyBuf, func(key []byte, id uint32) bool {
+	err = decodeSSTBlock(plain, &keyBuf, func(key []byte, id uint32) bool {
 		s := unsafe.String(unsafe.SliceData(key), len(key))
 		if s < value {
 			return true
@@ -218,12 +224,12 @@ func (e *dictExtDim) lookupSST(value string) uint32 {
 		}
 		return false
 	})
-	return found
+	return found, err
 }
 
-func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst []uint32) []uint32 {
+func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst []uint32) ([]uint32, error) {
 	if e == nil || len(e.sstBlocks) == 0 {
-		return dst
+		return dst, nil
 	}
 	startIdx := 0
 	if prefix != "" {
@@ -234,11 +240,11 @@ func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst 
 			startIdx = idx - 1
 		}
 	}
-	dec := getZstdDecoder()
-	defer putZstdDecoder(dec)
-	plainPtr := getZstdScratch()
+	slot := querySlot{codecs: e.view.codecs}
+	defer slot.close()
+	plainPtr := getDecodeScratch()
 	defer func() {
-		putZstdScratch(plainPtr, *plainPtr)
+		putDecodeScratch(plainPtr, *plainPtr)
 	}()
 	var keyBuf []byte
 	for blk := startIdx; blk < len(e.sstBlocks); blk++ {
@@ -248,12 +254,12 @@ func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst 
 				break
 			}
 		}
-		plain, err := e.readPageInto(e.sstStartOff, e.sstBlocks[blk], plainPtr, dec)
+		plain, err := e.readPageInto(e.sstStartOff, e.sstBlocks[blk], plainPtr, &slot)
 		if err != nil {
-			break
+			return nil, err
 		}
 		stopped := false
-		_ = decodeSSTBlock(plain, &keyBuf, func(key []byte, id uint32) bool {
+		err = decodeSSTBlock(plain, &keyBuf, func(key []byte, id uint32) bool {
 			s := unsafe.String(unsafe.SliceData(key), len(key))
 			if s < prefix {
 				return true
@@ -270,30 +276,33 @@ func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst 
 			dst = append(dst, id)
 			return true
 		})
+		if err != nil {
+			return nil, err
+		}
 		if stopped {
 			break
 		}
 	}
-	return dst
+	return dst, nil
 }
 
-func (e *dictExtDim) matchScanFwd(op TagOp, target string, extra map[uint32]string, dst []uint32) []uint32 {
+func (e *dictExtDim) matchScanFwd(op TagOp, target string, extra map[uint32]string, dst []uint32) ([]uint32, error) {
 	if e == nil || len(e.fwdPages) == 0 {
-		return dst
+		return dst, nil
 	}
-	dec := getZstdDecoder()
-	defer putZstdDecoder(dec)
-	plainPtr := getZstdScratch()
+	slot := querySlot{codecs: e.view.codecs}
+	defer slot.close()
+	plainPtr := getDecodeScratch()
 	defer func() {
-		putZstdScratch(plainPtr, *plainPtr)
+		putDecodeScratch(plainPtr, *plainPtr)
 	}()
 	for pIdx, pDesc := range e.fwdPages {
 		if pDesc.length == 0 {
 			continue
 		}
-		plain, err := e.readPageInto(e.fwdStartOff, pDesc, plainPtr, dec)
+		plain, err := e.readPageInto(e.fwdStartOff, pDesc, plainPtr, &slot)
 		if err != nil {
-			break
+			return nil, err
 		}
 		count := decodeFwdPageCount(plain)
 		baseID := uint32(pIdx*dictFwdPageSize + 1)
@@ -314,5 +323,5 @@ func (e *dictExtDim) matchScanFwd(op TagOp, target string, extra map[uint32]stri
 			}
 		}
 	}
-	return dst
+	return dst, nil
 }

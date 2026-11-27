@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -11,9 +10,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/UruhaLushia/strata/codec"
+	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
 func TestColumnarBlockRoundTripModes(t *testing.T) {
+	codecs := testCodecTable(t, zstd.New(zstd.Fastest))
 	small := []idRow{
 		{tags: [8]uint32{1, 255, 256, 65536, 0, 2, 3, 4}, values: [4]int64{0, -1, 256, 1 << 32}, initMask: 1},
 		{tags: [8]uint32{2, 256, 65535, 65537, 0, 4, 5, 6}, values: [4]int64{1, 2, 65536, -2}, initMask: 2},
@@ -32,13 +35,13 @@ func TestColumnarBlockRoundTripModes(t *testing.T) {
 			series: 7, res: resMinuteHR, start: 10, end: 70, epoch: 3, order: 9,
 			summary: Summary{Values: [4]int64{1, -2, 3, 4}, Mask: 0x0f}, rows: rows,
 		}
-		for level := CompressionFastest; level <= CompressionBest; level++ {
+		for level := zstd.Fastest; level <= zstd.Best; level++ {
 			raw, err := encodeBlockLevel(want, level)
 			mustTestOK(t, err)
-			if bytes.HasPrefix(raw, blockStreamsMagic[:]) != (len(rows) >= 256) {
+			if isStreamBlock(raw) != (len(rows) >= 256) {
 				t.Fatalf("unexpected block envelope for %d rows", len(rows))
 			}
-			got, err := decodeBlock(raw)
+			got, err := decodeBlock(raw, codec.IDZstd, codecs)
 			mustTestOK(t, err)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("round trip changed %d-row block at compression level %d", len(rows), level)
@@ -71,15 +74,16 @@ func TestAggregateMixedSmallAndStreamBlocks(t *testing.T) {
 }
 
 func TestColumnarFilterPushdownAndAdaptiveSelection(t *testing.T) {
+	codecs := testCodecTable(t, zstd.New(zstd.Fastest))
 	rows := make([]idRow, 600)
 	for i := range rows {
 		rows[i] = idRow{tags: [8]uint32{uint32(i/2 + 1), uint32(i%10 + 1), 1, uint32(i%2 + 1)}, initMask: 1}
 	}
-	raw, err := encodeBlockLevel(sealedBlock{rows: rows}, CompressionFastest)
+	raw, err := encodeBlockLevel(sealedBlock{rows: rows}, zstd.Fastest)
 	mustTestOK(t, err)
-	view, err := parseColumnarBlock(raw)
+	view, err := parseColumnarBlock(raw, codec.IDZstd)
 	mustTestOK(t, err)
-	slot := newQuerySlot()
+	slot := &querySlot{codecs: codecs}
 	defer slot.close()
 	eq := func(dim int, id uint32) compiledFilter {
 		return compiledFilter{dim: dim, ids: []uint32{id}, single: id}
@@ -192,7 +196,7 @@ func TestSoAScanBatchAndColCacheSelectivityFallback(t *testing.T) {
 
 func TestColumnarStreamsRawFallback(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 30, 0, 0, time.UTC)
-	db, s := testDB(t, &now, Options{})
+	db, s := testDB(t, &now, Options{Codec: zstd.New(zstd.Fastest)})
 	defer func() { _ = db.Close() }()
 	ts := now.Add(-5 * time.Minute)
 	tags := func(a, b int) []string {
@@ -233,7 +237,7 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 	m := db.sealed[i]
 	raw, err := sectionBlock(db.data, db.head.sections[secTSBlocks], m.offset, m.length, nil)
 	mustTestOK(t, err)
-	view, err := parseColumnarBlock(raw)
+	view, err := parseColumnarBlock(raw, codec.IDZstd)
 	mustTestOK(t, err)
 	if !view.unsorted {
 		t.Fatal("raw dim 0 lost its unsorted flag")
@@ -251,7 +255,7 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 			t.Fatalf("stream %d copied its payload", idx)
 		}
 	}
-	decoded, err := decodeBlock(raw)
+	decoded, err := decodeBlock(raw, codec.IDZstd, db.codecs)
 	mustTestOK(t, err)
 	const target = 271
 	if len(decoded.rows) != len(rows) || decoded.rows[target].values != rows[target].Values {
@@ -260,16 +264,14 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 
 	// The first payload starts immediately after the fixed-width descriptor directory.
 	const metric, descSize = 11, 24
-	pos := len(blockStreamsMagic) + int(view.descs[0].offset) - (streamColumnCount-metric)*descSize + 20
+	pos := 1 + int(view.descs[0].offset) - (streamColumnCount-metric)*descSize + 20
 	bad := slices.Clone(raw)
 	binary.LittleEndian.PutUint32(bad[pos:pos+4], view.descs[metric].rawLen-1)
-	if _, err := decodeBlock(bad); err == nil || !strings.Contains(err.Error(), "invalid raw column stream length") {
+	if _, err := decodeBlock(bad, codec.IDZstd, db.codecs); err == nil || !strings.Contains(err.Error(), "invalid raw column stream length") {
 		t.Fatalf("decodeBlock corrupt rawLen err=%v", err)
 	}
-	badView, err := parseColumnarBlock(bad)
-	mustTestOK(t, err)
-	if _, err := decodeStreamColInto(badView, metric, slot); err == nil {
-		t.Fatal("column reader accepted corrupt rawLen")
+	if _, err := parseColumnarBlock(bad, codec.IDZstd); err == nil {
+		t.Fatal("column parser accepted corrupt rawLen")
 	}
 
 	want := rows[target]

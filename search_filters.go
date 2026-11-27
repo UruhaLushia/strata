@@ -15,12 +15,16 @@ type compiledFilter struct {
 	bits     []uint64
 }
 
-func compileFiltersSnap(dict dictionary, series uint16, arity int, filters []Filter) []compiledFilter {
+func compileFiltersSnap(dict dictionary, series uint16, arity int, filters []Filter) ([]compiledFilter, error) {
 	out := make([]compiledFilter, len(filters))
 	for i, filter := range filters {
 		var ids []uint32
 		if filter.Dim >= 0 && filter.Dim < arity {
-			ids = matchingTagIDsSnap(dict, series, filter)
+			var err error
+			ids, err = matchingTagIDsSnap(dict, series, filter)
+			if err != nil {
+				return nil, err
+			}
 		}
 		compiled := compiledFilter{dim: filter.Dim, negate: filter.Negate, ids: ids}
 		switch {
@@ -43,7 +47,7 @@ func compileFiltersSnap(dict dictionary, series uint16, arity int, filters []Fil
 		}
 		out[i] = compiled
 	}
-	return out
+	return out, nil
 }
 
 func orderCompiledFilters(filters []Filter, compiled []compiledFilter) ([]Filter, []compiledFilter) {

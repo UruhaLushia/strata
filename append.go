@@ -33,22 +33,50 @@ func (s *Series) append(ts time.Time, summary Summary, rows []Row, syncNow bool)
 		}
 	}
 	summary = summary.normalized()
-	db.order++
 	delta := &bucket{
-		series: s.id, ts: minuteTS(ts), epoch: s.resetEpoch, order: db.order,
+		series: s.id, ts: minuteTS(ts), epoch: s.resetEpoch,
 		arity: uint8(s.cfg.Arity), summaryOps: s.cfg.SummaryOps, rowOps: s.cfg.RowOps,
 		summary: summary,
 	}
 	if len(rows) > 0 {
-		delta.rows = make([]idRow, 0, len(rows))
+		delta.rows = make([]idRow, len(rows))
 	}
+	// Resolve external tags before reserving any new IDs or publishing the bucket.
+	for dim := range s.cfg.Arity {
+		d := db.dict.dims[dictDimKey{series: s.id, dim: uint8(dim)}]
+		if d == nil || d.ext == nil {
+			continue
+		}
+		for i, row := range rows {
+			tag := row.Tags[dim]
+			if tag == "" {
+				continue
+			}
+			id, fromSST, err := d.lookupExt(tag)
+			if err != nil {
+				return err
+			}
+			if fromSST {
+				d.cacheHot(tag, id, db.dict.hotBudget)
+			}
+			delta.rows[i].tags[dim] = id
+		}
+	}
+	db.order++
+	delta.order = db.order
 	var addedBytes int64 = 128
-	for _, row := range rows {
+	for i, row := range rows {
 		row = row.normalized()
-		var r idRow
+		r := &delta.rows[i]
 		r.initMask = row.Mask
 		for j, tag := range row.Tags {
-			id, newID := db.dict.intern(s.id, uint8(j), tag)
+			if r.tags[j] != 0 {
+				continue
+			}
+			id, newID, err := db.dict.internAfterLookup(s.id, uint8(j), tag)
+			if err != nil {
+				return err
+			}
 			r.tags[j] = id
 			if newID {
 				db.pendingDict = append(db.pendingDict, dictEntry{id: id, series: s.id, dim: uint8(j), value: tag})
@@ -56,7 +84,6 @@ func (s *Series) append(ts time.Time, summary Summary, rows []Row, syncNow bool)
 			}
 		}
 		r.values = row.Values
-		delta.rows = append(delta.rows, r)
 		addedBytes += 72
 	}
 	key := bucketKey{series: s.id, minute: delta.ts, epoch: delta.epoch}

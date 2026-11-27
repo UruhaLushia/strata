@@ -364,7 +364,11 @@ func copyWALRangeWithResurrection(dst, src *osFile, start, end int64, minSeq uin
 							continue
 						}
 						live.mark(dk, tag)
-						if v := sd.resolve(tag); v != "" {
+						v, err := sd.resolve(tag)
+						if err != nil {
+							return dstPos, err
+						}
+						if v != "" {
 							extra = append(extra, dictEntry{id: tag, series: b.series, dim: uint8(dim), value: v})
 						}
 					}

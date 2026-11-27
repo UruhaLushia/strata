@@ -50,6 +50,7 @@ type kvSSTEntry struct {
 	blobLen           uint32
 	blobCRC           uint32
 	external          bool
+	rawBlob           bool
 	deleted           bool
 }
 

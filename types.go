@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/UruhaLushia/strata/codec"
 )
 
 var (
@@ -31,15 +33,6 @@ const (
 	OpLast
 )
 
-type CompressionLevel uint8
-
-const (
-	CompressionFastest CompressionLevel = iota
-	CompressionDefault
-	CompressionBetter
-	CompressionBest
-)
-
 type MemoryProfile uint8
 
 const (
@@ -57,18 +50,19 @@ type MemoryBudget struct {
 }
 
 type Options struct {
-	ReadOnly         bool
-	UseMmap          bool
-	MemoryProfile    MemoryProfile
-	MemoryBudget     MemoryBudget
-	CompressionLevel CompressionLevel
-	WALCompactBytes  int64
-	FlushInterval    time.Duration
-	SyncInterval     time.Duration
-	Retention1m      time.Duration
-	Retention1h      time.Duration
-	Retention1d      time.Duration
-	Now              func() time.Time
+	ReadOnly        bool
+	UseMmap         bool
+	MemoryProfile   MemoryProfile
+	MemoryBudget    MemoryBudget
+	Codec           codec.Codec
+	Codecs          []codec.Codec
+	WALCompactBytes int64
+	FlushInterval   time.Duration
+	SyncInterval    time.Duration
+	Retention1m     time.Duration
+	Retention1h     time.Duration
+	Retention1d     time.Duration
+	Now             func() time.Time
 }
 
 const (
@@ -264,6 +258,7 @@ type DB struct {
 	lock                  fileLock
 	data                  *osFile
 	view                  *fileView
+	codecs                *codecTable
 	head                  superblock
 	series                map[uint16]*Series
 	dict                  dictionary

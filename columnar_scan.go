@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 )
@@ -12,13 +11,14 @@ type columnarBlockView struct {
 	descs    [streamColumnCount]columnStreamDesc
 	summary  Summary
 	unsorted bool
+	codecID  uint8
 }
 
-func parseColumnarBlock(raw []byte) (columnarBlockView, error) {
-	if !bytes.HasPrefix(raw, blockStreamsMagic[:]) {
+func parseColumnarBlock(raw []byte, id uint8) (columnarBlockView, error) {
+	if !isStreamBlock(raw) {
 		return columnarBlockView{}, errors.New("strata: non-stream block")
 	}
-	plain := raw[len(blockStreamsMagic):]
+	plain := raw[1:]
 	off := 0
 	for _, n := range []int{2, 1, 8, 8, 8, 8} {
 		if _, err := takeBlockBytes(plain, &off, n); err != nil {
@@ -29,7 +29,7 @@ func parseColumnarBlock(raw []byte) (columnarBlockView, error) {
 	if err != nil {
 		return columnarBlockView{}, err
 	}
-	view := columnarBlockView{plain: plain}
+	view := columnarBlockView{plain: plain, codecID: id}
 	view.summary.Mask = mask[0]
 	for i := range view.summary.Values {
 		field, err := takeBlockBytes(plain, &off, 8)
@@ -39,33 +39,71 @@ func parseColumnarBlock(raw []byte) (columnarBlockView, error) {
 		view.summary.Values[i] = int64(binary.LittleEndian.Uint64(field))
 	}
 	count, err := readBlockUvarint(plain, &off)
-	if err != nil || count > 1<<20 {
+	if err != nil || count < 256 || count > 1<<20 {
 		return columnarBlockView{}, errors.New("strata: invalid column row count")
 	}
 	view.count = int(count)
 	if off >= len(plain) || plain[off] != blockColumnarStreamsMarker {
 		return columnarBlockView{}, errors.New("strata: invalid column stream marker")
 	}
-	off++
+	if err := parseStreamDirectory(&view, off+1); err != nil {
+		return columnarBlockView{}, err
+	}
+	return view, nil
+}
+
+func parseStreamDirectory(view *columnarBlockView, off int) error {
+	plain := view.plain
 	if off+2 > len(plain) || plain[off] != 1 || plain[off+1] != streamColumnCount {
-		return columnarBlockView{}, errors.New("strata: invalid column stream header")
+		return errors.New("strata: invalid column stream header")
 	}
 	off += 2
-	if len(plain)-off < streamColumnCount*24 {
-		return columnarBlockView{}, errors.New("strata: truncated column stream directory")
+	dataStart := off + streamColumnCount*24
+	if dataStart > len(plain) {
+		return errors.New("strata: truncated column stream directory")
 	}
 	for i := range view.descs {
 		p := plain[off+i*24 : off+(i+1)*24]
-		if i == 0 && p[2]&streamFlagUnsorted != 0 {
-			view.unsorted = true
-		}
-		view.descs[i] = columnStreamDesc{
+		d := columnStreamDesc{
 			mode: p[0], width: p[1], flags: p[2], value: binary.LittleEndian.Uint64(p[4:12]),
 			offset: binary.LittleEndian.Uint32(p[12:16]), length: binary.LittleEndian.Uint32(p[16:20]),
 			rawLen: binary.LittleEndian.Uint32(p[20:24]),
 		}
+		view.descs[i] = d
+		if i == 0 {
+			view.unsorted = d.flags&streamFlagUnsorted != 0
+		}
+		width := tagModeWidth(d.mode)
+		if i >= 8 && i < 12 {
+			width = valueModeWidth(d.mode)
+		}
+		if i == 12 && (d.mode == modeU8 || d.mode == modeConst) {
+			width = 1
+		}
+		if d.mode == modeConst || i >= 8 && i < 12 && d.mode == modeZero {
+			if d.width != width || d.offset != 0 || d.length != 0 || d.rawLen != 0 {
+				return errors.New("strata: invalid constant column stream")
+			}
+			continue
+		}
+		if width == 0 || d.width != width || i == 12 && d.mode != modeU8 {
+			return errors.New("strata: invalid column stream width")
+		}
+		if uint64(d.offset) < uint64(dataStart) || uint64(d.offset)+uint64(d.length) > uint64(len(plain)) {
+			return errors.New("strata: invalid column stream bounds")
+		}
+		if d.flags&streamFlagRaw != 0 {
+			if d.length != d.rawLen {
+				return errors.New("strata: invalid raw column stream length")
+			}
+		} else if view.codecID == 0 {
+			return errors.New("strata: compressed column stream in raw section")
+		}
+		if d.rawLen != uint32(view.count*int(width)) {
+			return errors.New("strata: invalid column stream payload")
+		}
 	}
-	return view, nil
+	return nil
 }
 
 func decodeStreamColInto(view columnarBlockView, idx int, slot *querySlot) (decodedCol, error) {
@@ -90,7 +128,7 @@ func decodeStreamColInto(view columnarBlockView, idx int, slot *querySlot) (deco
 		}
 		return decodedCol{mode: desc.mode, width: desc.width, data: view.plain[start:end]}, nil
 	}
-	plain, err := slot.decodeZstd(view.plain[start:end])
+	plain, err := slot.decode(view.codecID, view.plain[start:end], expected)
 	if err != nil {
 		return decodedCol{}, err
 	}

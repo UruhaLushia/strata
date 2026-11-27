@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"time"
@@ -300,8 +299,8 @@ func probeSlotHasMatch(db *DB, chosen sealedMeta, sources querySources, s *Serie
 	}
 	if block.encoded != nil {
 		var sel rowSelection
-		if bytes.HasPrefix(block.encoded, blockStreamsMagic[:]) {
-			view, err := parseColumnarBlock(block.encoded)
+		if isStreamBlock(block.encoded) {
+			view, err := parseColumnarBlock(block.encoded, block.codecID)
 			if err != nil {
 				return false, err
 			}
@@ -310,7 +309,7 @@ func probeSlotHasMatch(db *DB, chosen sealedMeta, sources querySources, s *Serie
 				return false, err
 			}
 		} else {
-			count, cols, err := decodeSmallBlockCols(block.encoded, slot)
+			count, cols, err := decodeSmallBlockCols(block.encoded, block.codecID, slot)
 			if err != nil {
 				return false, err
 			}
@@ -333,19 +332,19 @@ func probeSlotHasMatch(db *DB, chosen sealedMeta, sources querySources, s *Serie
 
 func readPageFromBlock(block sealedBlock, meta SegmentMeta, d dictionary, series uint16, arity int, filters []compiledFilter, allowDim0BS bool, skip, need int, slot *querySlot, rowIdxBuf *[]int32, page *PageResult) (int, int, int, error) {
 	if block.encoded != nil {
-		isStream := bytes.HasPrefix(block.encoded, blockStreamsMagic[:])
+		isStream := isStreamBlock(block.encoded)
 		var view columnarBlockView
 		var cols [streamColumnCount]decodedCol
 		var sel rowSelection
 		var err error
 		if isStream {
-			view, err = parseColumnarBlock(block.encoded)
+			view, err = parseColumnarBlock(block.encoded, block.codecID)
 			if err == nil {
 				sel, err = filterStreamView(view, filters, allowDim0BS, slot)
 			}
 		} else {
 			var count int
-			count, cols, err = decodeSmallBlockCols(block.encoded, slot)
+			count, cols, err = decodeSmallBlockCols(block.encoded, block.codecID, slot)
 			if err == nil {
 				sel, err = filterSmallCols(count, &cols, filters, allowDim0BS)
 			}
@@ -368,7 +367,9 @@ func readPageFromBlock(block sealedBlock, meta SegmentMeta, d dictionary, series
 				return 0, 0, 0, err
 			}
 		} else {
-			appendPageFromCols(&cols, meta, d, series, arity, isRange, rangeLo, rows, take, page)
+			if err := appendPageFromCols(&cols, meta, d, series, arity, isRange, rangeLo, rows, take, page); err != nil {
+				return 0, 0, 0, err
+			}
 		}
 		return total, take, skip, nil
 	}
@@ -382,7 +383,11 @@ func readPageFromBlock(block sealedBlock, meta SegmentMeta, d dictionary, series
 			page.tagBuf = page.tagBuf[:tagStart+arity]
 			tags := page.tagBuf[tagStart : tagStart+arity]
 			for dim := range arity {
-				tags[dim] = d.resolve(series, uint8(dim), row.tags[dim])
+				tag, err := d.resolve(series, uint8(dim), row.tags[dim])
+				if err != nil {
+					return 0, 0, 0, err
+				}
+				tags[dim] = tag
 			}
 			page.Rows = append(page.Rows, PageRow{
 				From: meta.CoveredFrom, Resolution: meta.Resolution, Exact: meta.Exact,

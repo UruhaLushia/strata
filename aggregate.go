@@ -133,7 +133,11 @@ func (s *Series) aggregateWithDefaultWindow(ctx context.Context, q AggregateQuer
 	}
 	out.Groups = make([][]GroupRow, len(groups))
 	for i := range groups {
-		out.Groups[i] = materializeGroupRows(&groups[i], pq.execDB.dict, s.id, q.GroupDims[i], q.TopK, slot)
+		out.Groups[i], err = materializeGroupRows(&groups[i], pq.execDB.dict, s.id, q.GroupDims[i], q.TopK, slot)
+		if err != nil {
+			out.Release()
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -221,15 +225,24 @@ func heapSiftDown(items []groupRankEntry, i int) {
 	}
 }
 
-func materializeGroupRows(g *aggregateGroups, d dictionary, series uint16, dim, topK int, slot *querySlot) []GroupRow {
+func materializeGroupRows(g *aggregateGroups, d dictionary, series uint16, dim, topK int, slot *querySlot) ([]GroupRow, error) {
 	dimU8 := uint8(dim)
 	if topK <= 0 {
 		n := g.countNonEmpty()
 		rows := getGroupRowSlice(n)
 		if g.dense != nil {
+			var err error
 			g.each(func(id uint32, sum Summary) {
-				rows = append(rows, GroupRow{Tag: d.resolve(series, dimU8, id), Summary: sum})
+				if err == nil {
+					var tag string
+					tag, err = d.resolve(series, dimU8, id)
+					rows = append(rows, GroupRow{Tag: tag, Summary: sum})
+				}
 			})
+			if err != nil {
+				putGroupRowSlice(rows)
+				return nil, err
+			}
 		} else {
 			entries := make([]groupRankEntry, 0, n)
 			g.each(func(id uint32, sum Summary) {
@@ -241,13 +254,18 @@ func materializeGroupRows(g *aggregateGroups, d dictionary, series uint16, dim, 
 			reader := newDictTagReader(d, series, dimU8, slot)
 			defer reader.close()
 			for _, e := range entries {
-				rows = append(rows, GroupRow{Tag: string(reader.resolveBytes(e.id)), Summary: e.sum})
+				tag := string(reader.resolveBytes(e.id))
+				if reader.err != nil {
+					putGroupRowSlice(rows)
+					return nil, reader.err
+				}
+				rows = append(rows, GroupRow{Tag: tag, Summary: e.sum})
 			}
 		}
 		slices.SortFunc(rows, func(a, b GroupRow) int {
 			return cmp.Compare(a.Tag, b.Tag)
 		})
-		return rows
+		return rows, nil
 	}
 	reader := newDictTagReader(d, series, dimU8, slot)
 	defer reader.close()
@@ -269,7 +287,10 @@ func materializeGroupRows(g *aggregateGroups, d dictionary, series uint16, dim, 
 			h.push(e.id, e.sum)
 		}
 	}
-	return h.toGroupRows()
+	if reader.err != nil {
+		return nil, reader.err
+	}
+	return h.toGroupRows(), nil
 }
 
 func sortTopKGroupRows(rows []GroupRow) {

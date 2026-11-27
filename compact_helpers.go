@@ -33,7 +33,7 @@ func loadSealedBlockFromView(view *fileView, sec sectionDesc, meta sealedMeta) (
 	if crc(raw) != meta.crc {
 		return sealedBlock{}, errors.New("strata: block CRC mismatch")
 	}
-	decoded, err := decodeBlock(raw)
+	decoded, err := decodeBlock(raw, sec.codec, view.codecs)
 	if err != nil {
 		return sealedBlock{}, err
 	}

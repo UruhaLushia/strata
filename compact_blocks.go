@@ -33,7 +33,7 @@ type compactPlan struct {
 	catalogRaw      []byte
 	dictSnap        *dictCompactSnap
 	optional        []optionalSection
-	level           CompressionLevel
+	codecs          *codecTable
 	kvPassthrough   bool
 	policy          memPolicy
 	invertRunBytes  int

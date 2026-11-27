@@ -6,28 +6,25 @@ import (
 	"io"
 )
 
-func readInvertChunkFromSlot(f *osFile, desc sectionDesc, mapped []byte, chunk invertChunkMeta, slot *querySlot) ([]byte, error) {
-	raw, bufPtr, err := sectionBlockPooled(f, desc, chunk.offset, chunk.length, mapped)
-	if bufPtr != nil {
-		defer putReadBuf(bufPtr)
+func readInvertChunkFromView(view *fileView, desc sectionDesc, chunk invertChunkMeta, totalSealed int, slot *querySlot) ([]byte, *[]byte, error) {
+	if view == nil || view.data == nil {
+		return nil, nil, errors.New("strata: missing file view")
 	}
+	raw, bufPtr, err := sectionBlockPooled(view.data, desc, chunk.offset, chunk.length, view.mappedBytes())
 	if err != nil {
-		return nil, err
+		putReadBuf(bufPtr)
+		return nil, nil, err
 	}
 	if crc(raw) != chunk.crc {
-		return nil, errors.New("strata: TS invert chunk CRC mismatch")
+		putReadBuf(bufPtr)
+		return nil, nil, errors.New("strata: TS invert chunk CRC mismatch")
 	}
-	if slot != nil {
-		return slot.decodeZstd(raw)
+	if desc.codec == 0 {
+		return raw, bufPtr, nil
 	}
-	return zstdDecompress(raw)
-}
-
-func readInvertChunkFromView(view *fileView, desc sectionDesc, chunk invertChunkMeta, slot *querySlot) ([]byte, error) {
-	if view == nil || view.data == nil {
-		return nil, errors.New("strata: missing file view")
-	}
-	return readInvertChunkFromSlot(view.data, desc, view.mappedBytes(), chunk, slot)
+	defer putReadBuf(bufPtr)
+	plain, err := slot.decode(desc.codec, raw, max(invertChunkTargetSize, 24+(totalSealed+7)/8))
+	return plain, nil, err
 }
 
 func decodeInvertRecordBody(plain []byte, off *int, k uint64, mode byte, match bool, onPosting func(key uint64, blockID uint32), onDense func(key uint64)) error {

@@ -90,6 +90,7 @@ type sealedBlock struct {
 	rowCount      uint32
 	rows          []idRow
 	encoded       []byte
+	codecID       uint8
 	candidate     bool
 	passthrough   bool
 	preserveOrder bool

@@ -6,8 +6,23 @@ import (
 	"errors"
 	"sort"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
+
+const (
+	kvBlockTarget  = 16 << 10
+	kvInlineLimit  = 32 << 10
+	kvMaxBlobRaw   = 256 << 20
+	kvFlagExternal = 1
+	kvFlagRawBlob  = 1 << 1
+)
+
+// Before its last entry a block has less than kvBlockTarget estimated bytes.
+// The prefix and value framing is less than triple that estimate; the final
+// entry contributes its indexed key, an inline value or blob pointer, and framing.
+func kvBlockRawLimit(last []byte) int {
+	return 3*kvBlockTarget + len(last) + kvInlineLimit + 64
+}
 
 type kvSSTBlock struct {
 	raw         []byte
@@ -23,7 +38,7 @@ func physicalKVKey(region uint16, key []byte) []byte {
 	return out
 }
 
-func encodeKVBlockWithEncoder(entries []kvSSTEntry, enc *zstd.Encoder) []byte {
+func encodeKVBlock(entries []kvSSTEntry) []byte {
 	var out []byte
 	var prev []byte
 	for _, e := range entries {
@@ -43,7 +58,10 @@ func encodeKVBlockWithEncoder(entries []kvSSTEntry, enc *zstd.Encoder) []byte {
 		out = binary.LittleEndian.AppendUint64(out, uint64(e.expiresAtUnixNano))
 		var flags byte
 		if e.external {
-			flags = 1
+			flags = kvFlagExternal
+			if e.rawBlob {
+				flags |= kvFlagRawBlob
+			}
 		}
 		out = append(out, flags)
 		out = append(out, key[shared:]...)
@@ -56,14 +74,10 @@ func encodeKVBlockWithEncoder(entries []kvSSTEntry, enc *zstd.Encoder) []byte {
 		}
 		prev = key
 	}
-	return enc.EncodeAll(out, nil)
+	return out
 }
 
-func decodeKVBlock(raw []byte) ([]kvSSTEntry, error) {
-	plain, err := zstdDecompress(raw)
-	if err != nil {
-		return nil, err
-	}
+func decodeKVBlock(plain []byte) ([]kvSSTEntry, error) {
 	r := bytes.NewReader(plain)
 	var prev []byte
 	out := make([]kvSSTEntry, 0)
@@ -99,7 +113,11 @@ func decodeKVBlock(raw []byte) ([]kvSSTEntry, error) {
 		var value []byte
 		var blobOffset uint64
 		var blobLen, blobCRC uint32
-		external := flags&1 != 0
+		external := flags&kvFlagExternal != 0
+		rawBlob := flags&kvFlagRawBlob != 0
+		if flags & ^byte(kvFlagExternal|kvFlagRawBlob) != 0 || rawBlob && !external {
+			return nil, errors.New("strata: invalid KV SST flags")
+		}
 		if external {
 			if valueLen != 0 || r.Len() < 16 {
 				return nil, errors.New("strata: invalid external KV value")
@@ -127,7 +145,7 @@ func decodeKVBlock(raw []byte) ([]kvSSTEntry, error) {
 		out = append(out, kvSSTEntry{
 			region: binary.BigEndian.Uint16(key), key: append([]byte(nil), key[2:]...),
 			value: value, modRev: rev, expiresAtUnixNano: expiresAt,
-			blobOffset: blobOffset, blobLen: blobLen, blobCRC: blobCRC, external: external,
+			blobOffset: blobOffset, blobLen: blobLen, blobCRC: blobCRC, external: external, rawBlob: rawBlob,
 		})
 		prev = key
 	}
@@ -140,6 +158,9 @@ func (db *DB) loadKVIndex() ([]byte, error) {
 	if d.length == 0 {
 		return nil, nil
 	}
+	if d.codec != codec.IDNone && d.rawLen > maxSectionRawBytes {
+		return nil, errors.New("strata: invalid KV index length")
+	}
 	raw, err := sectionRaw(db.data, d, db.mappedBytes())
 	if err != nil {
 		return nil, err
@@ -147,18 +168,14 @@ func (db *DB) loadKVIndex() ([]byte, error) {
 	if crc(raw) != d.crc {
 		return nil, errors.New("strata: KV index CRC mismatch")
 	}
-	switch d.codec {
-	case 0:
-	case 1:
-		raw, err = zstdDecompress(raw)
+	if d.codec != codec.IDNone {
+		raw, err = db.codecs.decode(d.codec, nil, raw, int(d.rawLen))
 		if err != nil {
 			return nil, err
 		}
-		if len(raw) != int(d.rawLen) {
-			return nil, errors.New("strata: invalid KV index length")
-		}
-	default:
-		return nil, errors.New("strata: unsupported KV index codec")
+	}
+	if uint64(len(raw)) != uint64(d.rawLen) {
+		return nil, errors.New("strata: invalid KV index length")
 	}
 	r := bytes.NewReader(raw)
 	catalogLen, err := binary.ReadUvarint(r)
@@ -205,7 +222,7 @@ func (db *DB) loadKVIndex() ([]byte, error) {
 	return catalog, nil
 }
 
-func readKVBlockFrom(data *osFile, mapped []byte, sec sectionDesc, m kvSSTMeta) ([]kvSSTEntry, error) {
+func readKVBlockFrom(data *osFile, mapped []byte, sec sectionDesc, m kvSSTMeta, codecs *codecTable) ([]kvSSTEntry, error) {
 	raw, err := sectionBlock(data, sec, m.offset, m.length, mapped)
 	if err != nil {
 		return nil, err
@@ -213,10 +230,16 @@ func readKVBlockFrom(data *osFile, mapped []byte, sec sectionDesc, m kvSSTMeta) 
 	if crc(raw) != m.crc {
 		return nil, errors.New("strata: KV block CRC mismatch")
 	}
+	if sec.codec != codec.IDNone {
+		raw, err = codecs.decode(sec.codec, nil, raw, kvBlockRawLimit(m.last))
+		if err != nil {
+			return nil, err
+		}
+	}
 	return decodeKVBlock(raw)
 }
 
-func readKVBlobFrom(data *osFile, mapped []byte, sec sectionDesc, e kvSSTEntry) ([]byte, error) {
+func readKVBlobFrom(data *osFile, mapped []byte, sec sectionDesc, e kvSSTEntry, codecs *codecTable) ([]byte, error) {
 	if sec.length == 0 || !e.external || e.blobLen == 0 {
 		return nil, errors.New("strata: invalid KV blob pointer")
 	}
@@ -227,29 +250,32 @@ func readKVBlobFrom(data *osFile, mapped []byte, sec sectionDesc, e kvSSTEntry) 
 	if crc(raw) != e.blobCRC {
 		return nil, errors.New("strata: KV blob CRC mismatch")
 	}
-	return zstdDecompress(raw)
+	if e.rawBlob {
+		return raw, nil
+	}
+	return codecs.decode(sec.codec, nil, raw, kvMaxBlobRaw)
 }
 
 func readKVBlockFromView(view *fileView, sec sectionDesc, m kvSSTMeta) ([]kvSSTEntry, error) {
 	if view == nil || view.data == nil {
 		return nil, errors.New("strata: database is closed")
 	}
-	return readKVBlockFrom(view.data, view.mappedBytes(), sec, m)
+	return readKVBlockFrom(view.data, view.mappedBytes(), sec, m, view.codecs)
 }
 
 func readKVBlobFromView(view *fileView, sec sectionDesc, e kvSSTEntry) ([]byte, error) {
 	if view == nil || view.data == nil {
 		return nil, errors.New("strata: database is closed")
 	}
-	return readKVBlobFrom(view.data, view.mappedBytes(), sec, e)
+	return readKVBlobFrom(view.data, view.mappedBytes(), sec, e, view.codecs)
 }
 
 func (db *DB) readKVBlock(m kvSSTMeta) ([]kvSSTEntry, error) {
-	return readKVBlockFrom(db.data, db.mappedBytes(), db.head.sections[0], m)
+	return readKVBlockFrom(db.data, db.mappedBytes(), db.head.sections[0], m, db.codecs)
 }
 
 func (db *DB) readKVBlob(e kvSSTEntry) ([]byte, error) {
-	return readKVBlobFrom(db.data, db.mappedBytes(), db.head.sections[1], e)
+	return readKVBlobFrom(db.data, db.mappedBytes(), db.head.sections[1], e, db.codecs)
 }
 
 func kvExpired(expiresAt, now int64) bool {

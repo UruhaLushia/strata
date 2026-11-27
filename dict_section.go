@@ -10,7 +10,7 @@ import (
 	"sort"
 	"unsafe"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
 
 const dictGCMinDead = 1024
@@ -88,12 +88,12 @@ type dictCompactSnap struct {
 	dims   []dictDimCompactSnap
 }
 
-func (s *dictDimCompactSnap) resolve(id uint32) string {
+func (s *dictDimCompactSnap) resolve(id uint32) (string, error) {
 	if v := s.resolveLocal(id); v != "" || s.ext == nil || id == 0 || id >= s.tailBase {
-		return v
+		return v, nil
 	}
 	if _, ok := s.extra[id]; ok {
-		return ""
+		return "", nil
 	}
 	return s.ext.resolve(id)
 }
@@ -193,7 +193,7 @@ type writtenExtDim struct {
 	sstBlocks     []dictPageDesc
 }
 
-func writeDictSection(tf *osFile, pos int64, snap *dictCompactSnap, sourceView *fileView, enc *zstd.Encoder, live dictLiveBits) (int64, sectionDesc, map[dictDimKey]bool, error) {
+func writeDictSection(tf *osFile, pos int64, snap *dictCompactSnap, sourceView *fileView, enc codec.Encoder, target uint8, live dictLiveBits) (int64, sectionDesc, map[dictDimKey]bool, error) {
 	if snap == nil || (len(snap.series) == 0 && len(snap.dims) == 0) {
 		return pos, sectionDesc{}, nil, nil
 	}
@@ -241,7 +241,7 @@ func writeDictSection(tf *osFile, pos int64, snap *dictCompactSnap, sourceView *
 		}
 		var we writtenExtDim
 		var err error
-		pos, we, err = writeOneExtDim(tf, secStart, pos, secHash, d, sourceView, enc, copyBuf, &plainBuf, &compBuf, keepBits)
+		pos, we, err = writeOneExtDim(tf, secStart, pos, secHash, d, sourceView, enc, target, copyBuf, &plainBuf, &compBuf, keepBits)
 		if err != nil {
 			return pos, sectionDesc{}, nil, err
 		}
@@ -251,7 +251,14 @@ func writeDictSection(tf *osFile, pos int64, snap *dictCompactSnap, sourceView *
 	}
 
 	dirRaw := encodeDictDir(snap.series, inlineDims, extDims)
-	dirComp := enc.EncodeAll(dirRaw, nil)
+	dirComp, compressed, err := encodeSmaller(enc, nil, dirRaw, maxSectionRawBytes)
+	if err != nil {
+		return pos, sectionDesc{}, nil, err
+	}
+	var dirRawLen uint32
+	if compressed {
+		dirRawLen = uint32(len(dirRaw))
+	}
 	if _, err := tf.WriteAt(dirComp, pos); err != nil {
 		return pos, sectionDesc{}, nil, err
 	}
@@ -261,7 +268,7 @@ func writeDictSection(tf *osFile, pos int64, snap *dictCompactSnap, sourceView *
 	var trailer [16]byte
 	copy(trailer[0:4], dictMagic[:])
 	binary.LittleEndian.PutUint32(trailer[4:8], uint32(len(dirComp)))
-	binary.LittleEndian.PutUint32(trailer[8:12], uint32(len(dirRaw)))
+	binary.LittleEndian.PutUint32(trailer[8:12], dirRawLen)
 	binary.LittleEndian.PutUint32(trailer[12:16], crc(dirComp))
 	if _, err := tf.WriteAt(trailer[:], pos); err != nil {
 		return pos, sectionDesc{}, nil, err
@@ -270,16 +277,17 @@ func writeDictSection(tf *osFile, pos int64, snap *dictCompactSnap, sourceView *
 	pos += int64(len(trailer))
 
 	desc := sectionDesc{
-		kind: 5, codec: 1, count: 1,
+		kind: 5, codec: target, count: 1,
 		offset: uint64(secStart), length: uint64(pos - secStart),
-		rawLen: uint32(len(dirRaw)), crc: secHash.Sum32(),
+		rawLen: dirRawLen, crc: secHash.Sum32(),
 	}
 	return pos, desc, pruned, nil
 }
 
-func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dictDimCompactSnap, sourceView *fileView, enc *zstd.Encoder, copyBuf []byte, plainBuf, compBuf *[]byte, keepBits []uint64) (int64, writtenExtDim, error) {
+func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dictDimCompactSnap, sourceView *fileView, enc codec.Encoder, target uint8, copyBuf []byte, plainBuf, compBuf *[]byte, keepBits []uint64) (int64, writtenExtDim, error) {
 	we := writtenExtDim{key: d.key, baseNextID: d.nextID, baseCount: uint32(d.count)}
-	if keepBits == nil && d.ext != nil && d.nextID == d.ext.baseNextID && len(d.extra) == 0 {
+	sameCodec := d.ext != nil && d.ext.secDesc.codec == target
+	if keepBits == nil && sameCodec && d.nextID == d.ext.baseNextID && len(d.extra) == 0 {
 		// Unchanged external dim: pure raw byte passthrough (0 decode, 0 recompress).
 		we.fwdStartOff = uint64(pos - secStart)
 		we.fwdTotalBytes = d.ext.fwdTotalBytes
@@ -308,7 +316,8 @@ func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dic
 	if d.ext != nil && d.ext.baseNextID > 1 {
 		fullOldPages = int(d.ext.baseNextID-1) / dictFwdPageSize
 	}
-	var dec *zstd.Decoder
+	slot := querySlot{codecs: sourceView.codecs}
+	defer slot.close()
 	var oldPlain []byte
 	vals := make([]string, 0, dictFwdPageSize)
 	var liveWritten uint32
@@ -319,7 +328,7 @@ func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dic
 			we.fwdPages = append(we.fwdPages, dictPageDesc{})
 			continue
 		}
-		canPass := keepBits == nil && d.ext != nil && p < fullOldPages && !pageHasExtra(d.extra, startID, endID)
+		canPass := keepBits == nil && sameCodec && p < fullOldPages && !pageHasExtra(d.extra, startID, endID)
 		if canPass {
 			oldDesc := d.ext.fwdPages[p]
 			if oldDesc.length == 0 {
@@ -339,12 +348,8 @@ func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dic
 		hasNonEmpty := false
 		oldCount := 0
 		if d.ext != nil && p < len(d.ext.fwdPages) && d.ext.fwdPages[p].length > 0 {
-			if dec == nil {
-				dec = getZstdDecoder()
-				defer putZstdDecoder(dec)
-			}
 			var err error
-			oldPlain, err = d.ext.readPageInto(d.ext.fwdStartOff, d.ext.fwdPages[p], &oldPlain, dec)
+			oldPlain, err = d.ext.readPageInto(d.ext.fwdStartOff, d.ext.fwdPages[p], &oldPlain, &slot)
 			if err != nil {
 				return pos, we, err
 			}
@@ -376,12 +381,14 @@ func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dic
 			we.fwdPages = append(we.fwdPages, dictPageDesc{})
 			continue
 		}
-		comp := encodeFwdPage(vals, plainBuf, compBuf, enc)
-		out := comp
-		rawLen := uint32(len(*plainBuf))
-		if len(comp) >= len(*plainBuf) {
-			out = *plainBuf
-			rawLen = 0
+		out, compressed, err := encodeFwdPage(vals, plainBuf, *compBuf, enc)
+		if err != nil {
+			return pos, we, err
+		}
+		var rawLen uint32
+		if compressed {
+			*compBuf = out
+			rawLen = uint32(len(*plainBuf))
 		}
 		relOff := uint64(pos - fwdAreaStart)
 		if _, err := tf.WriteAt(out, pos); err != nil {

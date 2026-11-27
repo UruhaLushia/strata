@@ -1,11 +1,9 @@
-// Package strata implements lightweight, memory-bounded embedded storage for
-// time-series metrics and transactional key-value data in a single file.
+// Package strata stores fixed-dimension time-series aggregates and transactional
+// key-value data in a single file.
 //
-// Applications can store traffic metrics, game launch statistics, or API usage
-// alongside local settings and state. Use [OpenClient] or [NewClient] for
-// time-series rollups, aggregation, paginated reads, streaming scans, and
-// transactions across key-value regions.
+// Compression is optional through github.com/UruhaLushia/strata/codec.
+// The default is uncompressed storage.
 //
-// The independent github.com/UruhaLushia/strata/eventlog subpackage provides
-// optional, bounded structured event history.
+// The optional github.com/UruhaLushia/strata/eventlog subpackage provides bounded
+// structured event history.
 package strata

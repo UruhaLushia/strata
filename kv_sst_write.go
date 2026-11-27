@@ -5,7 +5,7 @@ import (
 	"errors"
 	"hash/crc32"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
 
 const (
@@ -13,7 +13,7 @@ const (
 	kvFlagHasLiveTTL uint8 = 1 << 2
 )
 
-func canPassthroughKV(oldHead superblock, sealedKVRev uint64) bool {
+func canPassthroughKV(oldHead superblock, sealedKVRev uint64, target uint8) bool {
 	if sealedKVRev != oldHead.sealedKVRev {
 		return false
 	}
@@ -21,7 +21,7 @@ func canPassthroughKV(oldHead superblock, sealedKVRev uint64) bool {
 	if sBlk.length == 0 && sBlob.length == 0 && sIdx.length == 0 {
 		return true
 	}
-	if sIdx.length == 0 || sIdx.kind != secKVSSTIndex {
+	if sIdx.length == 0 || sIdx.kind != secKVSSTIndex || sIdx.codec != 0 && sIdx.codec != target {
 		return false
 	}
 	if sIdx.flags&kvFlagTTLChecked == 0 || sIdx.flags&kvFlagHasLiveTTL != 0 {
@@ -32,13 +32,13 @@ func canPassthroughKV(oldHead superblock, sealedKVRev uint64) bool {
 	}
 	cur := uint64(dataStart)
 	if sBlob.length > 0 {
-		if sBlob.kind != secKVLargeBlobs || sBlob.offset != cur || sBlob.length > oldHead.walOffset-cur {
+		if sBlob.kind != secKVLargeBlobs || sBlob.codec != target || sBlob.offset != cur || sBlob.length > oldHead.walOffset-cur {
 			return false
 		}
 		cur += sBlob.length
 	}
 	if sBlk.length > 0 {
-		if sBlk.kind != secKVSSTBlocks || sBlk.offset != cur || sBlk.length > oldHead.walOffset-cur {
+		if sBlk.kind != secKVSSTBlocks || sBlk.codec != target || sBlk.offset != cur || sBlk.length > oldHead.walOffset-cur {
 			return false
 		}
 		cur += sBlk.length
@@ -86,7 +86,7 @@ func copyPassthroughKVSections(dst, src *osFile, oldHead superblock) (int64, [3]
 	return pos, [3]sectionDesc{sBlk, {}, sIdx}, sBlob, nil
 }
 
-func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, enc *zstd.Encoder) (int64, [3]sectionDesc, sectionDesc, error) {
+func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, enc codec.Encoder, target uint8) (int64, [3]sectionDesc, sectionDesc, error) {
 	var desc [3]sectionDesc
 	var blobDesc sectionDesc
 	if len(blocks) == 0 && len(catalog) == 0 {
@@ -101,10 +101,17 @@ func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, 
 			if e.expiresAtUnixNano != 0 {
 				hasLiveTTL = true
 			}
-			if len(e.value) <= 32<<10 {
+			if len(e.value) <= kvInlineLimit {
 				continue
 			}
-			raw := enc.EncodeAll(e.value, nil)
+			if len(e.value) > kvMaxBlobRaw {
+				return 0, desc, blobDesc, codec.ErrTooLarge
+			}
+			raw, compressed, err := encodeSmaller(enc, nil, e.value, kvMaxBlobRaw)
+			if err != nil {
+				return 0, desc, blobDesc, err
+			}
+			e.rawBlob = !compressed
 			e.external = true
 			e.blobLen = uint32(len(raw))
 			e.blobCRC = crc(raw)
@@ -135,7 +142,7 @@ func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, 
 			}
 		}
 		blobDesc = sectionDesc{
-			kind: secKVLargeBlobs, codec: 1, count: uint32(len(blobs)),
+			kind: secKVLargeBlobs, codec: target, count: uint32(len(blobs)),
 			offset: uint64(blobStart), length: uint64(pos - blobStart),
 			rawLen: blobRawLen, crc: blobHash.Sum32(),
 		}
@@ -147,7 +154,15 @@ func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, 
 	var rawAllLen uint32
 	for i := range blocks {
 		b := &blocks[i]
-		b.raw = encodeKVBlockWithEncoder(b.entries, enc)
+		plain := encodeKVBlock(b.entries)
+		if len(plain) > kvBlockRawLimit(b.last) {
+			return 0, desc, blobDesc, codec.ErrTooLarge
+		}
+		var err error
+		b.raw, err = encodePayload(enc, nil, plain)
+		if err != nil {
+			return 0, desc, blobDesc, err
+		}
 		if _, err := f.WriteAt(b.raw, pos); err != nil {
 			return 0, desc, blobDesc, err
 		}
@@ -163,17 +178,19 @@ func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, 
 		index = binary.LittleEndian.AppendUint32(index, crc(b.raw))
 		pos += int64(len(b.raw))
 	}
-	desc[0] = sectionDesc{kind: secKVSSTBlocks, codec: 1, count: uint32(len(blocks)), offset: uint64(start), length: uint64(pos - start), rawLen: rawAllLen, crc: blockHash.Sum32()}
+	desc[0] = sectionDesc{kind: secKVSSTBlocks, codec: target, count: uint32(len(blocks)), offset: uint64(start), length: uint64(pos - start), rawLen: rawAllLen, crc: blockHash.Sum32()}
 	idxStart := pos
 	idxFlags := kvFlagTTLChecked
 	if hasLiveTTL {
 		idxFlags |= kvFlagHasLiveTTL
 	}
-	out := index
+	out, compressed, err := encodeSmaller(enc, nil, index, maxSectionRawBytes)
+	if err != nil {
+		return 0, desc, blobDesc, err
+	}
 	var idxCodec uint8
-	if comp := enc.EncodeAll(index, nil); len(comp) < len(index) {
-		out = comp
-		idxCodec = 1
+	if compressed {
+		idxCodec = target
 	}
 	if _, err := f.WriteAt(out, pos); err != nil {
 		return 0, desc, blobDesc, err

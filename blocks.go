@@ -1,25 +1,32 @@
 package strata
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"sort"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/UruhaLushia/strata/codec"
 )
 
 var (
-	blockStreamsMagic      = [4]byte{'S', 'T', 'R', '2'}
 	errBlockOutsideSection = errors.New("strata: block outside section")
 	errTruncatedBlock      = errors.New("strata: truncated block")
 	errInvalidBlockVint    = errors.New("strata: invalid block varint")
 )
 
-const streamFlagUnsorted byte = 1
+const (
+	blockTagRawSmall   byte = 1
+	blockTagCompSmall  byte = 2
+	blockTagStreams    byte = 3
+	streamFlagUnsorted byte = 1
+)
+
+const maxSmallBlockRaw = 32 << 10
 const tsIndexEntryBytes = 80
 
-func encodeBlockWithEncoder(b sealedBlock, enc *zstd.Encoder) ([]byte, error) {
+func isStreamBlock(raw []byte) bool { return len(raw) != 0 && raw[0] == blockTagStreams }
+
+func encodeBlockWithEncoder(b sealedBlock, enc codec.Encoder) ([]byte, error) {
 	raw := make([]byte, 0, 64+len(b.rows)*73)
 	raw = binary.LittleEndian.AppendUint16(raw, b.series)
 	raw = append(raw, b.res)
@@ -54,31 +61,47 @@ func encodeBlockWithEncoder(b sealedBlock, enc *zstd.Encoder) ([]byte, error) {
 		return nil, err
 	}
 	if len(rows) >= 256 {
-		out := make([]byte, 0, len(raw)+len(blockStreamsMagic))
-		out = append(out, blockStreamsMagic[:]...)
-		return append(out, raw...), nil
+		return append([]byte{blockTagStreams}, raw...), nil
 	}
-	return enc.EncodeAll(raw, nil), nil
+	out, compressed, err := encodeSmaller(enc, nil, raw, maxSmallBlockRaw)
+	if err != nil {
+		return nil, err
+	}
+	tag := blockTagRawSmall
+	if compressed {
+		tag = blockTagCompSmall
+	}
+	return append([]byte{tag}, out...), nil
 }
 
-func decodeBlock(raw []byte) (sealedBlock, error) {
-	if bytes.HasPrefix(raw, blockStreamsMagic[:]) {
-		return decodeBlockPlain(raw[4:], blockColumnarStreamsMarker)
+func smallBlockPlain(raw []byte, id uint8, slot *querySlot) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, errTruncatedBlock
 	}
-	plainScratch := getZstdScratch()
-	dec := getZstdDecoder()
-	plain, err := dec.DecodeAll(raw, (*plainScratch)[:0])
-	putZstdDecoder(dec)
+	switch raw[0] {
+	case blockTagRawSmall:
+		return raw[1:], nil
+	case blockTagCompSmall:
+		return slot.decode(id, raw[1:], maxSmallBlockRaw)
+	default:
+		return nil, errors.New("strata: invalid TS block tag")
+	}
+}
+
+func decodeBlock(raw []byte, id uint8, codecs *codecTable) (sealedBlock, error) {
+	slot := querySlot{codecs: codecs}
+	defer slot.close()
+	if isStreamBlock(raw) {
+		return decodeBlockPlain(raw[1:], blockColumnarStreamsMarker, id, &slot)
+	}
+	plain, err := smallBlockPlain(raw, id, &slot)
 	if err != nil {
-		putZstdScratch(plainScratch, plain)
 		return sealedBlock{}, err
 	}
-	b, err := decodeBlockPlain(plain, blockColumnarMarker)
-	putZstdScratch(plainScratch, plain)
-	return b, err
+	return decodeBlockPlain(plain, blockColumnarMarker, id, &slot)
 }
 
-func decodeBlockPlain(plain []byte, wantMarker byte) (sealedBlock, error) {
+func decodeBlockPlain(plain []byte, wantMarker byte, id uint8, slot *querySlot) (sealedBlock, error) {
 	var b sealedBlock
 	off := 0
 	field, err := takeBlockBytes(plain, &off, 2)
@@ -127,7 +150,7 @@ func decodeBlockPlain(plain []byte, wantMarker byte) (sealedBlock, error) {
 	if err != nil {
 		return b, err
 	}
-	if n > 1<<20 {
+	if n > 1<<20 || (n < 256) != (wantMarker == blockColumnarMarker) {
 		return b, errors.New("strata: block row count too large")
 	}
 	if off >= len(plain) || plain[off] != wantMarker {
@@ -136,7 +159,7 @@ func decodeBlockPlain(plain []byte, wantMarker byte) (sealedBlock, error) {
 	off++
 	var decodeErr error
 	if wantMarker == blockColumnarStreamsMarker {
-		decodeErr = decodeColumnarRowsStreams(plain, &off, &b, int(n))
+		decodeErr = decodeColumnarRowsStreams(plain, &off, &b, int(n), id, slot)
 	} else {
 		decodeErr = decodeColumnarRows(plain, &off, &b, int(n))
 	}
@@ -174,29 +197,6 @@ func readBlockUvarint(raw []byte, off *int) (uint64, error) {
 	return readSliceUvarint(raw, off, errTruncatedBlock, errInvalidBlockVint)
 }
 
-func newZstdEncoder(level CompressionLevel, windowSize int) *zstd.Encoder {
-	if windowSize <= 0 {
-		windowSize = 128 << 10
-	}
-	encoderLevel := zstd.SpeedFastest
-	switch level {
-	case CompressionDefault:
-		encoderLevel = zstd.SpeedDefault
-	case CompressionBetter:
-		encoderLevel = zstd.SpeedBetterCompression
-	case CompressionBest:
-		encoderLevel = zstd.SpeedBestCompression
-	}
-	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithEncoderLevel(encoderLevel), zstd.WithWindowSize(windowSize))
-	return enc
-}
-
-func zstdDecompress(raw []byte) ([]byte, error) {
-	dec := getZstdDecoder()
-	defer putZstdDecoder(dec)
-	return dec.DecodeAll(raw, nil)
-}
-
 func sectionRaw(f *osFile, d sectionDesc, mapped []byte) ([]byte, error) {
 	if d.offset < dataStart || d.length > 1<<40 {
 		return nil, errors.New("strata: invalid section")
@@ -209,10 +209,15 @@ func sectionRaw(f *osFile, d sectionDesc, mapped []byte) ([]byte, error) {
 	return raw, err
 }
 
-func decodeBlocks(f *osFile, s superblock, mapped []byte) ([]sealedMeta, error) {
+func decodeBlocks(f *osFile, s superblock, mapped []byte, codecs *codecTable) ([]sealedMeta, error) {
 	idxd := s.sections[4]
 	if idxd.length == 0 || s.sections[3].length == 0 {
 		return nil, nil
+	}
+	expected := uint64(idxd.count) * tsIndexEntryBytes
+	if idxd.count == 0 || uint64(idxd.count) > s.sections[secTSBlocks].length ||
+		expected != uint64(idxd.rawLen) || idxd.codec != codec.IDNone && expected > maxSectionRawBytes {
+		return nil, errors.New("strata: invalid TS index entry size")
 	}
 	idxraw, err := sectionRaw(f, idxd, mapped)
 	if err != nil {
@@ -221,18 +226,14 @@ func decodeBlocks(f *osFile, s superblock, mapped []byte) ([]sealedMeta, error) 
 	if crc(idxraw) != idxd.crc {
 		return nil, errors.New("strata: TS index CRC mismatch")
 	}
-	if idxd.codec != 1 {
-		return nil, errors.New("strata: unsupported TS index codec")
+	if idxd.codec != codec.IDNone {
+		idxraw, err = codecs.decode(idxd.codec, nil, idxraw, int(expected))
+		if err != nil {
+			return nil, err
+		}
 	}
-	idxraw, err = zstdDecompress(idxraw)
-	if err != nil {
-		return nil, errors.New("strata: decode TS index: " + err.Error())
-	}
-	if idxd.count == 0 || len(idxraw)%int(idxd.count) != 0 {
-		return nil, errors.New("strata: invalid TS index")
-	}
-	if len(idxraw)/int(idxd.count) != tsIndexEntryBytes {
-		return nil, errors.New("strata: invalid TS index entry size")
+	if uint64(len(idxraw)) != expected {
+		return nil, errors.New("strata: invalid TS index length")
 	}
 	out := make([]sealedMeta, 0, len(idxraw)/tsIndexEntryBytes)
 	for i := 0; i < len(idxraw); i += tsIndexEntryBytes {

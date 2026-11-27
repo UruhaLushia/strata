@@ -179,6 +179,10 @@ func (db *DB) Refresh() error {
 		_ = probe.Close()
 		return ErrIncompatFormat
 	}
+	if err := db.codecs.checkSections(head); err != nil {
+		_ = probe.Close()
+		return err
+	}
 	if head.uuid == db.head.uuid && head.gen == db.head.gen {
 		_ = probe.Close()
 		pos, max, scanErr := scanWAL(db.data, db.walPos, false, db.applyFrame)
@@ -203,11 +207,12 @@ func (db *DB) Refresh() error {
 		path:   db.path,
 		opts:   db.opts,
 		policy: db.policy,
+		codecs: db.codecs,
 		writer: false,
 		data:   f,
 		head:   head,
 		mapped: mapped,
-		view:   newFileView(f, mapped, head.sections[secTSBlocks]),
+		view:   newFileView(f, mapped, head.sections[secTSBlocks], db.codecs),
 	}
 	if err := next.loadLocked(); err != nil {
 		next.view.release()

@@ -69,7 +69,7 @@ func (db *DB) buildKVBlocks(maxRev uint64) ([]kvSSTBlock, error) {
 	var out []kvSSTBlock
 	for len(list) > 0 {
 		n, rawBytes := 0, 0
-		for n < len(list) && (n == 0 || rawBytes < 16<<10) {
+		for n < len(list) && (n == 0 || rawBytes < kvBlockTarget) {
 			rawBytes += 16 + len(list[n].key) + len(list[n].value)
 			n++
 		}
