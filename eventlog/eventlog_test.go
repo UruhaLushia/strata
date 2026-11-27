@@ -2,12 +2,14 @@ package eventlog
 
 import (
 	"bytes"
+	stdflate "compress/flate"
 	"context"
 	"encoding/binary"
 	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +18,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/UruhaLushia/strata/codec"
+	"github.com/UruhaLushia/strata/codec/flate"
+	"github.com/UruhaLushia/strata/codec/s2"
+	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
 func TestPackageBoundaries(t *testing.T) {
@@ -29,7 +36,11 @@ func TestPackageBoundaries(t *testing.T) {
 		check(t, err)
 		for _, imp := range f.Imports {
 			p := strings.Trim(imp.Path.Value, "\"")
-			if strings.Contains(p, "/internal/") || p == "github.com/UruhaLushia/strata" ||
+			if p == "github.com/UruhaLushia/strata/codec" {
+				continue
+			}
+			if strings.Contains("/"+p+"/", "/internal/") || p == "github.com/UruhaLushia/strata" ||
+				strings.HasPrefix(p, "github.com/UruhaLushia/strata/") ||
 				strings.HasPrefix(p, "github.com/klauspost/compress") {
 				t.Errorf("%s imports %s", name, p)
 			}
@@ -99,7 +110,7 @@ func TestRoundTripAndScanLimits(t *testing.T) {
 	if len(want) != 0 || result.Records != 3 || result.LimitReached || result.Truncated {
 		t.Fatalf("exact record budget: %+v", result)
 	}
-	firstFrame := int64(minFrameSize + len("last"))
+	firstFrame := int64(minRawFrameSize + len("last"))
 	for _, tc := range []struct {
 		opts ScanOptions
 		n    int
@@ -125,6 +136,172 @@ func TestRoundTripAndScanLimits(t *testing.T) {
 	r, err = l.Scan(ctx, ScanOptions{}, func(Record) error { cancel(); return nil })
 	if !errors.Is(err, context.Canceled) || r.Records != 1 {
 		t.Fatalf("callback cancellation: %+v, %v", r, err)
+	}
+}
+
+func TestCodecRoundTrip(t *testing.T) {
+	const rowBytes = 4 << 10
+	payload := make([]byte, 96<<10)
+	rng := rand.New(rand.NewPCG(1, 2))
+	for i := range 72 << 10 {
+		payload[i] = byte(rng.Uint64())
+	}
+	first := Record{TimestampNS: 0x0102030405060708, StreamID: 0x090a, Payload: payload[:rowBytes]}
+	rows := []Record{first}
+	for i := 0; i < len(payload); i += rowBytes {
+		rows = append(rows, Record{TimestampNS: int64(i + 1), Payload: payload[i : i+rowBytes]})
+	}
+	for _, tc := range []struct {
+		name string
+		c    codec.Codec
+	}{
+		{"None", nil}, {"Zstd", zstd.New(zstd.Default)}, {"S2", s2.New(s2.Default)},
+		{"Flate", flate.New(stdflate.DefaultCompression)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l, err := Open(dir, Options{Codec: tc.c, MaxBatchBytes: 128 << 10})
+			check(t, err)
+			defer l.Close()
+			check(t, l.Append(first))
+			check(t, l.Flush())
+			check(t, l.Append(rows[1:]...))
+			check(t, l.Close())
+			data, err := os.ReadFile(l.shardPath(1))
+			check(t, err)
+			firstSize := minRawFrameSize + len(first.Payload)
+			secondStart := fileHeaderSize + firstSize
+			wantID := codec.IDNone
+			var opts Options
+			if tc.c != nil {
+				wantID = tc.c.ID()
+				opts.Codecs = []codec.Codec{tc.c}
+			}
+			if data[fileHeaderSize+20] != codec.IDNone || data[secondStart+20] != wantID {
+				t.Fatalf("frame codec IDs = %d and %d, want 0 and %d", data[fileHeaderSize+20], data[secondStart+20], wantID)
+			}
+			largeSize := int64(len(data) - secondStart)
+			if largeSize <= scanWindowBytes {
+				t.Fatalf("large stored frame is only %d bytes", largeSize)
+			}
+			l, err = Open(dir, opts)
+			check(t, err)
+			defer l.Close()
+			for _, budget := range []struct {
+				bytes int64
+				left  int
+			}{{largeSize, 1}, {largeSize + int64(firstSize), 0}} {
+				next := len(rows)
+				r, err := l.Scan(t.Context(), ScanOptions{MaxBytes: budget.bytes}, func(got Record) error {
+					next--
+					want := rows[next]
+					if got.TimestampNS != want.TimestampNS || got.StreamID != want.StreamID ||
+						!bytes.Equal(got.Payload, want.Payload) || cap(got.Payload) != len(got.Payload) {
+						t.Fatalf("incorrect borrowed record %d", next)
+					}
+					return nil
+				})
+				check(t, err)
+				if r.BytesRead != budget.bytes || r.Records != len(rows)-budget.left ||
+					next != budget.left || r.LimitReached != (budget.left > 0) {
+					t.Fatalf("scan with %d stored bytes: %+v, remaining records = %d", budget.bytes, r, next)
+				}
+			}
+			for range cap(l.scanSem) {
+				slot := <-l.scanSem
+				l.scanSem <- slot
+				if slot != nil && (cap(slot.raw) > scanWindowBytes || tc.c == nil && slot.raw != nil) {
+					t.Fatal("scan slot retained unexpected decompression memory")
+				}
+			}
+		})
+	}
+	t.Run("Tiny", func(t *testing.T) {
+		dir, c := t.TempDir(), tinyCodec(128)
+		l, err := Open(dir, Options{Codec: c})
+		check(t, err)
+		defer l.Close()
+		check(t, l.Append(Record{}))
+		check(t, l.Close())
+		l, err = Open(dir, Options{Codecs: []codec.Codec{c}})
+		check(t, err)
+		defer l.Close()
+		r, err := l.Scan(t.Context(), ScanOptions{MaxBytes: minStoredFrameSize}, func(r Record) error {
+			if r.TimestampNS != 0 || r.StreamID != 0 || len(r.Payload) != 0 {
+				t.Fatalf("unexpected empty record: %+v", r)
+			}
+			return nil
+		})
+		check(t, err)
+		if r != (ScanResult{Records: 1, BytesRead: minStoredFrameSize}) {
+			t.Fatalf("minimum stored frame scan = %+v", r)
+		}
+	})
+}
+
+// tinyCodec encodes an empty record as one byte in a fresh buffer.
+type tinyCodec uint8
+
+func (c tinyCodec) ID() uint8                             { return uint8(c) }
+func (c tinyCodec) NewEncoder(int) (codec.Encoder, error) { return c, nil }
+func (c tinyCodec) NewDecoder() (codec.Decoder, error)    { return c, nil }
+func (tinyCodec) Encode([]byte, []byte) ([]byte, error)   { return []byte{1}, nil }
+func (tinyCodec) Close() error                            { return nil }
+
+func (tinyCodec) Decode(dst, src []byte, limit int) ([]byte, error) {
+	if len(src) != 1 || src[0] != 1 || limit != recordHeaderSize {
+		return nil, ErrCorrupt
+	}
+	return append(dst[:0], make([]byte, recordHeaderSize)...), nil
+}
+
+func TestMixedCodecsAndMissingReaders(t *testing.T) {
+	dir := t.TempDir()
+	a, b := zstd.New(zstd.Default), s2.New(s2.Default)
+	write := func(l *Log, ts int64) {
+		t.Helper()
+		check(t, l.Append(Record{TimestampNS: ts, Payload: bytes.Repeat([]byte("repeat"), 64)}))
+		check(t, l.Close())
+	}
+	l, err := Open(dir, Options{Codec: a})
+	check(t, err)
+	write(l, 1)
+	path := l.shardPath(1)
+	before, err := os.ReadFile(path)
+	check(t, err)
+	_, err = Open(dir, Options{Codec: b})
+	wantError(t, err, codec.ErrUnsupportedCodec)
+	after, err := os.ReadFile(path)
+	check(t, err)
+	if !bytes.Equal(before, after) {
+		t.Fatal("Open changed a frame without a matching decoder")
+	}
+	l, err = Open(dir, Options{Codec: b, Codecs: []codec.Codec{a}})
+	check(t, err)
+	write(l, 2)
+	readers := []codec.Codec{a, b}
+	l, err = Open(dir, Options{Codecs: readers, ShardMaxBytes: fileHeaderSize + minRawFrameSize})
+	check(t, err)
+	readers[0] = nil
+	if got := timestamps(t, l); !slices.Equal(got, []int64{2, 1}) || len(shardFiles(t, dir)) != 1 {
+		t.Fatalf("mixed codec history in one shard = %v", got)
+	}
+	write(l, 3) // A newer raw shard lets recovery skip the mixed sealed shard.
+	before, err = os.ReadFile(path)
+	check(t, err)
+	l, err = Open(dir, Options{Codecs: []codec.Codec{b}})
+	check(t, err)
+	defer l.Close()
+	var seen []int64
+	r, err := l.Scan(t.Context(), ScanOptions{}, func(r Record) error {
+		seen = append(seen, r.TimestampNS)
+		return nil
+	})
+	wantError(t, err, codec.ErrUnsupportedCodec)
+	after, err = os.ReadFile(path)
+	check(t, err)
+	if r.Records != 2 || !slices.Equal(seen, []int64{3, 2}) || !bytes.Equal(before, after) {
+		t.Fatalf("scan without an older decoder = %+v, %v", r, seen)
 	}
 }
 
@@ -245,9 +422,9 @@ func TestTailRecoveryAndCorruption(t *testing.T) {
 		want int
 	}{
 		{"short frame", func(b []byte) []byte { return b[:len(b)-3] }, 2},
-		{"tail CRC", func(b []byte) []byte { b[start[2]+12] ^= 1; return b }, 2},
+		{"tail CRC", func(b []byte) []byte { b[start[2]+16] ^= 1; return b }, 2},
 		{"tail length", func(b []byte) []byte { b[start[2]+4]++; return b }, 2},
-		{"middle CRC", func(b []byte) []byte { b[start[1]+12] ^= 1; return b }, -1},
+		{"middle CRC", func(b []byte) []byte { b[start[1]+16] ^= 1; return b }, -1},
 		{"middle length with valid tail", func(b []byte) []byte {
 			binary.LittleEndian.PutUint32(b[start[0]+4:], ^uint32(0))
 			return b
@@ -378,7 +555,7 @@ func TestScanDoesNotRepairCorruptShard(t *testing.T) {
 func TestStorageBudgets(t *testing.T) {
 	for _, opts := range []Options{
 		{MaxRecordBytes: 8, MaxBatchBytes: 64, ShardMaxBytes: 62, MaxShards: 2},
-		{MaxRecordBytes: 8, MaxBatchBytes: 64, ShardMaxBytes: 62, MaxTotalBytes: 124},
+		{MaxRecordBytes: 8, MaxBatchBytes: 64, ShardMaxBytes: 62, MaxTotalBytes: 2 * (fileHeaderSize + minRawFrameSize + 8)},
 	} {
 		dir := t.TempDir()
 		l, err := Open(dir, opts)
@@ -411,9 +588,9 @@ func TestAdmissionAndDirectoryLock(t *testing.T) {
 	}{
 		{"TotalBudget", Options{MaxTotalBytes: 1 << 20}, 4 << 10},
 		{"TotalBelowDefaultBatch", Options{MaxTotalBytes: 8 << 10}, 4 << 10},
-		{"TotalBelowDefaultRecord", Options{MaxTotalBytes: 1024}, 1024 - fileHeaderSize - minFrameSize},
+		{"TotalBelowDefaultRecord", Options{MaxTotalBytes: 1024}, 1024 - fileHeaderSize - minRawFrameSize},
 		{"LargeRecord", Options{MaxRecordBytes: 64 << 10}, 64 << 10},
-		{"SmallBatch", Options{MaxBatchBytes: 2 << 10}, (2 << 10) - minFrameSize},
+		{"SmallBatch", Options{MaxBatchBytes: 2 << 10}, (2 << 10) - minRawFrameSize},
 		{"LargeShard", Options{ShardMaxBytes: 64 << 20}, 4 << 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -428,10 +605,17 @@ func TestAdmissionAndDirectoryLock(t *testing.T) {
 		})
 	}
 	dir := t.TempDir()
+	zstdDefault, zstdFast := zstd.New(zstd.Default), zstd.New(zstd.Fastest)
 	for _, opts := range []Options{
 		{MaxRecordBytes: 8, MaxBatchBytes: 45},
 		{MaxTotalBytes: 32},
 		{MaxTotalBytes: 1 << 20, ShardMaxBytes: 2 << 20},
+		{Codec: tinyCodec(codec.IDNone)},
+		{Codec: tinyCodec(4)},
+		{Codecs: []codec.Codec{tinyCodec(127)}},
+		{Codecs: []codec.Codec{nil}},
+		{Codecs: []codec.Codec{zstdDefault, zstdFast}},
+		{Codec: zstdDefault, Codecs: []codec.Codec{zstdFast}},
 	} {
 		_, err := Open(dir, opts)
 		wantError(t, err, ErrInvalidOption)

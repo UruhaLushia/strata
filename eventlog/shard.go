@@ -83,7 +83,7 @@ func (l *Log) loadShards() error {
 		err = checkHeader(f, s.id)
 		if err == nil && recoverable {
 			var end int64
-			end, err = recoverTail(f, s.size)
+			end, err = recoverTail(f, s.size, l.codecs)
 			if err == nil {
 				l.total -= s.size - end
 				s.size = end

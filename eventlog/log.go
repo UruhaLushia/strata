@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/UruhaLushia/strata/codec"
 )
 
 var (
@@ -36,13 +38,16 @@ type Options struct {
 	MaxTotalBytes      int64
 	MaxShards          int
 	MaxConcurrentScans int
+	Codec              codec.Codec   // Writes use this codec when it shrinks a frame. Nil writes raw frames.
+	Codecs             []codec.Codec // Additional codecs for reading older frames. IDs must be distinct.
 }
 
 // Log is a directory-backed event log opened by Open.
 type Log struct {
-	dir  string
-	opts Options
-	lock *os.File
+	dir    string
+	opts   Options
+	lock   *os.File
+	codecs map[uint8]codec.Codec
 
 	mu            sync.Mutex
 	closed        bool
@@ -58,6 +63,9 @@ type Log struct {
 
 	ioMu     sync.Mutex
 	spare    []byte
+	enc      codec.Encoder
+	encID    uint8
+	compBuf  []byte
 	active   *os.File
 	nextID   uint64
 	total    int64
@@ -77,13 +85,13 @@ func Open(dir string, opts Options) (*Log, error) {
 		if rec == 0 {
 			rec = defaultRecordBytes
 		}
-		opts.MaxBatchBytes = max(64<<10, minFrameSize+rec)
+		opts.MaxBatchBytes = max(64<<10, minRawFrameSize+rec)
 		if room := opts.MaxTotalBytes - fileHeaderSize; opts.MaxTotalBytes != 0 && room < int64(opts.MaxBatchBytes) {
 			opts.MaxBatchBytes = int(room)
 		}
 	}
-	if opts.MaxRecordBytes == 0 && opts.MaxBatchBytes >= minFrameSize {
-		opts.MaxRecordBytes = min(defaultRecordBytes, opts.MaxBatchBytes-minFrameSize)
+	if opts.MaxRecordBytes == 0 && opts.MaxBatchBytes >= minRawFrameSize {
+		opts.MaxRecordBytes = min(defaultRecordBytes, opts.MaxBatchBytes-minRawFrameSize)
 	}
 	if opts.MaxTotalBytes == 0 {
 		opts.MaxTotalBytes = max(32<<20, opts.ShardMaxBytes, int64(fileHeaderSize+opts.MaxBatchBytes))
@@ -100,12 +108,18 @@ func Open(dir string, opts Options) (*Log, error) {
 	if opts.MaxConcurrentScans == 0 {
 		opts.MaxConcurrentScans = 2
 	}
-	if opts.MaxBatchBytes < minFrameSize+opts.MaxRecordBytes ||
-		opts.ShardMaxBytes < fileHeaderSize+minFrameSize || opts.ShardMaxBytes > opts.MaxTotalBytes ||
+	if opts.MaxBatchBytes < minRawFrameSize+opts.MaxRecordBytes ||
+		opts.ShardMaxBytes < fileHeaderSize+minRawFrameSize || opts.ShardMaxBytes > opts.MaxTotalBytes ||
 		opts.MaxTotalBytes < int64(fileHeaderSize+opts.MaxBatchBytes) {
 		return nil, ErrInvalidOption
 	}
-	dir, err := filepath.Abs(dir)
+	codecs, encID, err := codecFactories(opts)
+	if err != nil {
+		return nil, err
+	}
+	writer := opts.Codec
+	opts.Codec, opts.Codecs = nil, nil
+	dir, err = filepath.Abs(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -118,10 +132,20 @@ func Open(dir string, opts Options) (*Log, error) {
 	}
 	l := &Log{
 		dir: dir, opts: opts, lock: lock, nextID: 1,
+		codecs: codecs, encID: encID,
 		closing: make(chan struct{}), done: make(chan struct{}),
 		scanSem: make(chan *scanSlot, opts.MaxConcurrentScans),
 	}
-	if err := l.loadShards(); err != nil {
+	if writer != nil {
+		l.enc, err = writer.NewEncoder(opts.MaxBatchBytes)
+	}
+	if err == nil {
+		err = l.loadShards()
+	}
+	if err != nil {
+		if l.enc != nil {
+			_ = l.enc.Close()
+		}
 		_ = lock.Close()
 		return nil, err
 	}
@@ -129,6 +153,34 @@ func Open(dir string, opts Options) (*Log, error) {
 		l.scanSem <- nil
 	}
 	return l, nil
+}
+
+func codecFactories(opts Options) (map[uint8]codec.Codec, uint8, error) {
+	if opts.Codec == nil && len(opts.Codecs) == 0 {
+		return nil, codec.IDNone, nil
+	}
+	factories := make(map[uint8]codec.Codec, len(opts.Codecs)+1)
+	add := func(c codec.Codec) uint8 {
+		if c == nil {
+			return codec.IDNone
+		}
+		id := c.ID()
+		if id == codec.IDNone || id > codec.IDFlate && id < 128 || factories[id] != nil {
+			return codec.IDNone
+		}
+		factories[id] = c
+		return id
+	}
+	encID := add(opts.Codec)
+	if opts.Codec != nil && encID == codec.IDNone {
+		return nil, 0, ErrInvalidOption
+	}
+	for _, c := range opts.Codecs {
+		if add(c) == codec.IDNone {
+			return nil, 0, ErrInvalidOption
+		}
+	}
+	return factories, encID, nil
 }
 
 // Append copies an entire batch into the pending buffer or rejects it.
@@ -202,10 +254,19 @@ func (l *Log) Close() error {
 
 	l.ioMu.Lock()
 	err := errors.Join(l.sync(true), l.closeActive())
+	if l.enc != nil {
+		err = errors.Join(err, l.enc.Close())
+		l.enc, l.compBuf = nil, nil
+	}
 	l.ioMu.Unlock()
 	l.scans.Wait()
 	close(l.scanSem)
-	for range l.scanSem {
+	for slot := range l.scanSem {
+		if slot != nil {
+			if closeErr := slot.closeDecoder(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}
 	}
 	err = errors.Join(err, l.lock.Close())
 	close(l.done)
@@ -232,7 +293,7 @@ func (l *Log) flush(closing bool) error {
 	l.inFlightBytes, l.inFlightCount = len(raw)-frameHeaderSize, count
 	l.mu.Unlock()
 
-	committed, err := l.writeFrame(finishFrame(raw, count))
+	committed, err := l.writeBatch(raw, count)
 
 	l.mu.Lock()
 	if !committed {
@@ -249,6 +310,24 @@ func (l *Log) flush(closing bool) error {
 	l.inFlightBytes, l.inFlightCount = 0, 0
 	l.mu.Unlock()
 	return err
+}
+
+func (l *Log) writeBatch(raw []byte, count int) (bool, error) {
+	body := raw[frameHeaderSize:]
+	if l.enc != nil {
+		if l.compBuf == nil {
+			l.compBuf = make([]byte, frameHeaderSize, l.opts.MaxBatchBytes)
+		}
+		packed, err := l.enc.Encode(l.compBuf[frameHeaderSize:frameHeaderSize], body)
+		if err != nil {
+			return false, err
+		}
+		if len(packed) > 0 && len(packed) < len(body) {
+			l.compBuf = finishFrame(append(l.compBuf[:frameHeaderSize], packed...), len(body), count, l.encID)
+			return l.writeFrame(l.compBuf)
+		}
+	}
+	return l.writeFrame(finishFrame(raw, len(body), count, codec.IDNone))
 }
 
 func (l *Log) sync(closing bool) error {

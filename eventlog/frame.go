@@ -6,20 +6,24 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+
+	"github.com/UruhaLushia/strata/codec"
 )
 
 const (
-	fileMagic        = "STEVLG01"
-	frameMagic       = "EVF1"
-	tailMagic        = "1FVE"
-	fileHeaderSize   = 16
-	frameHeaderSize  = 16
-	trailerSize      = 8
-	frameOverhead    = frameHeaderSize + trailerSize
-	recordHeaderSize = 14
-	minFrameSize     = frameOverhead + recordHeaderSize
-	maxRecordBytes   = 64 << 10
-	maxFrameBytes    = 1 << 20
+	fileMagic          = "STEVLG01"
+	frameMagic         = "EVF1"
+	tailMagic          = "1FVE"
+	fileHeaderSize     = 16
+	frameHeaderSize    = 21
+	trailerSize        = 8
+	frameOverhead      = frameHeaderSize + trailerSize
+	recordHeaderSize   = 14
+	minRawFrameSize    = frameOverhead + recordHeaderSize
+	minStoredFrameSize = frameOverhead + 1
+	maxRecordBytes     = 64 << 10
+	maxFrameBytes      = 1 << 20
+	maxRawBodyBytes    = maxFrameBytes - frameOverhead
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -31,50 +35,93 @@ func appendRecord(b []byte, r Record) []byte {
 	return append(b, r.Payload...)
 }
 
-func finishFrame(b []byte, count int) []byte {
-	body := b[frameHeaderSize:]
+func finishFrame(b []byte, rawLen, count int, id uint8) []byte {
 	copy(b, frameMagic)
-	binary.LittleEndian.PutUint32(b[4:], uint32(len(body)))
-	binary.LittleEndian.PutUint32(b[8:], uint32(count))
-	binary.LittleEndian.PutUint32(b[12:], crc32.Checksum(body, castagnoli))
+	binary.LittleEndian.PutUint32(b[4:], uint32(len(b)-frameHeaderSize))
+	binary.LittleEndian.PutUint32(b[8:], uint32(rawLen))
+	binary.LittleEndian.PutUint32(b[12:], uint32(count))
+	b[20] = id
+	binary.LittleEndian.PutUint32(b[16:], frameCRC(b))
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(b)+trailerSize))
 	return append(b, tailMagic...)
 }
 
-// decodeFrame validates the complete frame before any record can be delivered.
-// Recovery passes nil offsets since it only needs to validate record boundaries.
-func decodeFrame(b []byte, offsets *[]uint32) error {
-	if len(b) < minFrameSize || string(b[:4]) != frameMagic ||
+func frameCRC(b []byte) uint32 {
+	return crc32.Update(crc32.Checksum(b[:16], castagnoli), castagnoli, b[20:])
+}
+
+type storedFrame struct {
+	body          []byte
+	rawLen, count int
+	id            uint8
+}
+
+func parseFrame(b []byte) (storedFrame, error) {
+	if len(b) < minStoredFrameSize || string(b[:4]) != frameMagic ||
 		binary.LittleEndian.Uint32(b[4:]) != uint32(len(b)-frameOverhead) {
-		return ErrCorrupt
+		return storedFrame{}, ErrCorrupt
 	}
-	trailer := b[len(b)-trailerSize:]
-	body := b[frameHeaderSize : len(b)-trailerSize]
-	count := binary.LittleEndian.Uint32(b[8:])
+	end := len(b) - trailerSize
+	trailer := b[end:]
 	if string(trailer[4:]) != tailMagic || binary.LittleEndian.Uint32(trailer) != uint32(len(b)) ||
-		count == 0 || count > uint32(len(body)/recordHeaderSize) ||
-		binary.LittleEndian.Uint32(b[12:]) != crc32.Checksum(body, castagnoli) {
-		return ErrCorrupt
+		binary.LittleEndian.Uint32(b[16:]) != frameCRC(b[:end]) {
+		return storedFrame{}, ErrCorrupt
 	}
-	if offsets != nil {
-		*offsets = (*offsets)[:0]
-		if cap(*offsets) < int(count) {
-			*offsets = make([]uint32, 0, int(count))
+	rawLen, count := binary.LittleEndian.Uint32(b[8:]), binary.LittleEndian.Uint32(b[12:])
+	storedLen, id := uint32(end-frameHeaderSize), b[20]
+	if rawLen > maxRawBodyBytes || count == 0 || count > rawLen/recordHeaderSize ||
+		id == codec.IDNone && storedLen != rawLen || id != codec.IDNone && storedLen >= rawLen {
+		return storedFrame{}, ErrCorrupt
+	}
+	return storedFrame{b[frameHeaderSize:end], int(rawLen), int(count), id}, nil
+}
+
+func (f storedFrame) decode(slot *scanSlot, codecs map[uint8]codec.Codec) ([]byte, error) {
+	if slot.dec != nil && slot.decID != f.id {
+		if err := slot.closeDecoder(); err != nil {
+			return nil, err
 		}
 	}
-	pos := frameHeaderSize
-	end := len(b) - trailerSize
+	body := f.body
+	if f.id != codec.IDNone {
+		if slot.dec == nil {
+			factory := codecs[f.id]
+			if factory == nil {
+				return nil, codec.ErrUnsupportedCodec
+			}
+			dec, err := factory.NewDecoder()
+			if err != nil {
+				return nil, err
+			}
+			slot.dec, slot.decID = dec, f.id
+		}
+		raw, err := slot.dec.Decode(slot.raw[:0], f.body, f.rawLen)
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) != f.rawLen {
+			return nil, ErrCorrupt
+		}
+		slot.raw, body = raw, raw
+	}
+	return body, checkRecords(body, f.count, &slot.offsets)
+}
+
+func checkRecords(body []byte, count int, offsets *[]uint32) error {
+	*offsets = (*offsets)[:0]
+	if cap(*offsets) < count {
+		*offsets = make([]uint32, 0, count)
+	}
+	pos, end := 0, len(body)
 	for range count {
 		if end-pos < recordHeaderSize {
 			return ErrCorrupt
 		}
-		size := binary.LittleEndian.Uint32(b[pos+8:])
+		size := binary.LittleEndian.Uint32(body[pos+8:])
 		if size > maxRecordBytes || size > uint32(end-pos-recordHeaderSize) {
 			return ErrCorrupt
 		}
-		if offsets != nil {
-			*offsets = append(*offsets, uint32(pos))
-		}
+		*offsets = append(*offsets, uint32(pos))
 		pos += recordHeaderSize + int(size)
 	}
 	if pos != end {
@@ -106,35 +153,38 @@ func resizeFrame(b []byte, n int) []byte {
 	return b[:n]
 }
 
-func readForward(f *os.File, b *[]byte, pos, end int64) (int64, error) {
+func readForward(f *os.File, b *[]byte, pos, end int64) (storedFrame, error) {
 	var header [frameHeaderSize]byte
-	if end-pos < minFrameSize {
-		return 0, ErrCorrupt
+	if end-pos < minStoredFrameSize {
+		return storedFrame{}, ErrCorrupt
 	}
 	if err := readAt(f, header[:], pos); err != nil {
-		return 0, err
+		return storedFrame{}, err
 	}
 	if string(header[:4]) != frameMagic {
-		return 0, ErrCorrupt
+		return storedFrame{}, ErrCorrupt
 	}
 	size := int64(binary.LittleEndian.Uint32(header[4:])) + frameOverhead
-	if size < minFrameSize || size > maxFrameBytes || size > end-pos {
-		return 0, ErrCorrupt
+	if size < minStoredFrameSize || size > maxFrameBytes || size > end-pos {
+		return storedFrame{}, ErrCorrupt
 	}
 	*b = resizeFrame(*b, int(size))
 	copy(*b, header[:])
 	if err := readAt(f, (*b)[frameHeaderSize:], pos+frameHeaderSize); err != nil {
-		return 0, err
+		return storedFrame{}, err
 	}
-	return pos + size, decodeFrame(*b, nil)
+	return parseFrame(*b)
 }
 
-func recoverTail(f *os.File, end int64) (int64, error) {
+func recoverTail(f *os.File, end int64, codecs map[uint8]codec.Codec) (int64, error) {
 	var b []byte
 	for pos := int64(fileHeaderSize); pos < end; {
-		next, err := readForward(f, &b, pos, end)
+		frame, err := readForward(f, &b, pos, end)
 		if err == nil {
-			pos = next
+			if frame.id != codec.IDNone && codecs[frame.id] == nil {
+				return 0, codec.ErrUnsupportedCodec
+			}
+			pos += int64(frameOverhead + len(frame.body))
 			continue
 		}
 		if err != ErrCorrupt {
@@ -158,7 +208,7 @@ func recoverTail(f *os.File, end int64) (int64, error) {
 // canTruncateTail checks whether the remaining bytes fit one torn frame.
 func canTruncateTail(f *os.File, pos, end int64) (bool, error) {
 	rem := end - pos
-	if rem < minFrameSize {
+	if rem < minStoredFrameSize {
 		return true, nil
 	}
 	if rem > maxFrameBytes {
@@ -168,9 +218,8 @@ func canTruncateTail(f *os.File, pos, end int64) (bool, error) {
 	if err := readAt(f, header[:], pos); err != nil {
 		return false, err
 	}
-	bodyLen := binary.LittleEndian.Uint32(header[4:])
-	count := binary.LittleEndian.Uint32(header[8:])
-	size := int64(bodyLen) + frameOverhead
-	return string(header[:4]) == frameMagic && size >= minFrameSize && size <= maxFrameBytes &&
-		size >= rem && count >= 1 && count <= bodyLen/recordHeaderSize, nil
+	size := int64(binary.LittleEndian.Uint32(header[4:])) + frameOverhead
+	rawLen, count := binary.LittleEndian.Uint32(header[8:]), binary.LittleEndian.Uint32(header[12:])
+	return string(header[:4]) == frameMagic && size >= rem && size <= maxFrameBytes &&
+		rawLen <= maxRawBodyBytes && count >= 1 && count <= rawLen/recordHeaderSize, nil
 }
