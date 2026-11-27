@@ -2,10 +2,7 @@
 
 package strata
 
-import (
-	"golang.org/x/sys/unix"
-	"os"
-)
+import "golang.org/x/sys/unix"
 
 type unixMap struct{ data []byte }
 
@@ -38,5 +35,3 @@ func (m *unixMap) close() error {
 	m.data = nil
 	return err
 }
-
-var _ = os.ErrInvalid

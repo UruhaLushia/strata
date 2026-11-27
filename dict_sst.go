@@ -9,34 +9,30 @@ import (
 )
 
 type dictSSTWriter struct {
-	tf          *osFile
-	secStart    int64
-	areaStart   int64
-	pos         int64
-	secHash     hash.Hash32
-	enc         *zstd.Encoder
-	rawBuf      []byte
-	compBuf     []byte
-	prevKey     []byte
-	firstKey    []byte
-	entryCount  int
-	firstArena  []byte
-	firstOffs   []uint32
-	blocks      []dictPageDesc
-	blockBufCap int
+	tf         *osFile
+	areaStart  int64
+	pos        int64
+	secHash    hash.Hash32
+	enc        *zstd.Encoder
+	rawBuf     []byte
+	compBuf    []byte
+	prevKey    []byte
+	firstKey   []byte
+	entryCount int
+	firstArena []byte
+	firstOffs  []uint32
+	blocks     []dictPageDesc
 }
 
-func newDictSSTWriter(tf *osFile, secStart, pos int64, secHash hash.Hash32, enc *zstd.Encoder) *dictSSTWriter {
+func newDictSSTWriter(tf *osFile, pos int64, secHash hash.Hash32, enc *zstd.Encoder) *dictSSTWriter {
 	return &dictSSTWriter{
-		tf:          tf,
-		secStart:    secStart,
-		areaStart:   pos,
-		pos:         pos,
-		secHash:     secHash,
-		enc:         enc,
-		rawBuf:      make([]byte, 0, dictSSTTargetBytes+256),
-		firstOffs:   []uint32{0},
-		blockBufCap: dictSSTTargetBytes,
+		tf:        tf,
+		areaStart: pos,
+		pos:       pos,
+		secHash:   secHash,
+		enc:       enc,
+		rawBuf:    make([]byte, 0, dictSSTTargetBytes+256),
+		firstOffs: []uint32{0},
 	}
 }
 
@@ -44,7 +40,7 @@ func (w *dictSSTWriter) add(key string, id uint32) error {
 	if key == "" || id == 0 {
 		return nil
 	}
-	if w.entryCount > 0 && len(w.rawBuf)+len(key)+16 > w.blockBufCap {
+	if w.entryCount > 0 && len(w.rawBuf)+len(key)+16 > dictSSTTargetBytes {
 		if err := w.flush(); err != nil {
 			return err
 		}
@@ -196,7 +192,7 @@ func encodeFwdPage(vals []string, plainBuf, compBuf *[]byte, enc *zstd.Encoder) 
 	return *compBuf
 }
 
-func writeExtDimMergedSST(tf *osFile, secStart, pos int64, secHash hash.Hash32, enc *zstd.Encoder, oldExt *dictExtDim, tail []dictSSTEntry, overridden map[uint32]string, keepBits []uint64) (int64, []byte, []uint32, []dictPageDesc, error) {
+func writeExtDimMergedSST(tf *osFile, pos int64, secHash hash.Hash32, enc *zstd.Encoder, oldExt *dictExtDim, tail []dictSSTEntry, overridden map[uint32]string, keepBits []uint64) (int64, []byte, []uint32, []dictPageDesc, error) {
 	slices.SortFunc(tail, func(a, b dictSSTEntry) int {
 		if a.key < b.key {
 			return -1
@@ -212,7 +208,7 @@ func writeExtDimMergedSST(tf *osFile, secStart, pos int64, secHash hash.Hash32, 
 		}
 		return 0
 	})
-	w := newDictSSTWriter(tf, secStart, pos, secHash, enc)
+	w := newDictSSTWriter(tf, pos, secHash, enc)
 	stream := newDictSSTStream(oldExt)
 	defer stream.close()
 

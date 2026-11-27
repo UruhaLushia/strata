@@ -32,13 +32,13 @@ func (db *DB) Close() error {
 	}
 	var err error
 	if db.writer {
-		err = db.flushLocked(true)
+		err = db.flushLocked()
+		if err == nil {
+			err = syncData(db.data)
+		}
 		if err == nil {
 			db.durableSeq = db.appendSeq
 		}
-	}
-	if err == nil && db.writer {
-		err = syncData(db.data)
 	}
 	db.closed = true
 	if db.view != nil {
@@ -191,7 +191,6 @@ func (db *DB) Refresh() error {
 			db.allocatedSeq = max
 			db.durableSeq = max
 		}
-		db.lastRefreshSize = pos
 		return nil
 	}
 	f := probe
@@ -255,13 +254,11 @@ func (db *DB) Refresh() error {
 	db.appendSeq = next.appendSeq
 	db.allocatedSeq = next.allocatedSeq
 	db.durableSeq = next.durableSeq
-	db.sealedSeq = next.sealedSeq
 	db.order = next.order
 	db.walPos = next.walPos
 	db.pending = next.pending
 	db.pendingDict = next.pendingDict
 	db.pendingBytes = next.pendingBytes
-	db.lastRefreshSize = next.lastRefreshSize
 	db.kvCatalog = next.kvCatalog
 	db.kvRegions = next.kvRegions
 	db.kvOverlay = next.kvOverlay
@@ -275,9 +272,9 @@ func (db *DB) Refresh() error {
 	return nil
 }
 
-func (db *DB) Flush() error { db.mu.Lock(); defer db.mu.Unlock(); return db.flushLocked(false) }
+func (db *DB) Flush() error { db.mu.Lock(); defer db.mu.Unlock(); return db.flushLocked() }
 
-func (db *DB) flushLocked(force bool) error {
+func (db *DB) flushLocked() error {
 	if db.closed {
 		return errDBClosed
 	}
@@ -315,10 +312,6 @@ func (db *DB) flushLocked(force bool) error {
 	db.pending = make(map[bucketKey]*bucket)
 	db.pendingDict = nil
 	db.pendingBytes = 0
-	db.lastRefreshSize = db.walPos
-	if force {
-		return syncData(db.data)
-	}
 	return nil
 }
 

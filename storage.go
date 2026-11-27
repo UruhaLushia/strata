@@ -170,7 +170,6 @@ func (db *DB) loadLocked() error {
 	db.appendSeq = db.head.sealedWalSeq
 	db.allocatedSeq = db.appendSeq
 	db.durableSeq = db.appendSeq
-	db.sealedSeq = db.head.sealedWalSeq
 	db.kvRev = db.head.sealedKVRev
 	pos, maxSeq, err := scanWAL(db.data, int64(db.head.walOffset), db.writer, db.applyFrame)
 	if err != nil {
@@ -182,7 +181,6 @@ func (db *DB) loadLocked() error {
 		db.allocatedSeq = maxSeq
 		db.durableSeq = maxSeq
 	}
-	db.lastRefreshSize = pos
 	return nil
 }
 

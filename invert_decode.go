@@ -23,10 +23,6 @@ func readInvertChunkFromSlot(f *osFile, desc sectionDesc, mapped []byte, chunk i
 	return zstdDecompress(raw)
 }
 
-func readInvertChunkFrom(f *osFile, desc sectionDesc, mapped []byte, chunk invertChunkMeta) ([]byte, error) {
-	return readInvertChunkFromSlot(f, desc, mapped, chunk, nil)
-}
-
 func readInvertChunkFromView(view *fileView, desc sectionDesc, chunk invertChunkMeta, slot *querySlot) ([]byte, error) {
 	if view == nil || view.data == nil {
 		return nil, errors.New("strata: missing file view")

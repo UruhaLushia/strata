@@ -275,14 +275,11 @@ type DB struct {
 	appendSeq             uint64
 	allocatedSeq          uint64
 	durableSeq            uint64
-	fenceSeq              uint64
-	sealedSeq             uint64
 	order                 uint64
 	walPos                int64
 	pending               map[bucketKey]*bucket
 	pendingDict           []dictEntry
 	pendingBytes          int64
-	lastRefreshSize       int64
 	loopMu                sync.Mutex // Protects the loop state and is a leaf lock.
 	loopClosed            bool
 	loopStop              chan struct{}

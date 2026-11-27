@@ -3,9 +3,8 @@ package strata
 import "time"
 
 type plannedSlot struct {
-	block   sealedMeta
-	liveIdx int
-	meta    SegmentMeta
+	block sealedMeta
+	meta  SegmentMeta
 }
 
 type windowSpec struct {
@@ -154,7 +153,7 @@ func resolveTimeWindow(db *DB, seriesID uint16, from, to time.Time, window time.
 	return 0, 0, false, ErrWindowRequired
 }
 
-func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *Series, opts queryOptions, onSlot func(chosen sealedMeta, liveIdx int, meta SegmentMeta) error) error {
+func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *Series, opts queryOptions, onSlot func(chosen sealedMeta, meta SegmentMeta) error) error {
 	cursor := from
 	fineCursor := blockCursor{src: sources.fine}
 	hourCursor := blockCursor{src: sources.hours}
@@ -162,7 +161,6 @@ func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 	for cursor < to {
 		var chosen sealedMeta
 		hasChosen := false
-		liveIdx := -1
 		if !opts.PreferFine {
 			if b, ok := dayCursor.partial(cursor, &fineCursor, &hourCursor, s); ok {
 				chosen, hasChosen = b, true
@@ -173,8 +171,8 @@ func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 			}
 		}
 		if !hasChosen {
-			if b, li, ok := fineCursor.covering(cursor); ok {
-				chosen, liveIdx, hasChosen = b, li, true
+			if b, ok := fineCursor.covering(cursor); ok {
+				chosen, hasChosen = b, true
 			}
 		}
 		if !hasChosen && !opts.PreferFine {
@@ -185,9 +183,9 @@ func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 			}
 		} else if hasChosen && chosen.res == resMinuteHR && !opts.PreferFine && !res.sparse {
 			if b, ok := hourCursor.coveringCoarse(cursor, s); ok && !fineCursor.candidateCoversUntil(cursor, b.end()) {
-				chosen, liveIdx = b, -1
+				chosen = b
 			} else if b, ok := dayCursor.coveringCoarse(cursor, s); ok && !fineCursor.candidateCoversUntil(cursor, b.end()) {
-				chosen, liveIdx = b, -1
+				chosen = b
 			}
 		}
 		if res.sparse && hasChosen && chosen.res != resMinuteHR && sparseFinerGapCursor(chosen.res, cursor, &fineCursor, &hourCursor) {
@@ -260,7 +258,7 @@ func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 				res.EffectiveTo = meta.CoveredTo
 			}
 		}
-		if err := onSlot(chosen, liveIdx, meta); err != nil {
+		if err := onSlot(chosen, meta); err != nil {
 			return err
 		}
 		cursor = segmentTo
@@ -277,8 +275,8 @@ func walkQuerySlots(res *queryResult, from, to int64, sources querySources, s *S
 func planQuerySlots(res *queryResult, from, to int64, sources querySources, s *Series, opts queryOptions) ([]plannedSlot, error) {
 	est := max(len(sources.days.idx)+min(len(sources.hours.idx), 256)+len(sources.fine.live), 16)
 	plans := make([]plannedSlot, 0, est)
-	if err := walkQuerySlots(res, from, to, sources, s, opts, func(chosen sealedMeta, liveIdx int, meta SegmentMeta) error {
-		plans = append(plans, plannedSlot{block: chosen, liveIdx: liveIdx, meta: meta})
+	if err := walkQuerySlots(res, from, to, sources, s, opts, func(chosen sealedMeta, meta SegmentMeta) error {
+		plans = append(plans, plannedSlot{block: chosen, meta: meta})
 		return nil
 	}); err != nil {
 		return nil, err

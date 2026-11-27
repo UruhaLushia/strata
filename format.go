@@ -76,30 +76,23 @@ func (m sealedMeta) toBlock() sealedBlock {
 		order:    m.order,
 		summary:  m.summary(),
 		rowCount: m.rowCount,
-		offset:   m.offset,
-		length:   m.length,
-		rawLen:   m.length,
-		crc:      m.crc,
 	}
 }
 
-// sealedBlock is a transient working structure used only during compaction and single-slot materialization.
+// sealedBlock is used during compaction, query snapshot construction, and slot materialization.
 type sealedBlock struct {
-	series         uint16
-	res            byte
-	start, end     int64
-	epoch          uint64
-	order          uint64
-	summary        Summary
-	rowCount       uint32
-	rows           []idRow
-	offset         uint64
-	length, rawLen uint32
-	crc            uint32
-	encoded        []byte
-	candidate      bool
-	passthrough    bool
-	preserveOrder  bool
+	series        uint16
+	res           byte
+	start, end    int64
+	epoch         uint64
+	order         uint64
+	summary       Summary
+	rowCount      uint32
+	rows          []idRow
+	encoded       []byte
+	candidate     bool
+	passthrough   bool
+	preserveOrder bool
 }
 
 type resetRule struct {

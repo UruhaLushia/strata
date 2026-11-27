@@ -421,7 +421,7 @@ func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dic
 				tail = append(tail, dictSSTEntry{key: v, id: id})
 			}
 		}
-		pos, we.sstFirstArena, we.sstFirstOffs, we.sstBlocks, err = writeExtDimMergedSST(tf, secStart, pos, secHash, enc, d.ext, tail, d.extra, keepBits)
+		pos, we.sstFirstArena, we.sstFirstOffs, we.sstBlocks, err = writeExtDimMergedSST(tf, pos, secHash, enc, d.ext, tail, d.extra, keepBits)
 	} else {
 		ids := make([]uint32, 0, we.baseCount)
 		for id := uint32(1); id < d.nextID; id++ {
@@ -435,7 +435,7 @@ func writeOneExtDim(tf *osFile, secStart, pos int64, secHash hash.Hash32, d *dic
 		sort.Slice(ids, func(i, j int) bool {
 			return d.resolveLocal(ids[i]) < d.resolveLocal(ids[j])
 		})
-		w := newDictSSTWriter(tf, secStart, pos, secHash, enc)
+		w := newDictSSTWriter(tf, pos, secHash, enc)
 		for _, id := range ids {
 			if err = w.add(d.resolveLocal(id), id); err != nil {
 				return pos, we, err

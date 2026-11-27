@@ -71,7 +71,7 @@ func (c *blockCursor) aligned(cursor, to, width int64, s *Series) (sealedMeta, b
 	return sealedMeta{}, false
 }
 
-func (c *blockCursor) covering(cursor int64) (sealedMeta, int, bool) {
+func (c *blockCursor) covering(cursor int64) (sealedMeta, bool) {
 	var sb sealedMeta
 	hasSealed := false
 	list, startIdx, preFiltered := c.candList(cursor)
@@ -87,8 +87,6 @@ func (c *blockCursor) covering(cursor int64) (sealedMeta, int, bool) {
 			break
 		}
 	}
-	liveIdx := -1
-	var lb sealedMeta
 	c.advanceLive(cursor)
 	for i := c.li; i < len(c.src.live); i++ {
 		b := &c.src.live[i]
@@ -96,28 +94,18 @@ func (c *blockCursor) covering(cursor int64) (sealedMeta, int, bool) {
 			break
 		}
 		if b.candidate && b.end > cursor {
-			lb = sealedMeta{
+			lb := sealedMeta{
 				start: b.start, epoch: b.epoch, order: b.order,
 				values: b.summary.Values, rowCount: b.rowCount,
 				series: b.series, res: b.res, mask: b.summary.Mask,
 			}
-			liveIdx = i
+			if !hasSealed || metaBefore(lb, sb) {
+				return lb, true
+			}
 			break
 		}
 	}
-	if hasSealed && liveIdx >= 0 {
-		if metaBefore(lb, sb) {
-			return lb, liveIdx, true
-		}
-		return sb, -1, true
-	}
-	if hasSealed {
-		return sb, -1, true
-	}
-	if liveIdx >= 0 {
-		return lb, liveIdx, true
-	}
-	return sealedMeta{}, -1, false
+	return sb, hasSealed
 }
 
 func (c *blockCursor) coveringCoarse(cursor int64, s *Series) (sealedMeta, bool) {

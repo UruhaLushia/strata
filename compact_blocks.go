@@ -24,8 +24,6 @@ type compactPlan struct {
 	tailMetas       []walFrameMeta
 	tailResetAllSeq map[uint16]uint64
 	walRefs         []walBucketRef
-	nowSec          int64
-	fineTarget      int64
 	hourTarget      int64
 	dayTarget       int64
 	ret1mCutoff     int64
@@ -74,9 +72,6 @@ func computeCompactWatermarks(metas []walFrameMeta, oldHead superblock, fenceSeq
 	fineTarget = fineWatermark(nowSec)
 	var eligEnd int
 	sealedSeq, eligEnd, sealedKVRev = sealableFrameMetas(metas, oldHead.sealedWalSeq, fineTarget)
-	if sealedKVRev < oldHead.sealedKVRev {
-		sealedKVRev = oldHead.sealedKVRev
-	}
 	for {
 		late := fineTarget
 		for _, m := range metas {
@@ -92,10 +87,8 @@ func computeCompactWatermarks(metas []walFrameMeta, oldHead superblock, fenceSeq
 		}
 		fineTarget = (late / 60) * 60
 		sealedSeq, eligEnd, sealedKVRev = sealableFrameMetas(metas, oldHead.sealedWalSeq, fineTarget)
-		if sealedKVRev < oldHead.sealedKVRev {
-			sealedKVRev = oldHead.sealedKVRev
-		}
 	}
+	sealedKVRev = max(sealedKVRev, oldHead.sealedKVRev)
 	hourTarget = min(hourTS(nowSec), hourTS(fineTarget))
 	dayTarget = dayTS(hourTarget) - 86400
 	for _, m := range metas[:eligEnd] {

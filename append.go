@@ -80,13 +80,13 @@ func (s *Series) append(ts time.Time, summary Summary, rows []Row, syncNow bool)
 		return db.syncLocked()
 	}
 	if db.policy.pendingBytes > 0 && db.pendingBytes >= db.policy.pendingBytes {
-		return db.flushLocked(false)
+		return db.flushLocked()
 	}
 	return nil
 }
 
 func (db *DB) syncLocked() error {
-	if err := db.flushLocked(false); err != nil {
+	if err := db.flushLocked(); err != nil {
 		return err
 	}
 	if err := db.syncFile(); err != nil {
@@ -132,7 +132,7 @@ func (s *Series) ResetAll() error {
 
 func (s *Series) resetLocked(from, to int64) error {
 	db := s.db
-	if err := db.flushLocked(false); err != nil {
+	if err := db.flushLocked(); err != nil {
 		return err
 	}
 	old := s.resetEpoch

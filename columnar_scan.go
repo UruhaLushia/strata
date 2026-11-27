@@ -71,7 +71,7 @@ func parseColumnarBlock(raw []byte) (columnarBlockView, error) {
 func decodeStreamColInto(view columnarBlockView, idx int, slot *querySlot) (decodedCol, error) {
 	desc := view.descs[idx]
 	if desc.mode == modeConst || desc.mode == modeZero {
-		return decodedCol{mode: desc.mode, val: desc.value, loaded: true}, nil
+		return decodedCol{mode: desc.mode, val: desc.value}, nil
 	}
 	if desc.width == 0 {
 		return decodedCol{}, errors.New("strata: invalid column stream width")
@@ -88,7 +88,7 @@ func decodeStreamColInto(view columnarBlockView, idx int, slot *querySlot) (deco
 		if end-start != expected {
 			return decodedCol{}, errors.New("strata: invalid column stream length")
 		}
-		return decodedCol{mode: desc.mode, width: desc.width, data: view.plain[start:end], loaded: true}, nil
+		return decodedCol{mode: desc.mode, width: desc.width, data: view.plain[start:end]}, nil
 	}
 	plain, err := slot.decodeZstd(view.plain[start:end])
 	if err != nil {
@@ -97,7 +97,7 @@ func decodeStreamColInto(view columnarBlockView, idx int, slot *querySlot) (deco
 	if len(plain) != expected {
 		return decodedCol{}, errors.New("strata: invalid column stream length")
 	}
-	return decodedCol{mode: desc.mode, width: desc.width, data: plain, loaded: true}, nil
+	return decodedCol{mode: desc.mode, width: desc.width, data: plain}, nil
 }
 
 func filterStreamView(view columnarBlockView, filters []compiledFilter, allowDim0BS bool, slot *querySlot) (rowSelection, error) {

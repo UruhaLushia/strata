@@ -560,7 +560,6 @@ func (db *DB) commitKVLocked(ops []kvOp) error {
 	db.walPos, db.appendSeq, db.allocatedSeq = pos, seq, seq
 	db.applyKVBatch(rev, ops)
 	db.durableSeq = seq
-	db.lastRefreshSize = pos
 	return nil
 }
 

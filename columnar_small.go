@@ -6,11 +6,10 @@ import (
 )
 
 type decodedCol struct {
-	mode   byte
-	width  byte
-	val    uint64
-	data   []byte
-	loaded bool
+	mode  byte
+	width byte
+	val   uint64
+	data  []byte
 }
 
 func (c decodedCol) tagAt(row int) uint32 {
@@ -97,7 +96,7 @@ func parseSmallBlockCols(plain []byte) (int, [streamColumnCount]decodedCol, erro
 		}
 		mode := plain[off]
 		off++
-		cols[dim] = decodedCol{mode: mode, width: tagModeWidth(mode), loaded: true}
+		cols[dim] = decodedCol{mode: mode, width: tagModeWidth(mode)}
 		if mode == modeConst {
 			if off+4 > len(plain) {
 				return 0, cols, errors.New("strata: truncated column block")
@@ -112,7 +111,7 @@ func parseSmallBlockCols(plain []byte) (int, [streamColumnCount]decodedCol, erro
 		}
 		mode := plain[off]
 		off++
-		cols[8+metric] = decodedCol{mode: mode, width: valueModeWidth(mode), loaded: true}
+		cols[8+metric] = decodedCol{mode: mode, width: valueModeWidth(mode)}
 		if mode == modeConst {
 			if off+8 > len(plain) {
 				return 0, cols, errors.New("strata: truncated column block")
@@ -126,7 +125,7 @@ func parseSmallBlockCols(plain []byte) (int, [streamColumnCount]decodedCol, erro
 	}
 	maskMode := plain[off]
 	off++
-	cols[12] = decodedCol{mode: maskMode, width: 1, loaded: true}
+	cols[12] = decodedCol{mode: maskMode, width: 1}
 	if maskMode == modeConst {
 		if off >= len(plain) {
 			return 0, cols, errors.New("strata: truncated column block")

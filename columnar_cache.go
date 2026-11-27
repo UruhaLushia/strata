@@ -136,7 +136,7 @@ func (c *blockColCache) load(idx int) (decodedCol, error) {
 	}
 	d := c.view.descs[idx]
 	if d.mode == modeConst || d.mode == modeZero {
-		col := decodedCol{mode: d.mode, val: d.value, loaded: true}
+		col := decodedCol{mode: d.mode, val: d.value}
 		c.cols[idx], c.cached[idx] = col, true
 		return col, nil
 	}
@@ -155,7 +155,7 @@ func (c *blockColCache) load(idx int) (decodedCol, error) {
 		if end-start != expected {
 			return decodedCol{}, errors.New("strata: invalid column stream length")
 		}
-		col := decodedCol{mode: d.mode, width: d.width, data: c.view.plain[start:end], loaded: true}
+		col := decodedCol{mode: d.mode, width: d.width, data: c.view.plain[start:end]}
 		c.cols[idx], c.cached[idx] = col, true
 		return col, nil
 	}
@@ -170,7 +170,7 @@ func (c *blockColCache) load(idx int) (decodedCol, error) {
 			return decodedCol{}, errors.New("strata: invalid column stream length")
 		}
 		c.arenaUsed += expected
-		col := decodedCol{mode: d.mode, width: d.width, data: plain, loaded: true}
+		col := decodedCol{mode: d.mode, width: d.width, data: plain}
 		c.cols[idx], c.cached[idx], c.cachedOffs[idx] = col, true, off
 		return col, nil
 	}
@@ -235,20 +235,20 @@ func (c *blockColCache) packChunk(colMask uint16, isRange bool, rangeLo int, row
 		}
 		d := c.view.descs[idx]
 		if d.mode == modeConst || d.mode == modeZero {
-			cols[idx] = decodedCol{mode: d.mode, val: d.value, loaded: true}
+			cols[idx] = decodedCol{mode: d.mode, val: d.value}
 			continue
 		}
 		w := int(d.width)
 		if c.cached[idx] {
 			src := c.cols[idx].data
 			if isRange {
-				cols[idx] = decodedCol{mode: d.mode, width: d.width, data: src[rangeLo*w : (rangeLo+n)*w], loaded: true}
+				cols[idx] = decodedCol{mode: d.mode, width: d.width, data: src[rangeLo*w : (rangeLo+n)*w]}
 				continue
 			}
 			dst := dstArena[off : off+n*w]
 			off += n * w
 			gatherColBytes(dst, src, rows, w)
-			cols[idx] = decodedCol{mode: d.mode, width: d.width, data: dst, loaded: true}
+			cols[idx] = decodedCol{mode: d.mode, width: d.width, data: dst}
 			continue
 		}
 		rawCol, err := decodeStreamColInto(c.view, idx, c.slot)
@@ -262,7 +262,7 @@ func (c *blockColCache) packChunk(colMask uint16, isRange bool, rangeLo int, row
 		} else {
 			gatherColBytes(dst, rawCol.data, rows, w)
 		}
-		cols[idx] = decodedCol{mode: d.mode, width: d.width, data: dst, loaded: true}
+		cols[idx] = decodedCol{mode: d.mode, width: d.width, data: dst}
 	}
 	return cols, nil
 }

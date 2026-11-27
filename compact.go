@@ -24,12 +24,12 @@ func (db *DB) Compact() error {
 		db.mu.Unlock()
 		return ErrReadOnly
 	}
-	if err := db.flushLocked(false); err != nil {
+	if err := db.flushLocked(); err != nil {
 		db.mu.Unlock()
 		return err
 	}
 	oldHead, source := db.head, db.data
-	db.fenceSeq = db.appendSeq
+	fenceSeq := db.appendSeq
 	fencePos := db.walPos
 	nowSec := db.opts.Now().Unix()
 	metas, err := scanWALFrameMetas(source, int64(oldHead.walOffset), fencePos)
@@ -37,7 +37,7 @@ func (db *DB) Compact() error {
 		db.mu.Unlock()
 		return err
 	}
-	fineTarget, hourTarget, dayTarget, sealedSeq, sealedKVRev, eligibleFrames := computeCompactWatermarks(metas, oldHead, db.fenceSeq, nowSec)
+	fineTarget, hourTarget, dayTarget, sealedSeq, sealedKVRev, eligibleFrames := computeCompactWatermarks(metas, oldHead, fenceSeq, nowSec)
 	var unsealedResetMinEpoch map[uint16]uint64
 	var tailMetas []walFrameMeta
 	var tailResetAllSeq map[uint16]uint64
@@ -112,8 +112,6 @@ func (db *DB) Compact() error {
 		tailMetas:       tailMetas,
 		tailResetAllSeq: tailResetAllSeq,
 		walRefs:         walRefs,
-		nowSec:          nowSec,
-		fineTarget:      fineTarget,
 		hourTarget:      hourTarget,
 		dayTarget:       dayTarget,
 		ret1mCutoff:     nowSec - int64(db.opts.Retention1m/time.Second),
@@ -166,21 +164,20 @@ func (db *DB) Compact() error {
 	}
 
 	db.mu.Lock()
-	if err = db.flushLocked(false); err != nil {
+	if err = db.flushLocked(); err != nil {
 		db.mu.Unlock()
 		return fail(err)
 	}
 	finalSeq, finalPos := db.appendSeq, db.walPos
 	if len(prunedDims) > 0 && finalPos > fencePos {
-		newWal, err = copyWALRangeWithResurrection(tf, source, fencePos, finalPos, sealedSeq, newWal, plan.dictSnap, liveBits, prunedDims)
+		_, err = copyWALRangeWithResurrection(tf, source, fencePos, finalPos, sealedSeq, newWal, plan.dictSnap, liveBits, prunedDims)
 	} else {
-		newWal, err = copyWALRangeStreaming(tf, source, fencePos, finalPos, sealedSeq, newWal, copyBuf)
+		_, err = copyWALRangeStreaming(tf, source, fencePos, finalPos, sealedSeq, newWal, copyBuf)
 	}
 	if err != nil {
 		db.mu.Unlock()
 		return fail(err)
 	}
-	_ = newWal
 	newHead := oldHead
 	newHead.gen, newHead.sections = gen, descs
 	newHead.walOffset, newHead.sealedWalSeq, newHead.sealedKVRev = uint64(walStart), sealedSeq, sealedKVRev
@@ -219,7 +216,7 @@ func (db *DB) Compact() error {
 		if openErr != nil {
 			_ = newData.Close()
 		} else {
-			db.data, db.head, db.sealedSeq, db.mapped = newData, newHead, sealedSeq, newMapped
+			db.data, db.head, db.mapped = newData, newHead, newMapped
 			db.view = newFileView(newData, newMapped, newHead.sections[secTSBlocks])
 			if previousView != nil {
 				previousView.release()

@@ -8,7 +8,7 @@ func aggregateSummaryQueryPlan(res *queryResult, from, to int64, sources querySo
 		out.Segments = getSegmentSummarySlice(estSegs)
 	}
 	var resultOrder uint64
-	return walkQuerySlots(res, from, to, sources, s, opts, func(chosen sealedMeta, _ int, meta SegmentMeta) error {
+	return walkQuerySlots(res, from, to, sources, s, opts, func(chosen sealedMeta, meta SegmentMeta) error {
 		mergedSum, ok := summaryMetaSlot(chosen, sources, s)
 		if !ok {
 			return errors.New("strata: selected block disappeared")

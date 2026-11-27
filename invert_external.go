@@ -168,7 +168,7 @@ func (b *invertExternalBuilder) spillRun() error {
 func (b *invertExternalBuilder) addPassthroughFromInvert(src *osFile, invertDesc sectionDesc, mapped []byte, chunks []invertChunkMeta, passOldToWrite []int32, passSeriesCount map[uint16]uint32) error {
 	stickyAdded := make(map[uint64]struct{})
 	for _, chunk := range chunks {
-		plain, err := readInvertChunkFrom(src, invertDesc, mapped, chunk)
+		plain, err := readInvertChunkFromSlot(src, invertDesc, mapped, chunk, nil)
 		if err != nil {
 			return err
 		}

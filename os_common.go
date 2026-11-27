@@ -18,8 +18,7 @@ func (f *osFile) Close() error {
 	}
 	return f.f.Close()
 }
-func (f *osFile) Seek(off int64, whence int) (int64, error) { return f.f.Seek(off, whence) }
-func (f *osFile) Fd() uintptr                               { return f.f.Fd() }
+func (f *osFile) Fd() uintptr { return f.f.Fd() }
 
 var _ io.ReaderAt = (*osFile)(nil)
 

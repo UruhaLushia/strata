@@ -17,7 +17,6 @@ type compactBlockWriter struct {
 	pos             int64
 	blockStart      int64
 	blockHash       hash.Hash32
-	blockRawLen     uint32
 	passBuf         []byte
 	metas           []sealedMeta
 	passOldToWrite  []int32
@@ -71,13 +70,10 @@ func (w *compactBlockWriter) close() {
 
 func (w *compactBlockWriter) writePassthrough(oldIdx int, meta sealedMeta) error {
 	writeID := uint32(len(w.metas))
-	rawLen, blockCRC, err := copyPassthroughBlock(w.tf, w.source, w.sourceBlocks, meta.toBlock(), w.pos, w.blockHash, w.passBuf)
-	if err != nil {
+	if err := copyPassthroughBlock(w.tf, w.source, w.sourceBlocks, meta, w.pos, w.blockHash, w.passBuf); err != nil {
 		return err
 	}
 	meta.offset = uint64(w.pos)
-	meta.crc = blockCRC
-	w.blockRawLen += rawLen
 	w.pos += int64(meta.length)
 	w.metas = append(w.metas, meta)
 	w.passOldToWrite[oldIdx] = int32(writeID)
@@ -92,7 +88,6 @@ func (w *compactBlockWriter) commitFresh(b sealedBlock, raw []byte) error {
 		return err
 	}
 	_, _ = w.blockHash.Write(raw)
-	w.blockRawLen += uint32(len(raw))
 	rowCount := b.rowCount
 	if rowCount == 0 {
 		rowCount = uint32(len(b.rows))
@@ -259,7 +254,7 @@ func writeCompactFile(tf *osFile, plan *compactPlan) (int64, [12]sectionDesc, di
 		if _, err = tf.WriteAt(idxData, pos); err != nil {
 			return 0, ds, nil, nil, err
 		}
-		ds[3] = sectionDesc{kind: 3, codec: 1, count: uint32(len(bw.metas)), offset: uint64(bw.blockStart), length: uint64(blockLen), rawLen: bw.blockRawLen, crc: bw.blockHash.Sum32()}
+		ds[3] = sectionDesc{kind: 3, codec: 1, count: uint32(len(bw.metas)), offset: uint64(bw.blockStart), length: uint64(blockLen), rawLen: uint32(blockLen), crc: bw.blockHash.Sum32()}
 		ds[4] = sectionDesc{kind: 4, codec: 1, count: uint32(len(bw.metas)), offset: uint64(pos), length: uint64(len(idxData)), rawLen: idxRawLen, crc: crc(idxData)}
 		pos += int64(len(idxData))
 	}

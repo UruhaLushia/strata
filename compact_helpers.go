@@ -37,6 +37,5 @@ func loadSealedBlockFromView(view *fileView, sec sectionDesc, meta sealedMeta) (
 	if err != nil {
 		return sealedBlock{}, err
 	}
-	decoded.offset, decoded.length, decoded.rawLen, decoded.crc = meta.offset, meta.length, meta.length, meta.crc
 	return decoded, nil
 }
