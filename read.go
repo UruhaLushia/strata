@@ -359,7 +359,7 @@ func readPageFromBlock(block sealedBlock, meta SegmentMeta, d dictionary, series
 		}
 		take := min(need, total-skip)
 		isRange, rangeLo, rows := sel.sliceRows(skip, take, *rowIdxBuf)
-		if !isRange && cap(rows) > cap(*rowIdxBuf) {
+		if sel.mode == selBits && cap(rows) > cap(*rowIdxBuf) {
 			*rowIdxBuf = rows[:0]
 		}
 		if isStream {

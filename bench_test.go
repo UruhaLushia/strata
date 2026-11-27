@@ -504,6 +504,62 @@ func BenchmarkGateway90DayExtremeHighCard(b *testing.B) {
 	}
 }
 
+func BenchmarkGateway90ScanFullCols(b *testing.B) {
+	requireGatewayStress(b)
+	for _, fixture := range []struct {
+		name    string
+		extreme bool
+	}{{"Realistic", false}, {"Extreme", true}} {
+		b.Run(fixture.name, func(b *testing.B) {
+			fx := buildGateway90DayFixtureMode(b, fixture.extreme)
+			db, s := openGateway90Fixture(b, fx, false)
+			defer db.Close()
+			for _, tc := range []struct {
+				name    string
+				filters []Filter
+			}{{"TimeFirstIDs", nil}, {"DenseMeta", tagFilter(6, TagEq, "tcp")}} {
+				b.Run(tc.name, func(b *testing.B) {
+					ctx := b.Context()
+					q := ScanQuery{From: fx.now.Add(-90 * 24 * time.Hour), To: fx.now, Filters: tc.filters}
+					var wantRows int
+					if err := s.Scan(ctx, q, func(batch ScanBatch) error {
+						wantRows += batch.Len()
+						return nil
+					}); err != nil {
+						b.Fatal(err)
+					}
+					var rows int
+					var checksum uint64
+					yield := func(batch ScanBatch) error {
+						rows += batch.Len()
+						for i := range batch.Len() {
+							for dim := range 7 {
+								checksum = checksum*31 + uint64(batch.TagID(i, dim))
+							}
+							for _, v := range batch.Values(i) {
+								checksum = checksum*31 + uint64(v)
+							}
+							checksum = checksum*31 + uint64(batch.Mask(i))
+						}
+						return nil
+					}
+					b.ReportAllocs()
+					for b.Loop() {
+						rows, checksum = 0, 0
+						if err := s.Scan(ctx, q, yield); err != nil {
+							b.Fatal(err)
+						}
+					}
+					if rows == 0 || rows != wantRows || checksum == 0 {
+						b.Fatalf("full-column scan rows=%d, want=%d, checksum=%x", rows, wantRows, checksum)
+					}
+					b.ReportMetric(float64(rows), "rows/op")
+				})
+			}
+		})
+	}
+}
+
 func BenchmarkGateway90AggregateDomain(b *testing.B) {
 	requireGatewayStress(b)
 	ctx := context.Background()

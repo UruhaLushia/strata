@@ -135,71 +135,195 @@ func binarySearchTagCol(col decodedCol, count int, target uint32) (int, int) {
 	return lo, endLo
 }
 
+func (s *rowSelection) collectWordIdx(w uint64, wi, count, span, bitLimit int) {
+	ones := bits.OnesCount64(w)
+	if s.cnt+ones > bitLimit {
+		s.bitsPool = getRowBits((count + 63) >> 6)
+		s.bits = *s.bitsPool
+		for _, r := range s.idx {
+			s.bits[r>>6] |= uint64(1) << (r & 63)
+		}
+		*s.idxPool = s.idx
+		putMatchIdx(s.idxPool)
+		s.idxPool, s.idx, s.mode = nil, nil, selBits
+		s.bits[wi] = w
+	} else {
+		if s.idxPool == nil {
+			s.mode = selIdx
+			s.idxPool = getMatchIdx(min(span, 1024))
+			s.idx = *s.idxPool
+		}
+		for ; w != 0; w &= w - 1 {
+			s.idx = append(s.idx, int32(wi<<6|bits.TrailingZeros64(w)))
+		}
+	}
+	s.cnt += ones
+}
+
+func scanSmallRangeIdx(col decodedCol, lo, hi int, f compiledFilter, singleEq bool) rowSelection {
+	span := hi - lo
+	var pool *[]int32
+	var idx []int32
+	if singleEq {
+		target := f.single
+		switch col.mode {
+		case modeU8:
+			data := col.data[lo:hi]
+			for i, v := range data {
+				if uint32(v) != target {
+					continue
+				}
+				if pool == nil {
+					pool = getMatchIdx(span)
+					idx = *pool
+				}
+				idx = append(idx, int32(lo+i))
+			}
+		case modeU16:
+			data := col.data[2*lo : 2*hi]
+			for r := lo; len(data) >= 2; r, data = r+1, data[2:] {
+				if uint32(binary.LittleEndian.Uint16(data)) != target {
+					continue
+				}
+				if pool == nil {
+					pool = getMatchIdx(span)
+					idx = *pool
+				}
+				idx = append(idx, int32(r))
+			}
+		case modeU32:
+			data := col.data[4*lo : 4*hi]
+			for r := lo; len(data) >= 4; r, data = r+1, data[4:] {
+				if binary.LittleEndian.Uint32(data) != target {
+					continue
+				}
+				if pool == nil {
+					pool = getMatchIdx(span)
+					idx = *pool
+				}
+				idx = append(idx, int32(r))
+			}
+		}
+	} else {
+		for r := lo; r < hi; r++ {
+			if !matchesFilterID(col.tagAt(r), f) {
+				continue
+			}
+			if pool == nil {
+				pool = getMatchIdx(span)
+				idx = *pool
+			}
+			idx = append(idx, int32(r))
+		}
+	}
+	if pool == nil {
+		return rowSelection{}
+	}
+	*pool = idx
+	if len(idx) == span {
+		putMatchIdx(pool)
+		return rowSelection{mode: selRange, lo: lo, hi: hi, cnt: span}
+	}
+	return rowSelection{mode: selIdx, cnt: len(idx), idx: idx, idxPool: pool}
+}
+
 func scanRangeAdaptive(col decodedCol, count, lo, hi int, f compiledFilter) rowSelection {
 	span := hi - lo
 	if span <= 0 {
 		return rowSelection{}
 	}
-	bitLimit := span / 4
-	if span <= 256 {
-		bitLimit = span
-	}
-	var sel rowSelection
-	add := func(r int) {
-		sel.cnt++
-		if sel.mode == selBits {
-			sel.bits[r>>6] |= uint64(1) << (r & 63)
-			return
-		}
-		if sel.idxPool == nil {
-			sel.mode = selIdx
-			sel.idxPool = getMatchIdx(min(span, 1024))
-			sel.idx = *sel.idxPool
-		}
-		sel.idx = append(sel.idx, int32(r))
-		if len(sel.idx) > bitLimit {
-			sel.bitsPool = getRowBits((count + 63) >> 6)
-			sel.bits = *sel.bitsPool
-			for _, prev := range sel.idx {
-				sel.bits[prev>>6] |= uint64(1) << (prev & 63)
-			}
-			*sel.idxPool = sel.idx
-			putMatchIdx(sel.idxPool)
-			sel.idxPool, sel.idx, sel.mode = nil, nil, selBits
-		}
-	}
-	if !f.negate && len(f.ids) == 1 {
-		target := f.single
-		switch col.mode {
-		case modeU8:
-			for i, v := range col.data[lo:hi] {
-				if uint32(v) == target {
-					add(lo + i)
-				}
-			}
-		case modeU16:
-			data := col.data[2*lo : 2*hi]
-			for i := range span {
-				if uint32(binary.LittleEndian.Uint16(data[2*i:])) == target {
-					add(lo + i)
-				}
-			}
-		case modeU32:
-			data := col.data[4*lo : 4*hi]
-			for i := range span {
-				if binary.LittleEndian.Uint32(data[4*i:]) == target {
-					add(lo + i)
-				}
-			}
-		case modeConst:
+	singleEq := !f.negate && len(f.ids) == 1
+	target := f.single
+	if singleEq {
+		if col.mode == modeConst {
 			if uint32(col.val) == target {
 				return rowSelection{mode: selRange, lo: lo, hi: hi, cnt: span}
 			}
+			return rowSelection{}
+		}
+		if col.mode == modeU8 && target > 0xff || col.mode == modeU16 && target > 0xffff {
+			return rowSelection{}
+		}
+	}
+	if span <= 256 {
+		return scanSmallRangeIdx(col, lo, hi, f, singleEq)
+	}
+	bitLimit := span / 4
+	var sel rowSelection
+	if singleEq {
+		data := col.data
+		switch col.mode {
+		case modeU8:
+			for wi, r := lo>>6, lo; r < hi; wi++ {
+				var w uint64
+				end := min(hi, (wi+1)<<6)
+				for _, v := range data[r:end] {
+					if uint32(v) == target {
+						w |= uint64(1) << (r & 63)
+					}
+					r++
+				}
+				if w != 0 {
+					if sel.mode == selBits {
+						sel.bits[wi] = w
+						sel.cnt += bits.OnesCount64(w)
+					} else {
+						sel.collectWordIdx(w, wi, count, span, bitLimit)
+					}
+				}
+			}
+		case modeU16:
+			for wi, r := lo>>6, lo; r < hi; wi++ {
+				var w uint64
+				end := min(hi, (wi+1)<<6)
+				for word := data[2*r : 2*end]; len(word) >= 2; r, word = r+1, word[2:] {
+					if uint32(binary.LittleEndian.Uint16(word)) == target {
+						w |= uint64(1) << (r & 63)
+					}
+				}
+				if w != 0 {
+					if sel.mode == selBits {
+						sel.bits[wi] = w
+						sel.cnt += bits.OnesCount64(w)
+					} else {
+						sel.collectWordIdx(w, wi, count, span, bitLimit)
+					}
+				}
+			}
+		case modeU32:
+			for wi, r := lo>>6, lo; r < hi; wi++ {
+				var w uint64
+				end := min(hi, (wi+1)<<6)
+				for word := data[4*r : 4*end]; len(word) >= 4; r, word = r+1, word[4:] {
+					if binary.LittleEndian.Uint32(word) == target {
+						w |= uint64(1) << (r & 63)
+					}
+				}
+				if w != 0 {
+					if sel.mode == selBits {
+						sel.bits[wi] = w
+						sel.cnt += bits.OnesCount64(w)
+					} else {
+						sel.collectWordIdx(w, wi, count, span, bitLimit)
+					}
+				}
+			}
 		}
 	} else {
-		for r := lo; r < hi; r++ {
-			if matchesFilterID(col.tagAt(r), f) {
-				add(r)
+		for wi, r := lo>>6, lo; r < hi; wi++ {
+			var w uint64
+			for end := min(hi, (wi+1)<<6); r < end; r++ {
+				if matchesFilterID(col.tagAt(r), f) {
+					w |= uint64(1) << (r & 63)
+				}
+			}
+			if w != 0 {
+				if sel.mode == selBits {
+					sel.bits[wi] = w
+					sel.cnt += bits.OnesCount64(w)
+				} else {
+					sel.collectWordIdx(w, wi, count, span, bitLimit)
+				}
 			}
 		}
 	}

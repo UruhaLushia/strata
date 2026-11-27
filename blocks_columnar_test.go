@@ -116,8 +116,7 @@ func TestColumnarFilterPushdownAndAdaptiveSelection(t *testing.T) {
 	}
 }
 
-func TestColumnarSingleEqRangeSelection(t *testing.T) {
-	const lo, hi = 11, 311
+func TestColumnarRangeSelectionByWord(t *testing.T) {
 	for _, colType := range []struct {
 		mode   byte
 		width  int
@@ -125,39 +124,121 @@ func TestColumnarSingleEqRangeSelection(t *testing.T) {
 	}{
 		{modeU8, 1, 0x81}, {modeU16, 2, 0x8123}, {modeU32, 4, 0x81234567},
 	} {
+		id := colType.target
+		filters := []compiledFilter{
+			{ids: []uint32{id}, single: id},
+			{ids: []uint32{0}, negate: true},
+			{ids: []uint32{id - 1, id}, small: [8]uint32{id - 1, id}, smallLen: 2},
+		}
 		for _, tc := range []struct {
-			stride int
-			hi     int
-			mode   selMode
-		}{{0, hi, selRange}, {10, hi, selIdx}, {2, hi, selBits}, {2, lo + 256, selIdx}, {1, hi, selRange}} {
-			data := make([]byte, (hi+1)*colType.width)
-			var want []int32
-			for i := lo; i < tc.hi && tc.stride != 0; i += tc.stride {
-				for j := range colType.width {
-					data[i*colType.width+j] = byte(colType.target >> (8 * j))
+			lo, span, hits int
+			mode           selMode
+		}{
+			{63, 256, 128, selIdx},
+			{65, 257, 64, selIdx},
+			{63, 257, 65, selBits},
+			{65, 257, 0, selRange},
+			{63, 257, 257, selRange},
+		} {
+			hi := tc.lo + tc.span
+			ids := make([]uint32, hi+1)
+			ids[tc.lo-1], ids[hi] = id, id
+			for i := range tc.span {
+				if (i+1)*tc.hits/tc.span != i*tc.hits/tc.span {
+					ids[tc.lo+i] = id
 				}
-				want = append(want, int32(i))
+			}
+			data := make([]byte, len(ids)*colType.width)
+			for i, v := range ids {
+				for j := range colType.width {
+					data[i*colType.width+j] = byte(v >> (8 * j))
+				}
 			}
 			col := decodedCol{mode: colType.mode, data: data}
-			f := compiledFilter{ids: []uint32{colType.target}, single: colType.target}
-			sel := scanRangeAdaptive(col, hi+1, lo, tc.hi, f)
-			if sel.mode != tc.mode || sel.count() != len(want) {
-				t.Fatalf("width %d, stride %d: mode=%d count=%d", colType.width, tc.stride, sel.mode, sel.count())
+			for _, f := range filters {
+				var want []int32
+				for r := tc.lo; r < hi; r++ {
+					if slices.Contains(f.ids, ids[r]) != f.negate {
+						want = append(want, int32(r))
+					}
+				}
+				sel := scanRangeAdaptive(col, len(ids), tc.lo, hi, f)
+				isRange, start, got := sel.sliceRows(0, sel.count(), nil)
+				if sel.mode != tc.mode || sel.count() != len(want) ||
+					isRange && len(want) > 0 && start != tc.lo || !isRange && !slices.Equal(got, want) {
+					t.Fatalf("width %d [%d,%d) %v negate=%t: mode=%d count=%d rows at %d or %v",
+						colType.width, tc.lo, hi, f.ids, f.negate, sel.mode, sel.count(), start, got)
+				}
+				sel.release()
 			}
-			isRange, start, got := sel.sliceRows(0, sel.count(), nil)
-			if isRange && len(want) > 0 && start != lo || !isRange && !slices.Equal(got, want) {
-				t.Fatalf("width %d, stride %d: rows at %d or %v, want %v", colType.width, tc.stride, start, got, want)
-			}
-			sel.release()
-			if colType.width < 4 && tc.stride == 1 {
-				f.single += 1 << (8 * colType.width)
-				f.ids[0] = f.single
-				miss := scanRangeAdaptive(col, hi+1, lo, hi, f)
+			if colType.width < 4 && tc.hits == tc.span {
+				wide := id + 1<<(8*colType.width)
+				miss := scanRangeAdaptive(col, len(ids), tc.lo, hi, compiledFilter{ids: []uint32{wide}, single: wide})
 				if miss.count() != 0 || miss.idxPool != nil || miss.bitsPool != nil {
 					t.Fatalf("width %d accepted an oversized target", colType.width)
 				}
 			}
 		}
+	}
+}
+
+func TestColumnarCacheRawAccountingAndArenaGrowth(t *testing.T) {
+	const rows, mask = 256, 3
+	factory := zstd.New(zstd.Fastest)
+	enc, err := factory.NewEncoder(64 << 10)
+	mustTestOK(t, err)
+	defer enc.Close()
+	raw, values := make([]byte, rows), make([]byte, rows)
+	for i := range raw {
+		raw[i], values[i] = byte(i), byte(i%7+1)
+	}
+	packed, err := enc.Encode(nil, values)
+	mustTestOK(t, err)
+	view := columnarBlockView{count: rows, codecID: codec.IDZstd, plain: append(raw, packed...)}
+	view.descs[0] = columnStreamDesc{mode: modeU8, width: 1, flags: streamFlagRaw, length: rows, rawLen: rows}
+	view.descs[1] = columnStreamDesc{mode: modeU8, width: 1, offset: rows, length: uint32(len(packed)), rawLen: rows}
+	slot := &querySlot{codecs: testCodecTable(t, factory)}
+	defer slot.close()
+	cache := newBlockColCache(view, mask, 2, 240<<10, slot)
+	if streamRowBytes(view, mask) != 1 || cache.uncachedRowBytes(mask) != 1 || cache.packRowBytes(mask, false) != 2 {
+		t.Fatal("raw stream must be charged for gathering only")
+	}
+	mustTestOK(t, cache.loadAll(mask))
+	if cache.arenaUsed != rows || cache.cachedOffs[0] != -1 || cache.cachedOffs[1] != 0 {
+		t.Fatalf("cached offsets = %v, arenaUsed = %d", cache.cachedOffs, cache.arenaUsed)
+	}
+	var grown []byte
+	for _, size := range []int{192 << 10, 208 << 10, 240 << 10} {
+		cache.growArena(size)
+		capacity := 240 << 10
+		if size == 192<<10 {
+			capacity = size
+		}
+		if len(cache.arena) != size || cap(cache.arena) != capacity || cache.arenaCap != rows || cache.availPackBytes() != size-rows {
+			t.Fatalf("size %d: len=%d cap=%d arenaCap=%d pack=%d", size, len(cache.arena), cap(cache.arena), cache.arenaCap, cache.availPackBytes())
+		}
+		if size == 208<<10 {
+			grown = cache.arena
+		}
+		if size == 240<<10 && &cache.arena[0] != &grown[0] {
+			t.Fatal("capacity reserve was not reused")
+		}
+		if !slices.Equal(cache.cols[0].data, raw) || &cache.cols[0].data[0] != &view.plain[0] ||
+			!slices.Equal(cache.cols[1].data, values) || &cache.cols[1].data[0] != &cache.arena[0] {
+			t.Fatal("arena growth changed cached column data or ownership")
+		}
+	}
+	cols, err := cache.packChunk(mask, false, 0, []int32{13, 2}, 2)
+	mustTestOK(t, err)
+	if !slices.Equal(cols[0].data, []byte{raw[13], raw[2]}) || !slices.Equal(cols[1].data, []byte{values[13], values[2]}) {
+		t.Fatal("gathered columns lost row order")
+	}
+	if cap(slot.colArena) != 240<<10 {
+		t.Fatalf("slot arena capacity = %d", cap(slot.colArena))
+	}
+	slot.resetAfterQuery()
+	if slot.colArena != nil {
+		t.Fatal("large arena remained in the idle slot")
 	}
 }
 

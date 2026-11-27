@@ -153,7 +153,7 @@ func streamRowBytes(view columnarBlockView, colMask uint16) int {
 			continue
 		}
 		d := view.descs[idx]
-		if d.mode != modeConst && d.mode != modeZero {
+		if d.mode != modeConst && d.mode != modeZero && d.flags&streamFlagRaw == 0 {
 			total += int(d.width)
 		}
 	}

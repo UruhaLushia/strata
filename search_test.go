@@ -9,9 +9,208 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
+	"unsafe"
+
+	"github.com/UruhaLushia/strata/codec/s2"
 )
+
+func TestScanBatchZeroValue(t *testing.T) {
+	var empty ScanBatch
+	if unsafe.Sizeof(empty) != unsafe.Sizeof(uintptr(0)) || empty.Len() != 0 || empty.TagID(0, 0) != 0 || empty.Tag(0, 0) != "" ||
+		empty.Values(0) != [4]int64{} || empty.Mask(0) != 0 || empty.Meta() != (SegmentMeta{}) || empty.BlockSummary() != (Summary{}) {
+		t.Fatal("zero ScanBatch must be one pointer and report an empty view")
+	}
+	if row := empty.CloneRow(0); row.Tags != nil || row.Values != [4]int64{} || row.Mask != 0 {
+		t.Fatalf("zero ScanBatch cloned %+v", row)
+	}
+}
+
+func TestScanRowSelectionCursor(t *testing.T) {
+	borrowed := []int32{1, 4, 5}
+	scratch := []int32{-1}
+	initial := &scratch[0]
+	idx := rowSelCursor{sel: rowSelection{mode: selIdx, idx: borrowed}}
+	if isRange, _, rows := idx.next(2, &scratch); isRange || !slices.Equal(rows, borrowed[:2]) || &rows[0] != &borrowed[0] {
+		t.Fatalf("borrowed rows = %v", rows)
+	}
+	if isRange, lo, rows := idx.next(1, &scratch); !isRange || lo != 5 || rows != nil || &scratch[0] != initial || scratch[0] != -1 {
+		t.Fatal("indexed batches changed private scratch")
+	}
+	rangeCursor := rowSelCursor{sel: rowSelection{mode: selRange, lo: 11, hi: 18}}
+	for _, tc := range []struct{ n, lo int }{{0, 0}, {4, 11}, {3, 15}} {
+		if isRange, lo, rows := rangeCursor.next(tc.n, &scratch); !isRange || lo != tc.lo || rows != nil || &scratch[0] != initial {
+			t.Fatalf("range next(%d) = %v, %d, %v", tc.n, isRange, lo, rows)
+		}
+	}
+	var bitmap [7]uint64
+	var want []int32
+	for i := range len(bitmap) * 64 {
+		if (i >= 3 && i < 143) || (i >= 260 && i%3 != 0) {
+			bitmap[i>>6] |= 1 << (i & 63)
+			want = append(want, int32(i))
+		}
+	}
+	before := bitmap
+	for _, batchSize := range []int{1, 63, 64, 65} {
+		cur := rowSelCursor{sel: rowSelection{mode: selBits, bits: bitmap[:], cnt: len(want)}}
+		for start := 0; start < len(want); start += batchSize {
+			expected := want[start:min(start+batchSize, len(want))]
+			isRange, lo, rows := cur.next(len(expected), &scratch)
+			continuous := expected[len(expected)-1]-expected[0] == int32(len(expected)-1)
+			if isRange != continuous || isRange && (lo != int(expected[0]) || rows != nil) ||
+				!isRange && (!slices.Equal(rows, expected) || &rows[0] != &scratch[0]) {
+				t.Fatalf("bitmap batch %d at %d = %v, %d, %v", batchSize, start, isRange, lo, rows)
+			}
+		}
+	}
+	if bitmap != before || !slices.Equal(borrowed, []int32{1, 4, 5}) {
+		t.Fatal("bitmap cursor modified borrowed storage")
+	}
+}
+
+func TestScanFilteredColumnarMaterializesEveryProjection(t *testing.T) {
+	c := s2.New(s2.Default)
+	enc, err := c.NewEncoder(128 << 10)
+	requireOK(t, err)
+	defer enc.Close()
+	slot := querySlot{codecs: testCodecTable(t, c)}
+	defer slot.close()
+	rng := rand.New(rand.NewSource(11))
+	rows := make([]idRow, 6000)
+	for i := range rows {
+		id := uint32(1)
+		if i%97 < 4 {
+			id = 0
+		} else if i%97 == 6 {
+			id = 2
+		}
+		rows[i] = idRow{tags: [8]uint32{id, uint32(i%131 + 1)}, initMask: uint8(i%15 + 1),
+			values: [4]int64{int64(rng.Uint64()), int64(i%16) << 53, -int64(i%21) << 54, int64(i%41) << 52}}
+	}
+	block := sealedBlock{res: resMinuteHR, start: 60, end: 120, preserveOrder: true, codecID: c.ID(), rows: rows}
+	block.encoded, err = encodeBlockWithEncoder(block, enc)
+	requireOK(t, err)
+	view, err := parseColumnarBlock(block.encoded, block.codecID)
+	requireOK(t, err)
+	if view.descs[8].flags&streamFlagRaw == 0 || view.descs[9].flags&streamFlagRaw != 0 || view.descs[9].rawLen == 0 ||
+		view.count*streamRowBytes(view, 2|(0x1f<<8)) <= 128<<10 {
+		t.Fatal("fixture does not have mixed streams that exceed the minimum arena")
+	}
+	small := block
+	small.rows = rows[:96]
+	small.encoded, err = encodeBlockWithEncoder(small, enc)
+	requireOK(t, err)
+	if isStreamBlock(small.encoded) {
+		t.Fatal("fixture did not produce a small block")
+	}
+	for _, tc := range []struct {
+		name          string
+		block         sealedBlock
+		id            uint32
+		batchSize     int
+		queryBytes    int64
+		dims, metrics uint8
+		contradict    bool
+	}{
+		{"small zero ID", small, 0, 4, 0, 3, 0x0f, false},
+		{"single batch", block, 0, 256, 0, 3, 0x0f, false},
+		{"full block", block, 1, 63, 2 << 20, 3, 0x0f, false},
+		{"packed chunks", block, 1, 65, 0, 3, 0x0f, false},
+		{"excluded columns", small, 1, 31, 0, 2, 0x05, false},
+		{"contradicted", block, 1, 63, 0, 3, 0x0f, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			filters := []compiledFilter{{ids: []uint32{tc.id}, single: tc.id}, {ids: []uint32{2}, single: 2, negate: !tc.contradict}}
+			var expected []idRow
+			for _, row := range tc.block.rows {
+				if !tc.contradict && row.tags[0] == tc.id {
+					expected = append(expected, row)
+				}
+			}
+			var scratch []int32
+			exec := queryExec{policy: memPolicy{queryBytes: tc.queryBytes}}
+			err := scanSlotBlock(t.Context(), tc.block, SegmentMeta{}, &exec, 0, 2, tc.dims, tc.metrics, tc.batchSize, false, filters, &slot, &scratch, func(b ScanBatch) error {
+				if b.Len() > tc.batchSize || b.Len() > len(expected) {
+					t.Fatalf("unexpected batch length %d", b.Len())
+				}
+				for i, row := range expected[:b.Len()] {
+					for dim := range 2 {
+						if tc.dims&(1<<dim) == 0 {
+							row.tags[dim] = 0
+						}
+					}
+					for m := range 4 {
+						if tc.metrics&(1<<m) == 0 {
+							row.values[m] = 0
+						}
+					}
+					if b.TagID(i, 0) != row.tags[0] || b.TagID(i, 1) != row.tags[1] || b.Values(i) != row.values || b.Mask(i) != row.initMask {
+						t.Fatalf("batch row %d differs from source row %+v", i, row)
+					}
+				}
+				expected = expected[b.Len():]
+				return nil
+			})
+			requireOK(t, err)
+			if len(expected) != 0 {
+				t.Fatalf("missing %d rows", len(expected))
+			}
+		})
+	}
+}
+
+func TestConcurrentScanAndReadAcrossSelections(t *testing.T) {
+	s, want, sparse := scanSelectionFixture(t)
+	filters := tagFilter(0, TagEq, "keep")
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for worker := range 4 {
+		wg.Go(func() {
+			<-start
+			for range 4 {
+				if worker%2 == 0 {
+					pos := 0
+					err := s.Scan(t.Context(), ScanQuery{AllTime: true, Filters: filters, BatchSize: 63}, func(b ScanBatch) error {
+						for i := range b.Len() {
+							if pos >= len(want) || b.Tag(i, 0) != want[pos].Tags[0] || b.Tag(i, 1) != want[pos].Tags[1] ||
+								b.Values(i) != want[pos].Values || b.Mask(i) != want[pos].Mask {
+								return fmt.Errorf("Scan row %d differs from source", pos)
+							}
+							pos++
+						}
+						return nil
+					})
+					if err != nil || pos != len(want) {
+						t.Errorf("Scan returned %d rows: %v", pos, err)
+						return
+					}
+				} else {
+					page, err := s.Read(t.Context(), ReadRequest{AllTime: true, Filters: filters, Offset: sparse - 2, Limit: 65})
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					if len(page.Rows) != 65 || !page.HasMore {
+						t.Errorf("Read returned %d rows, more=%v", len(page.Rows), page.HasMore)
+					}
+					for i, got := range page.Rows {
+						row := want[sparse-2+i]
+						if !slices.Equal(got.Tags, row.Tags) || got.Values != row.Values || got.Mask != row.Mask {
+							t.Errorf("Read row %d differs from source", i)
+							break
+						}
+					}
+					page.Release()
+				}
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+}
 
 func TestTagEqLiveSnapshotWithoutMap(t *testing.T) {
 	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)

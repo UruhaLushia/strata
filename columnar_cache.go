@@ -76,11 +76,16 @@ func (c *blockColCache) growArena(newSize int) {
 		return
 	}
 	used := c.arenaUsed
-	next := make([]byte, newSize)
+	capHint := newSize
+	if newSize > maxRetainedArenaCap {
+		oldCap := cap(c.arena)
+		capHint = max(newSize, min(c.arenaBudget, oldCap+oldCap/4))
+	}
+	next := make([]byte, newSize, capHint)
 	if used > 0 {
 		copy(next, c.arena[:used])
 	}
-	if newSize <= maxActiveArenaCap {
+	if cap(next) <= maxActiveArenaCap {
 		c.slot.colArena = next
 	}
 	c.arena = next
@@ -99,7 +104,7 @@ func (c *blockColCache) uncachedRowBytes(colMask uint16) int {
 			continue
 		}
 		d := c.view.descs[idx]
-		if d.mode != modeConst && d.mode != modeZero {
+		if d.mode != modeConst && d.mode != modeZero && d.flags&streamFlagRaw == 0 {
 			total += int(d.width)
 		}
 	}

@@ -10,6 +10,83 @@ import (
 	"time"
 )
 
+func scanSelectionFixture(t *testing.T) (*Series, []Row, int) {
+	t.Helper()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	db, s := testDB(t, &now, Options{})
+	t.Cleanup(func() { _ = db.Close() })
+	var selected []Row
+	sparse := 0
+	for block := range 2 {
+		rows := make([]Row, 320)
+		for i := range rows {
+			keep := block == 0 && i%47 == 5 || block == 1 && i%5 != 0
+			tag := "drop"
+			if keep {
+				tag = "keep"
+			}
+			mask := uint8(1 + i%15)
+			vals := testValues(int64(block*1000 + i))
+			rows[i] = Row{Tags: []string{tag, fmt.Sprintf("%d/%d", block, i)}, Values: vals, Mask: mask}
+			if keep {
+				want := rows[i]
+				for m := range 4 {
+					if mask&(1<<m) == 0 {
+						want.Values[m] = 0
+					}
+				}
+				selected = append(selected, want)
+				if block == 0 {
+					sparse++
+				}
+			}
+		}
+		requireOK(t, s.Append(now.Add(time.Duration(block-60)*time.Minute), Summary{}, rows...))
+	}
+	requireOK(t, db.Compact())
+	return s, selected, sparse
+}
+
+func TestReadPaginationAcrossSparseAndDenseSelections(t *testing.T) {
+	s, want, sparse := scanSelectionFixture(t)
+	q := ReadRequest{AllTime: true, Filters: tagFilter(0, TagEq, "keep"), Offset: sparse - 2, Limit: 64, RequireExact: true}
+	for pos := q.Offset; pos < len(want); {
+		page, err := s.Read(t.Context(), q)
+		requireOK(t, err)
+		n := min(q.Limit, len(want)-pos)
+		more := pos+n < len(want)
+		if len(page.Rows) != n || !page.Exact || page.HasMore != more || page.NextCursor.IsZero() == more {
+			page.Release()
+			t.Fatalf("wrong page length, exactness or continuation at offset %d", pos)
+		}
+		for i, got := range page.Rows {
+			row := want[pos+i]
+			if !slices.Equal(got.Tags, row.Tags) || got.Values != row.Values || got.Mask != row.Mask {
+				t.Fatalf("row %d = %+v, want %+v", pos+i, got, row)
+			}
+		}
+		q.Cursor, q.Offset = page.NextCursor, 0
+		page.Release()
+		pos += n
+	}
+}
+
+func TestReadIndexedSelectionDoesNotReplaceScratch(t *testing.T) {
+	block := sealedBlock{rows: []idRow{{tags: [8]uint32{1}}, {tags: [8]uint32{2}}}}
+	var err error
+	block.encoded, err = encodeBlockWithEncoder(block, nil)
+	requireOK(t, err)
+	scratch := []int32{-1}
+	initial := &scratch[0]
+	page := PageResult{Rows: make([]PageRow, 0, 1), tagBuf: make([]string, 0, 1)}
+	filters := []compiledFilter{{ids: []uint32{1}, single: 1}}
+	_, taken, _, err := readPageFromBlock(block, SegmentMeta{}, dictionary{}, 0, 1, filters, false, 0, 1, &querySlot{}, &scratch, &page)
+	requireOK(t, err)
+	if taken != 1 || len(scratch) != 1 || &scratch[0] != initial || scratch[0] != -1 {
+		t.Fatalf("indexed read took %d rows and changed scratch to %v", taken, scratch)
+	}
+}
+
 func TestReadPaginationCursorZeroDiskSkipAndCompactShift(t *testing.T) {
 	clock := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	ctx := t.Context()

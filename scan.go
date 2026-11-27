@@ -10,9 +10,13 @@ import (
 
 // ScanBatch is a zero-allocation read-only batch view valid only during a single Scan callback.
 type ScanBatch struct {
+	v *scanBatchView
+}
+
+type scanBatchView struct {
 	meta    SegmentMeta
 	summary Summary
-	dict    dictionary
+	dict    *dictionary
 	tagErr  *atomic.Pointer[error]
 	series  uint16
 	arity   uint8
@@ -22,15 +26,32 @@ type ScanBatch struct {
 	masks   []uint8
 }
 
-func (b ScanBatch) Meta() SegmentMeta     { return b.meta }
-func (b ScanBatch) BlockSummary() Summary { return b.summary }
-func (b ScanBatch) Len() int              { return b.count }
+func (b ScanBatch) Meta() SegmentMeta {
+	if b.v == nil {
+		return SegmentMeta{}
+	}
+	return b.v.meta
+}
 
-func (b ScanBatch) TagID(i, dim int) uint32 {
-	if i < 0 || i >= b.count || dim < 0 || dim >= int(b.arity) {
+func (b ScanBatch) BlockSummary() Summary {
+	if b.v == nil {
+		return Summary{}
+	}
+	return b.v.summary
+}
+
+func (b ScanBatch) Len() int {
+	if b.v == nil {
 		return 0
 	}
-	return b.tagIDs[dim][i]
+	return b.v.count
+}
+
+func (b ScanBatch) TagID(i, dim int) uint32 {
+	if b.v == nil || i < 0 || i >= b.v.count || dim < 0 || dim >= int(b.v.arity) {
+		return 0
+	}
+	return b.v.tagIDs[dim][i]
 }
 
 func (b ScanBatch) Tag(i, dim int) string {
@@ -38,32 +59,32 @@ func (b ScanBatch) Tag(i, dim int) string {
 	if id == 0 {
 		return ""
 	}
-	tag, err := b.dict.resolve(b.series, uint8(dim), id)
-	if err != nil && b.tagErr != nil {
-		b.tagErr.CompareAndSwap(nil, &err)
+	tag, err := b.v.dict.resolve(b.v.series, uint8(dim), id)
+	if err != nil && b.v.tagErr != nil {
+		b.v.tagErr.CompareAndSwap(nil, &err)
 	}
 	return tag
 }
 
 func (b ScanBatch) Values(i int) [4]int64 {
-	if i < 0 || i >= b.count {
+	if b.v == nil || i < 0 || i >= b.v.count {
 		return [4]int64{}
 	}
-	return [4]int64{b.values[0][i], b.values[1][i], b.values[2][i], b.values[3][i]}
+	return [4]int64{b.v.values[0][i], b.v.values[1][i], b.v.values[2][i], b.v.values[3][i]}
 }
 
 func (b ScanBatch) Mask(i int) uint8 {
-	if i < 0 || i >= b.count {
+	if b.v == nil || i < 0 || i >= b.v.count {
 		return 0
 	}
-	return b.masks[i]
+	return b.v.masks[i]
 }
 
 func (b ScanBatch) CloneRow(i int) Row {
-	if i < 0 || i >= b.count {
+	if b.v == nil || i < 0 || i >= b.v.count {
 		return Row{}
 	}
-	tags := make([]string, int(b.arity))
+	tags := make([]string, int(b.v.arity))
 	for dim := range tags {
 		tags[dim] = strings.Clone(b.Tag(i, dim))
 	}
@@ -155,9 +176,9 @@ func scanSlotBlock(ctx context.Context, block sealedBlock, meta SegmentMeta, db 
 		if err != nil {
 			return err
 		}
-		return scanDecodedColsBlock(ctx, count, &cols, block.summary, meta, db.dict, series, arity, dimMask, metricMask, batchSize, allowDim0BS, filters, slot, rowIdxBuf, fn)
+		return scanDecodedColsBlock(ctx, count, &cols, block.summary, meta, &db.dict, series, arity, dimMask, metricMask, batchSize, allowDim0BS, filters, slot, rowIdxBuf, fn)
 	}
-	return scanIDRowsBlock(ctx, block.rows, block.summary, meta, db.dict, series, arity, dimMask, metricMask, batchSize, filters, slot, fn)
+	return scanIDRowsBlock(ctx, block.rows, block.summary, meta, &db.dict, series, arity, dimMask, metricMask, batchSize, filters, slot, fn)
 }
 
 func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summary, meta SegmentMeta, db *queryExec, series uint16, arity int, dimMask, metricMask uint8, batchSize int, allowDim0BS bool, filters []compiledFilter, slot *querySlot, rowIdxBuf *[]int32, fn func(ScanBatch) error) error {
@@ -173,35 +194,40 @@ func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summar
 	if total == 0 {
 		return nil
 	}
+	constTags, constMask := extractScanConstTags(filters, arity)
+	constMask &= dimMask
+	colMask &^= uint16(constMask)
+	cursor := rowSelCursor{sel: sel}
 	if !cache.fullBlock && total <= batchSize {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		isRange, rangeLo, rows := sel.sliceRows(0, total, *rowIdxBuf)
-		if !isRange && cap(rows) > cap(*rowIdxBuf) {
-			*rowIdxBuf = rows[:0]
-		}
-		if err := fillBatchFromStreamCache(&cache, isRange, rangeLo, rows, total, arity, dimMask, metricMask, slot); err != nil {
+		isRange, rangeLo, rows := cursor.next(total, rowIdxBuf)
+		if err := fillBatchFromStreamCache(&cache, isRange, rangeLo, rows, total, arity, dimMask&^constMask, metricMask, slot); err != nil {
 			return err
 		}
-		return yieldScanBatch(fn, makeScanBatch(meta, summary, db.dict, series, arity, total, slot))
+		for dim := range arity {
+			if constMask&(uint8(1)<<dim) != 0 {
+				decodeTagRange(slot.tagIDs[dim][:total], decodedCol{mode: modeConst, val: uint64(constTags[dim])}, 0)
+			}
+		}
+		return yieldScanBatch(fn, makeScanBatch(meta, summary, &db.dict, series, arity, total, slot))
 	}
 	cache.prepareOutput(colMask, total, sel.mode == selRange)
 	if cache.fullBlock {
 		if err := cache.loadAll(colMask); err != nil {
 			return err
 		}
+		cols := cache.cols
+		setScanConstCols(&cols, constTags, constMask)
 		for start := 0; start < total; start += batchSize {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			n := min(batchSize, total-start)
-			isRange, rangeLo, rows := sel.sliceRows(start, n, *rowIdxBuf)
-			if !isRange && cap(rows) > cap(*rowIdxBuf) {
-				*rowIdxBuf = rows[:0]
-			}
-			fillBatchFromCols(&cache.cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
-			if err := yieldScanBatch(fn, makeScanBatch(meta, summary, db.dict, series, arity, n, slot)); err != nil {
+			isRange, rangeLo, rows := cursor.next(n, rowIdxBuf)
+			fillBatchFromCols(&cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
+			if err := yieldScanBatch(fn, makeScanBatch(meta, summary, &db.dict, series, arity, n, slot)); err != nil {
 				return err
 			}
 		}
@@ -221,21 +247,19 @@ func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summar
 			return err
 		}
 		n := min(chunkRows, total-start)
-		isRange, rangeLo, rows := sel.sliceRows(start, n, *rowIdxBuf)
-		if !isRange && cap(rows) > cap(*rowIdxBuf) {
-			*rowIdxBuf = rows[:0]
-		}
+		isRange, rangeLo, rows := cursor.next(n, rowIdxBuf)
 		cols, err := cache.packChunk(colMask, isRange, rangeLo, rows, n)
 		if err != nil {
 			return err
 		}
+		setScanConstCols(&cols, constTags, constMask)
 		for off := 0; off < n; off += batchSize {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			cnt := min(batchSize, n-off)
 			fillBatchFromCols(&cols, true, off, nil, cnt, arity, dimMask, metricMask, slot)
-			if err := yieldScanBatch(fn, makeScanBatch(meta, summary, db.dict, series, arity, cnt, slot)); err != nil {
+			if err := yieldScanBatch(fn, makeScanBatch(meta, summary, &db.dict, series, arity, cnt, slot)); err != nil {
 				return err
 			}
 		}
@@ -243,22 +267,25 @@ func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summar
 	return nil
 }
 
-func scanDecodedColsBlock(ctx context.Context, count int, cols *[streamColumnCount]decodedCol, summary Summary, meta SegmentMeta, d dictionary, series uint16, arity int, dimMask, metricMask uint8, batchSize int, allowDim0BS bool, filters []compiledFilter, slot *querySlot, rowIdxBuf *[]int32, fn func(ScanBatch) error) error {
+func scanDecodedColsBlock(ctx context.Context, count int, cols *[streamColumnCount]decodedCol, summary Summary, meta SegmentMeta, d *dictionary, series uint16, arity int, dimMask, metricMask uint8, batchSize int, allowDim0BS bool, filters []compiledFilter, slot *querySlot, rowIdxBuf *[]int32, fn func(ScanBatch) error) error {
 	sel, err := filterSmallCols(count, cols, filters, allowDim0BS)
 	if err != nil {
 		return err
 	}
 	defer sel.release()
 	total := sel.count()
+	if total == 0 {
+		return nil
+	}
+	constTags, constMask := extractScanConstTags(filters, arity)
+	setScanConstCols(cols, constTags, dimMask&constMask)
+	cursor := rowSelCursor{sel: sel}
 	for start := 0; start < total; start += batchSize {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		n := min(batchSize, total-start)
-		isRange, rangeLo, rows := sel.sliceRows(start, n, *rowIdxBuf)
-		if !isRange && cap(rows) > cap(*rowIdxBuf) {
-			*rowIdxBuf = rows[:0]
-		}
+		isRange, rangeLo, rows := cursor.next(n, rowIdxBuf)
 		fillBatchFromCols(cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
 		if err := yieldScanBatch(fn, makeScanBatch(meta, summary, d, series, arity, n, slot)); err != nil {
 			return err
@@ -267,7 +294,7 @@ func scanDecodedColsBlock(ctx context.Context, count int, cols *[streamColumnCou
 	return nil
 }
 
-func scanIDRowsBlock(ctx context.Context, rows []idRow, summary Summary, meta SegmentMeta, d dictionary, series uint16, arity int, dimMask, metricMask uint8, batchSize int, filters []compiledFilter, slot *querySlot, fn func(ScanBatch) error) error {
+func scanIDRowsBlock(ctx context.Context, rows []idRow, summary Summary, meta SegmentMeta, d *dictionary, series uint16, arity int, dimMask, metricMask uint8, batchSize int, filters []compiledFilter, slot *querySlot, fn func(ScanBatch) error) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -315,18 +342,18 @@ func scanIDRowsBlock(ctx context.Context, rows []idRow, summary Summary, meta Se
 
 func yieldScanBatch(fn func(ScanBatch) error, b ScanBatch) error {
 	err := fn(b)
-	if tagErr := b.tagErr.Swap(nil); tagErr != nil {
+	if tagErr := b.v.tagErr.Swap(nil); tagErr != nil {
 		return *tagErr
 	}
 	return err
 }
 
-func makeScanBatch(meta SegmentMeta, summary Summary, d dictionary, series uint16, arity, count int, slot *querySlot) ScanBatch {
+func makeScanBatch(meta SegmentMeta, summary Summary, d *dictionary, series uint16, arity, count int, slot *querySlot) ScanBatch {
 	var tagIDs [8][]uint32
 	for dim := range arity {
 		tagIDs[dim] = slot.tagIDs[dim][:count]
 	}
-	return ScanBatch{
+	slot.batch = scanBatchView{
 		meta:    meta,
 		summary: summary,
 		dict:    d,
@@ -338,4 +365,5 @@ func makeScanBatch(meta SegmentMeta, summary Summary, d dictionary, series uint1
 		values:  [4][]int64{slot.values[0][:count], slot.values[1][:count], slot.values[2][:count], slot.values[3][:count]},
 		masks:   slot.masks[:count],
 	}
+	return ScanBatch{v: &slot.batch}
 }

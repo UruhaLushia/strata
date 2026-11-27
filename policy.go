@@ -122,6 +122,7 @@ type querySlot struct {
 	tagIDs     [8][]uint32
 	values     [4][]int64
 	masks      []uint8
+	batch      scanBatchView
 	codecs     *codecTable
 	decID      uint8
 	dec        codec.Decoder
@@ -195,6 +196,7 @@ func (s *querySlot) ensureArena(size int) []byte {
 }
 
 func (s *querySlot) resetAfterQuery() {
+	s.batch = scanBatchView{}
 	s.tagErr.Store(nil)
 	if cap(s.colScratch) > maxRetainedScratchCap {
 		s.colScratch = nil
@@ -225,6 +227,8 @@ func (s *querySlot) close() {
 	if s == nil {
 		return
 	}
+	s.batch = scanBatchView{}
+	s.tagErr.Store(nil)
 	if s.dec != nil {
 		s.dec.Close()
 		s.dec = nil
