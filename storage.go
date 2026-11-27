@@ -45,6 +45,7 @@ func Open(path string, opts Options) (*DB, error) {
 		lightReadSem:   make(chan struct{}, 1),
 		lightReadSlots: make(chan *querySlot, 1),
 		writer:         !opts.ReadOnly,
+		loopClosed:     opts.ReadOnly,
 		lock:           lk,
 		data:           f,
 		kvNext:         0x100,

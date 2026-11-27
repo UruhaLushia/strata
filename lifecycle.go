@@ -7,14 +7,22 @@ import (
 	"time"
 )
 
-func (db *DB) Close() error {
+var errDBClosed = errors.New("strata: database is closed")
+
+func (db *DB) closeLoop() <-chan struct{} {
 	db.loopMu.Lock()
-	cancel, done := db.loopCancel, db.loopDone
-	db.loopCancel = nil
-	db.loopDone = nil
-	db.loopMu.Unlock()
-	if cancel != nil {
-		cancel()
+	defer db.loopMu.Unlock()
+	db.loopClosed = true
+	db.loopHasNext, db.loopNextCtxDone = false, nil
+	if db.loopStop != nil {
+		close(db.loopStop)
+		db.loopStop = nil
+	}
+	return db.loopDone
+}
+
+func (db *DB) Close() error {
+	if done := db.closeLoop(); done != nil {
 		<-done
 	}
 	db.mu.Lock()
@@ -53,39 +61,100 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) Start(ctx context.Context) {
-	if ctx == nil {
-		ctx = context.Background()
+	if db.opts.FlushInterval <= 0 && db.opts.SyncInterval <= 0 {
+		return
+	}
+	var ctxDone <-chan struct{}
+	if ctx != nil {
+		ctxDone = ctx.Done()
+	}
+	select {
+	case <-ctxDone:
+		return
+	default:
 	}
 	db.loopMu.Lock()
-	if db.loopCancel != nil {
+	defer db.loopMu.Unlock()
+	if db.loopClosed {
+		return
+	}
+	if db.loopDone != nil {
+		current := db.loopCtxDone
+		if db.loopHasNext {
+			current = db.loopNextCtxDone
+		}
+		select {
+		case <-current:
+			db.loopHasNext, db.loopNextCtxDone = true, ctxDone
+		default:
+		}
+		return
+	}
+	stop, done := make(chan struct{}), make(chan struct{})
+	db.loopStop, db.loopDone, db.loopCtxDone = stop, done, ctxDone
+	go db.runLoop(ctxDone, stop, done)
+}
+
+func (db *DB) runLoop(ctxDone, stop <-chan struct{}, done chan struct{}) {
+	var flush, syncT *time.Ticker
+	var flushC, syncC <-chan time.Time
+	if d := db.opts.FlushInterval; d > 0 {
+		flush = time.NewTicker(d)
+		flushC = flush.C
+	}
+	if d := db.opts.SyncInterval; d > 0 {
+		syncT = time.NewTicker(d)
+		syncC = syncT.C
+	}
+	for {
+	active:
+		for {
+			select {
+			case <-ctxDone:
+				break active
+			case <-stop:
+				break active
+			case <-flushC:
+				if err := db.Flush(); err == ErrReadOnly || err == errDBClosed {
+					break active
+				}
+				select {
+				case <-ctxDone:
+					break active
+				case <-stop:
+					break active
+				default:
+				}
+				db.autoCompact()
+			case <-syncC:
+				if err := db.Sync(); err == ErrReadOnly || err == errDBClosed {
+					break active
+				}
+			}
+		}
+		db.loopMu.Lock()
+		next, hasNext := db.loopNextCtxDone, db.loopHasNext
+		db.loopHasNext, db.loopNextCtxDone = false, nil
+		if !db.loopClosed && hasNext {
+			select {
+			case <-next:
+			default:
+				ctxDone, db.loopCtxDone = next, next
+				db.loopMu.Unlock()
+				continue
+			}
+		}
+		if flush != nil {
+			flush.Stop()
+		}
+		if syncT != nil {
+			syncT.Stop()
+		}
+		db.loopStop, db.loopDone, db.loopCtxDone = nil, nil, nil
+		close(done)
 		db.loopMu.Unlock()
 		return
 	}
-	c, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	db.loopCancel, db.loopDone = cancel, done
-	db.loopMu.Unlock()
-	go func() {
-		defer close(done)
-		flush := time.NewTicker(db.opts.FlushInterval)
-		syncT := time.NewTicker(db.opts.SyncInterval)
-		compact := time.NewTicker(db.opts.FlushInterval)
-		defer flush.Stop()
-		defer syncT.Stop()
-		defer compact.Stop()
-		for {
-			select {
-			case <-c.Done():
-				return
-			case <-flush.C:
-				_ = db.Flush()
-			case <-syncT.C:
-				_ = db.Sync()
-			case <-compact.C:
-				db.autoCompact()
-			}
-		}
-	}()
 }
 
 func (db *DB) Refresh() error {
@@ -210,7 +279,7 @@ func (db *DB) Flush() error { db.mu.Lock(); defer db.mu.Unlock(); return db.flus
 
 func (db *DB) flushLocked(force bool) error {
 	if db.closed {
-		return errors.New("strata: database is closed")
+		return errDBClosed
 	}
 	if !db.writer {
 		return ErrReadOnly
@@ -256,18 +325,5 @@ func (db *DB) flushLocked(force bool) error {
 func (db *DB) Sync() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.closed {
-		return errors.New("strata: database is closed")
-	}
-	if !db.writer {
-		return ErrReadOnly
-	}
-	if err := db.flushLocked(false); err != nil {
-		return err
-	}
-	if err := db.syncFile(); err != nil {
-		return err
-	}
-	db.durableSeq = db.appendSeq
-	return nil
+	return db.syncLocked()
 }

@@ -2,6 +2,7 @@ package strata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,364 @@ import (
 	"testing"
 	"time"
 )
+
+const (
+	backgroundTestInterval = 5 * time.Millisecond
+	backgroundTestTimeout  = 2 * time.Second
+)
+
+func TestConcurrentStartClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "strata.db")
+	opts := Options{FlushInterval: time.Hour, SyncInterval: time.Hour}
+	for range 16 {
+		db, err := Open(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := t.Context()
+		db.Start(ctx)
+		done := backgroundLoopDone(db)
+		db.Start(ctx)
+		if done == nil || backgroundLoopDone(db) != done {
+			t.Fatal("Start did not keep exactly one loop")
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range 8 {
+			wg.Go(func() {
+				<-start
+				for range 16 {
+					db.Start(ctx)
+					runtime.Gosched()
+				}
+			})
+		}
+		for range 2 {
+			wg.Go(func() {
+				<-start
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+
+		select {
+		case <-done:
+		default:
+			t.Fatal("Close returned before the loop stopped")
+		}
+		db.Start(ctx)
+		assertNoBackgroundLoop(t, db)
+	}
+}
+
+func TestStartSkipsInactiveDB(t *testing.T) {
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	opts := Options{FlushInterval: time.Hour, SyncInterval: time.Hour}
+	path := filepath.Join(t.TempDir(), "strata.db")
+	closed, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Open(path, Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	for _, tc := range []struct {
+		name string
+		db   *DB
+		ctx  context.Context
+	}{
+		{"read-only", reader, t.Context()},
+		{"closed", closed, t.Context()},
+		{"canceled", &DB{opts: opts, writer: true}, canceled},
+		{"disabled", &DB{writer: true}, t.Context()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.db.Start(tc.ctx)
+			assertNoBackgroundLoop(t, tc.db)
+		})
+	}
+}
+
+func TestStartRestartsAfterCancel(t *testing.T) {
+	ctx1, cancel1 := context.WithCancel(t.Context())
+	defer cancel1()
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	defer cancel2()
+	db, s, now, release := startBlockedAutoCompact(t, ctx1)
+	done := backgroundLoopDone(db)
+	started := make(chan struct{})
+	go func() {
+		cancel1()
+		db.Start(ctx2)
+		cancel2()
+		db.Start(context.Background())
+		close(started)
+	}()
+	waitForBackgroundSignal(t, started, "Start waited for the canceled loop to exit")
+	release()
+	waitForBackgroundContext(t, db, done, nil)
+	assertBackgroundFlush(t, db, s, now)
+}
+
+func TestStartReentersFromNow(t *testing.T) {
+	ctx1, cancel1 := context.WithCancel(t.Context())
+	defer cancel1()
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	defer cancel2()
+	now := time.Now()
+	db, s := testDB(t, &now, Options{FlushInterval: backgroundTestInterval, SyncInterval: time.Hour})
+	defer closeBackgroundTestDB(t, db)
+
+	returned := make(chan struct{})
+	db.opts.Now = func() time.Time {
+		select {
+		case <-returned:
+		default:
+			cancel1()
+			db.Start(ctx2)
+			close(returned)
+		}
+		return now
+	}
+	db.Start(ctx1)
+	done := backgroundLoopDone(db)
+	waitForBackgroundSignal(t, returned, "Start did not return in the Now callback")
+	waitForBackgroundContext(t, db, done, ctx2.Done())
+	assertBackgroundFlush(t, db, s, now)
+
+	closeBackgroundTestDB(t, db)
+	select {
+	case <-done:
+	default:
+		t.Fatal("Close returned before the loop stopped")
+	}
+	assertNoBackgroundLoop(t, db)
+}
+
+func TestConcurrentCloseWaitsForBackgroundLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db, _, _, release := startBlockedAutoCompact(t, ctx)
+	done := backgroundLoopDone(db)
+	started := make(chan struct{})
+	go func() {
+		cancel()
+		db.Start(context.Background())
+		close(started)
+	}()
+	waitForBackgroundSignal(t, started, "Start did not register a handoff during compaction")
+
+	db.loopMu.Lock()
+	stop := db.loopStop
+	db.loopMu.Unlock()
+	closed := make(chan error, 2)
+	closeDB := func() {
+		err := db.Close()
+		if err == nil {
+			select {
+			case <-done:
+			default:
+				err = errors.New("Close returned before the loop stopped")
+			}
+		}
+		closed <- err
+	}
+	go closeDB()
+	waitForBackgroundSignal(t, stop, "the first Close did not signal the loop to stop")
+
+	second := make(chan struct{})
+	go func() {
+		close(second)
+		closeDB()
+	}()
+	waitForBackgroundSignal(t, second, "the second Close did not start")
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned while background compaction was blocked: %v", err)
+	case <-time.After(backgroundTestInterval):
+	}
+	release()
+	for range 2 {
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(backgroundTestTimeout):
+			t.Fatal("Close did not return after compaction was released")
+		}
+	}
+	assertNoBackgroundLoop(t, db)
+}
+
+func startBlockedAutoCompact(t *testing.T, ctx context.Context) (*DB, *Series, time.Time, func()) {
+	t.Helper()
+	now := time.Now()
+	db, s := testDB(t, &now, Options{FlushInterval: backgroundTestInterval, SyncInterval: time.Hour, WALCompactBytes: 1})
+	entered, unblock := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(unblock) })
+	t.Cleanup(func() {
+		release()
+		closeBackgroundTestDB(t, db)
+	})
+	db.compactHook = func() {
+		select {
+		case <-unblock:
+			return
+		default:
+		}
+		close(entered)
+		<-unblock
+	}
+	if err := s.Append(now.Add(-time.Hour), Summary{Values: [4]int64{1}}); err != nil {
+		t.Fatal(err)
+	}
+	db.Start(ctx)
+	waitForBackgroundSignal(t, entered, "background compaction did not reach the hook")
+	return db, s, now, release
+}
+
+func TestBackgroundLoopStopsOnCompactWriteDisable(t *testing.T) {
+	now := time.Now()
+	db, _ := testDB(t, &now, Options{FlushInterval: time.Hour, SyncInterval: time.Hour})
+	defer closeBackgroundTestDB(t, db)
+	ctx := t.Context()
+
+	// A required unknown section is written successfully and rejected when reloaded.
+	db.optional = []optionalSection{{desc: sectionDesc{kind: 7}, data: []byte{1}, slot: 7}}
+	db.Start(ctx)
+	done := backgroundLoopDone(db)
+	if done == nil {
+		t.Fatal("Start did not register a loop")
+	}
+	if err := db.Compact(); !errors.Is(err, ErrIncompatFormat) {
+		t.Fatalf("Compact reload error = %v, want %v", err, ErrIncompatFormat)
+	}
+	if err := db.Flush(); err != ErrReadOnly {
+		t.Fatalf("Flush after write disable = %v, want %v", err, ErrReadOnly)
+	}
+	waitForBackgroundSignal(t, done, "loop did not stop before the next tick")
+	db.Start(ctx)
+	assertNoBackgroundLoop(t, db)
+}
+
+type startContext struct {
+	context.Context
+	done func() <-chan struct{}
+}
+
+func (c startContext) Done() <-chan struct{} { return c.done() }
+
+func TestStartContextDoneCanReenter(t *testing.T) {
+	now := time.Now()
+	db, _ := testDB(t, &now, Options{FlushInterval: time.Hour, SyncInterval: time.Hour})
+	defer db.Close()
+
+	var done <-chan struct{}
+	db.Start(startContext{Context: context.Background(), done: func() <-chan struct{} {
+		if !db.loopMu.TryLock() {
+			t.Fatal("Start called Context.Done with loopMu held")
+		}
+		db.loopMu.Unlock()
+		if !db.mu.TryLock() {
+			t.Fatal("Start called Context.Done with mu held")
+		}
+		db.mu.Unlock()
+		var nilCtx context.Context
+		db.Start(nilCtx)
+		done = backgroundLoopDone(db)
+		return nil
+	}})
+	if done == nil || backgroundLoopDone(db) != done {
+		t.Fatal("reentrant Start did not keep exactly one loop")
+	}
+}
+
+func backgroundLoopDone(db *DB) <-chan struct{} {
+	db.loopMu.Lock()
+	defer db.loopMu.Unlock()
+	return db.loopDone
+}
+
+func waitForBackgroundSignal(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(backgroundTestTimeout):
+		t.Fatal(message)
+	}
+}
+
+func waitForBackgroundCondition(t *testing.T, message string, ready func() bool) {
+	t.Helper()
+	tick := time.NewTicker(backgroundTestInterval)
+	defer tick.Stop()
+	timeout := time.After(backgroundTestTimeout)
+	for !ready() {
+		select {
+		case <-tick.C:
+		case <-timeout:
+			t.Fatal(message)
+		}
+	}
+}
+
+func waitForBackgroundContext(t *testing.T, db *DB, done, ctxDone <-chan struct{}) {
+	t.Helper()
+	waitForBackgroundCondition(t, "the loop did not hand off to the requested context", func() bool {
+		db.loopMu.Lock()
+		defer db.loopMu.Unlock()
+		return done != nil && db.loopDone == done && db.loopCtxDone == ctxDone && !db.loopHasNext
+	})
+}
+
+func assertBackgroundFlush(t *testing.T, db *DB, s *Series, now time.Time) {
+	t.Helper()
+	db.mu.RLock()
+	before := db.walPos
+	db.mu.RUnlock()
+	if err := s.Append(now, Summary{Values: [4]int64{1}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForBackgroundCondition(t, "restarted loop did not flush pending data to WAL", func() bool {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		return db.walPos > before && len(db.pending) == 0
+	})
+}
+
+func closeBackgroundTestDB(t *testing.T, db *DB) {
+	t.Helper()
+	closed := make(chan error, 1)
+	go func() { closed <- db.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(backgroundTestTimeout):
+		t.Error("Close did not return")
+	}
+}
+
+func assertNoBackgroundLoop(t *testing.T, db *DB) {
+	t.Helper()
+	db.loopMu.Lock()
+	defer db.loopMu.Unlock()
+	if db.loopDone != nil || db.loopStop != nil || db.loopCtxDone != nil || db.loopHasNext || db.loopNextCtxDone != nil {
+		t.Fatal("background loop is still registered")
+	}
+}
 
 func dictCacheStats(db *DB) (used, maxBytes int) {
 	if db == nil {

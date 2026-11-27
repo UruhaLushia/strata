@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -284,9 +283,13 @@ type DB struct {
 	pendingDict           []dictEntry
 	pendingBytes          int64
 	lastRefreshSize       int64
-	loopMu                sync.Mutex
-	loopCancel            context.CancelFunc
+	loopMu                sync.Mutex // Protects the loop state and is a leaf lock.
+	loopClosed            bool
+	loopStop              chan struct{}
 	loopDone              chan struct{}
+	loopCtxDone           <-chan struct{}
+	loopHasNext           bool
+	loopNextCtxDone       <-chan struct{}
 	syncHook              func() error
 	compactHook           func()
 	compactInvertRunBytes int

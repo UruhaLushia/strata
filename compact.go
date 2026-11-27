@@ -235,6 +235,7 @@ func (db *DB) Compact() error {
 		db.data, db.mapped, db.view = previousView.data, previousView.mapped, previousView
 	}
 	if loadOrOpenErr != nil {
+		db.closeLoop()
 		db.writer = false
 	}
 	db.mu.Unlock()
