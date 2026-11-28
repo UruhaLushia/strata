@@ -107,23 +107,34 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 | 常规网关（5K 域名、2K IP） | 10.06 MiB | 2.20 MiB | 13.48 MiB | 172–176 ms |
 | 极端高基数（106 万唯一 IPv6） | 26.36 MiB | 2.31 MiB | 14.42 MiB | 446–462 ms |
 
-### 查询延迟与分配
+### 查询延迟与分配（`codec/zstd`，`zstd.Fastest`）
 
 | 基准项 | 常规网关 | 极端高基数（106 万 IPv6） |
 |---|---:|---:|
-| `SummaryOnly`（90 天零盘读） | 36.1 µs / 887 B / 7 allocs | 36.1 µs / 887 B / 7 allocs |
-| `ReadLast15mPage200` | 39.1 µs / 10.8 KiB / 14 allocs | 68.4 µs / 15.5 KiB / 214 allocs |
+| `SummaryOnly`（90 天零盘读） | 36.9 µs / 881 B / 7 allocs | 36.9 µs / 881 B / 7 allocs |
+| `ReadLast15mPage200` | 41.3 µs / 8.6 KiB / 13 allocs | 68.4 µs / 15.5 KiB / 214 allocs |
 | `Read90dDeepOffset5000` | 84.2 µs / 80.3 KiB / 14 allocs | 86.8 µs / 83.6 KiB / 214 allocs |
-| `OutboundLookup`（15m / 1h / 24h / 7d 单键命中） | 83.4 µs / 212.8 µs / 543.0 µs / 1.06 ms | 64.1 µs / 65.5 µs / 64.7 µs / 71.0 µs |
-| `OutboundLookup`（未知冷键未命中） | 3.9–4.1 µs / 9.4 KiB / 16 allocs | 10.2–10.8 µs / 9.6 KiB / 17 allocs |
-| `Scan90dSparseMeta`（76 行） | 2.94 ms / 86.2 KiB / 39 allocs | 5.11 ms / 95.3 KiB / 39 allocs |
-| `Scan90dMediumMeta`（1,768 行） | 6.29 ms / 88.0 KiB / 26 allocs | 8.51 ms / 105.7 KiB / 27 allocs |
-| `Scan90dDenseMeta`（344K / 530K 行） | 9.60 ms / 445 KiB / 28 allocs | 13.80 ms / 1.00 MiB / 35 allocs |
-| `Scan90dTimeFirstIDs`（735K / 106 万行） | 7.69 ms / 426 KiB / 16 allocs | 10.72 ms / 968 KiB / 20 allocs |
+| `OutboundLookup`（15m / 1h / 24h / 7d 单键命中） | 77.5 µs / 203.2 µs / 500.0 µs / 907.6 µs | 65.0 µs / 64.4 µs / 64.5 µs / 65.1 µs |
+| `OutboundLookup`（未知冷键未命中） | 1.33 µs / 2.3 KiB / 5 allocs | 10.6 µs / 10.4 KiB / 13 allocs |
+| `Scan90dSparseMeta`（76 行） | 2.04 ms / 36.3 KiB / 33 allocs | 4.44 ms / 40.8 KiB / 33 allocs |
+| `Scan90dMediumMeta`（1,768 行） | 5.33 ms / 64.2 KiB / 26 allocs | 8.20 ms / 89.7 KiB / 27 allocs |
+| `Scan90dDenseMeta`（344K / 530K 行） | 7.97 ms / 401 KiB / 33 allocs | 12.79 ms / 638 KiB / 35 allocs |
+| `Scan90dTimeFirstIDs`（735K / 106 万行） | 8.10 ms / 371 KiB / 16 allocs | 12.99 ms / 592 KiB / 17 allocs |
 | `AggregateFiltered` | 1.17 ms / 236 KiB / 81 allocs | — |
-| `AggregateTopK`（5K 域名 Top-50） | 4.77 ms / 824 KiB / 102 allocs | — |
+| `AggregateTopK`（5K 域名 Top-20） | 4.31 ms / 804 KiB / 107 allocs | — |
 | `AggregateDomain`（5K 域名） | 5.47 ms / 1.13 MiB / 72 allocs | — |
 | `ExtremeDestIPTopK`（106 万 IPv6 精确 Top-50） | — | 38.30 ms / 2.41 MiB / 218 allocs |
+
+### 压缩算法基准对照
+
+同一 90 天 106 万行数据集（`BenchmarkGateway90CodecLatency`，`mmap=false`，各组合均按对应算法真实写入并压实）：
+
+| 压缩算法 | `.db` 大小（常规 / 极端） | 常规 `15m` / `24h` 命中 | `Read15m` 命中 | `Scan90d` 密集 / 全扫 | `AggregateTopK` | 极端 `15m` 命中 / `Scan90d` 密集 |
+|---|---:|---:|---:|---:|---:|---:|
+| `None`（默认） | 27.3 MiB / 73.6 MiB | **37.9 µs** / **263.6 µs** | **40.1 µs** | **5.51 ms** / **4.83 ms** | 3.82 ms | **41.9 µs** / **9.34 ms** |
+| `codec/s2`（`Default`） | 11.5 MiB / 37.1 MiB | 47.5 µs / 304.7 µs | 49.7 µs | 7.76 ms / 7.07 ms | **3.66 ms** | 56.1 µs / 11.31 ms |
+| `codec/zstd`（`Fastest`） | 10.1 MiB / 26.4 MiB | 86.6 µs / 563.2 µs | 86.6 µs | 9.16 ms / 8.50 ms | 4.56 ms | 69.1 µs / 13.24 ms |
+| `codec/flate`（`BestSpeed`） | **9.68 MiB** / **25.0 MiB** | 276.3 µs / 1.18 ms | 281.3 µs | 17.82 ms / 17.01 ms | 7.36 ms | 141.4 µs / 20.69 ms |
 
 ### 编译体积与 `eventlog` 吞吐
 
@@ -137,11 +148,14 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 | `strata` + `codec/zstd` | 3.09 MiB | — |
 | 单用 `eventlog`（`None`） | 1.50 MiB | -1.59 MiB |
 
-| `eventlog` 基准（64B 载荷，4 MiB 分片，`None`） | 耗时 | 内存 / 分配 | 吞吐 |
-|---|---:|---:|---:|
-| `AppendFlush`（批量写盘） | 45.0 ns/event | 0 allocs/op | 1,423 MB/s |
-| `ScanRecent`（最近 200 条，~1.5 KiB 小帧） | 14.8 µs | 345 B / 6 allocs | — |
-| `ScanRecent`（4 MiB 全分片，~1.5 KiB 小帧） | 1.40 ms | 344 B / 6 allocs | ~2.9 GB/s |
+`eventlog` 四算法对照（`BenchmarkEventlogCodecs`，69B 结构化 JSON 载荷，等价 4 MiB 原始数据，每帧 20 条）：
+
+| 压缩算法 | 盘上体积 | `AppendFlush`（256 条批） | `Scan` 近 200 条 | `Scan` 全量 |
+|---|---:|---:|---:|---:|
+| `None`（默认） | 4.00 MiB | **52.9 ns/event**（1,304 MB/s，0 allocs） | **15.6 µs**（297 B / 5 allocs） | **1.56 ms** |
+| `codec/s2`（`Default`） | 1.13 MiB | 71.2 ns/event（970 MB/s，0 allocs） | 21.9 µs（297 B / 5 allocs） | 2.53 ms |
+| `codec/zstd`（`Fastest`） | **582 KiB** | 243.6 ns/event（283 MB/s，0 allocs） | 57.1 µs（302 B / 5 allocs） | 11.15 ms |
+| `codec/flate`（`BestSpeed`） | 805 KiB | 303.9 ns/event（227 MB/s，1 alloc） | 87.1 µs（544 B / 15 allocs） | 17.90 ms |
 
 8 并发重查询饱和压测下（`mmap=true`），`SummaryOnly` 稳定在 `p99 <= 183 µs`，有界小页 `Read` 稳定在 `p99 <= 424 µs`（`MemoryConstrained` 下 `<= 303 µs`）。
 

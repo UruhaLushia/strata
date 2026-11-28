@@ -809,6 +809,81 @@ func BenchmarkEventlogScanRecent(b *testing.B) {
 	b.Run("SmallFrames", func(b *testing.B) { run(b, 20) })
 }
 
+func BenchmarkEventlogCodecs(b *testing.B) {
+	const batchSize, smallBatch, rawTarget = 256, 20, 4 << 20
+	payloads := make([]Record, batchSize)
+	for i := range payloads {
+		p := []byte(`{"host":"edge-00.example.net","rule":"proxy-00","bytes":16384,"ok":1}`)
+		p[14], p[15] = byte('0'+(i/10)%10), byte('0'+i%10)
+		p[44], p[45] = byte('0'+(i/7)%10), byte('0'+i%7)
+		payloads[i] = Record{TimestampNS: int64(i + 1), StreamID: uint16(i % 4), Payload: p}
+	}
+	payloadBytes := len(payloads[0].Payload)
+	for _, alg := range []struct {
+		name string
+		c    codec.Codec
+	}{
+		{"None", nil},
+		{"S2", s2.New(s2.Default)},
+		{"Zstd", zstd.New(zstd.Fastest)},
+		{"Flate", flate.New(stdflate.BestSpeed)},
+	} {
+		b.Run(alg.name, func(b *testing.B) {
+			b.Run("AppendFlush", func(b *testing.B) {
+				l, err := Open(b.TempDir(), Options{Codec: alg.c})
+				check(b, err)
+				b.Cleanup(func() { check(b, l.Close()) })
+				b.ReportAllocs()
+				b.SetBytes(int64(batchSize * payloadBytes))
+				for b.Loop() {
+					if err := l.Append(payloads...); err != nil {
+						b.Fatal(err)
+					}
+					if err := l.Flush(); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/(float64(b.N)*batchSize), "ns/event")
+			})
+			dir := b.TempDir()
+			batches := (rawTarget - fileHeaderSize) / (frameOverhead + smallBatch*(recordHeaderSize+payloadBytes))
+			l, err := Open(dir, Options{Codec: alg.c, ShardMaxBytes: rawTarget})
+			check(b, err)
+			b.Cleanup(func() { check(b, l.Close()) })
+			for range batches {
+				check(b, l.Append(payloads[:smallBatch]...))
+				check(b, l.Flush())
+			}
+			check(b, l.Sync())
+			var diskBytes int64
+			for _, f := range shardFiles(b, dir) {
+				info, err := os.Stat(f)
+				check(b, err)
+				diskBytes += info.Size()
+			}
+			for _, tc := range []struct {
+				name  string
+				limit int
+				want  int
+			}{{"Recent200", 200, 200}, {"All", 0, batches * smallBatch}} {
+				b.Run("SmallFrames/"+tc.name, func(b *testing.B) {
+					b.ReportAllocs()
+					ctx := b.Context()
+					opts := ScanOptions{MaxRecords: tc.limit}
+					visit := func(Record) error { return nil }
+					for b.Loop() {
+						res, err := l.Scan(ctx, opts, visit)
+						if err != nil || res.Records != tc.want {
+							b.Fatalf("scan: got %d, want %d, err=%v", res.Records, tc.want, err)
+						}
+					}
+					b.ReportMetric(float64(diskBytes), "disk_bytes")
+				})
+			}
+		})
+	}
+}
+
 func check(t testing.TB, err error) {
 	t.Helper()
 	if err != nil {
@@ -840,7 +915,7 @@ func timestamps(t *testing.T, l *Log) []int64 {
 	return got
 }
 
-func shardFiles(t *testing.T, dir string) []string {
+func shardFiles(t testing.TB, dir string) []string {
 	t.Helper()
 	files, err := filepath.Glob(filepath.Join(dir, "shard-*.evl"))
 	check(t, err)

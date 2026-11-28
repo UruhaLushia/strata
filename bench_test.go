@@ -1,6 +1,7 @@
 package strata
 
 import (
+	stdflate "compress/flate"
 	"context"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/UruhaLushia/strata/codec"
+	codecflate "github.com/UruhaLushia/strata/codec/flate"
 	"github.com/UruhaLushia/strata/codec/s2"
 	"github.com/UruhaLushia/strata/codec/zstd"
 )
@@ -724,7 +726,12 @@ func BenchmarkGateway90CodecLatency(b *testing.B) {
 	for _, algorithm := range []struct {
 		name    string
 		factory codec.Codec
-	}{{"None", nil}, {"S2", s2.New(s2.Default)}, {"Zstd", zstd.New(zstd.Fastest)}} {
+	}{
+		{"None", nil},
+		{"S2", s2.New(s2.Default)},
+		{"Zstd", zstd.New(zstd.Fastest)},
+		{"Flate", codecflate.New(stdflate.BestSpeed)},
+	} {
 		b.Run(algorithm.name, func(b *testing.B) {
 			for _, mode := range []struct {
 				name    string
@@ -738,6 +745,7 @@ func BenchmarkGateway90CodecLatency(b *testing.B) {
 					if err != nil {
 						b.Fatal(err)
 					}
+					from90d := fx.now.Add(-90 * 24 * time.Hour)
 					to := fx.now.Add(time.Minute)
 					rowID := fx.rawRows - 6*30
 					dim, hit, miss := 0, gatewayDomain(rowID), "unknown.example"
@@ -760,6 +768,7 @@ func BenchmarkGateway90CodecLatency(b *testing.B) {
 								b.Fatalf("%s returned %d rows, expected hit=%t", name, count, hit)
 							}
 							b.ReportMetric(float64(info.Size()), "db_bytes")
+							b.ReportMetric(float64(fx.lastCompact)/float64(time.Millisecond), "compact_ms")
 						})
 					}
 					aggregate := func(name string, span time.Duration, value string) {
@@ -774,8 +783,20 @@ func BenchmarkGateway90CodecLatency(b *testing.B) {
 							return n, nil
 						})
 					}
+					scan := func(name string, filters []Filter) {
+						q := ScanQuery{From: from90d, To: fx.now, Filters: filters}
+						run(name, true, func(ctx context.Context) (int, error) {
+							rows := 0
+							err := s.Scan(ctx, q, func(batch ScanBatch) error {
+								rows += batch.Len()
+								return nil
+							})
+							return rows, err
+						})
+					}
 					aggregate("15m/Hit", 15*time.Minute, hit)
 					aggregate("15m/Miss", 15*time.Minute, miss)
+					scan("Scan90d/DenseMeta", tagFilter(6, TagEq, "tcp"))
 					if mode.extreme {
 						return
 					}
@@ -788,6 +809,17 @@ func BenchmarkGateway90CodecLatency(b *testing.B) {
 						}
 						n := len(page.Rows)
 						page.Release()
+						return n, nil
+					})
+					scan("Scan90d/TimeFirstIDs", nil)
+					topKQ := AggregateQuery{From: from90d, To: fx.now, GroupDims: []int{0}, TopK: 20}
+					run("AggregateTopK", true, func(ctx context.Context) (int, error) {
+						res, err := s.Aggregate(ctx, topKQ)
+						if err != nil {
+							return 0, err
+						}
+						n := len(res.Groups[0])
+						res.Release()
 						return n, nil
 					})
 				})

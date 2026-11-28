@@ -107,23 +107,34 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 | Realistic (5K domains, 2K IPs) | 10.06 MiB | 2.20 MiB | 13.48 MiB | 172–176 ms |
 | Extreme (1.06M unique IPv6) | 26.36 MiB | 2.31 MiB | 14.42 MiB | 446–462 ms |
 
-### Query Latency & Allocations
+### Query Latency & Allocations (`codec/zstd`, `zstd.Fastest`)
 
 | Benchmark | Realistic | Extreme (1.06M IPv6) |
 |---|---:|---:|
-| `SummaryOnly` (90d zero-disk) | 36.1 µs / 887 B / 7 allocs | 36.1 µs / 887 B / 7 allocs |
-| `ReadLast15mPage200` | 39.1 µs / 10.8 KiB / 14 allocs | 68.4 µs / 15.5 KiB / 214 allocs |
+| `SummaryOnly` (90d zero-disk) | 36.9 µs / 881 B / 7 allocs | 36.9 µs / 881 B / 7 allocs |
+| `ReadLast15mPage200` | 41.3 µs / 8.6 KiB / 13 allocs | 68.4 µs / 15.5 KiB / 214 allocs |
 | `Read90dDeepOffset5000` | 84.2 µs / 80.3 KiB / 14 allocs | 86.8 µs / 83.6 KiB / 214 allocs |
-| `OutboundLookup` (15m / 1h / 24h / 7d hit) | 83.4 µs / 212.8 µs / 543.0 µs / 1.06 ms | 64.1 µs / 65.5 µs / 64.7 µs / 71.0 µs |
-| `OutboundLookup` (unknown miss) | 3.9–4.1 µs / 9.4 KiB / 16 allocs | 10.2–10.8 µs / 9.6 KiB / 17 allocs |
-| `Scan90dSparseMeta` (76 rows) | 2.94 ms / 86.2 KiB / 39 allocs | 5.11 ms / 95.3 KiB / 39 allocs |
-| `Scan90dMediumMeta` (1,768 rows) | 6.29 ms / 88.0 KiB / 26 allocs | 8.51 ms / 105.7 KiB / 27 allocs |
-| `Scan90dDenseMeta` (344K / 530K rows) | 9.60 ms / 445 KiB / 28 allocs | 13.80 ms / 1.00 MiB / 35 allocs |
-| `Scan90dTimeFirstIDs` (735K / 1.06M rows) | 7.69 ms / 426 KiB / 16 allocs | 10.72 ms / 968 KiB / 20 allocs |
+| `OutboundLookup` (15m / 1h / 24h / 7d hit) | 77.5 µs / 203.2 µs / 500.0 µs / 907.6 µs | 65.0 µs / 64.4 µs / 64.5 µs / 65.1 µs |
+| `OutboundLookup` (unknown miss) | 1.33 µs / 2.3 KiB / 5 allocs | 10.6 µs / 10.4 KiB / 13 allocs |
+| `Scan90dSparseMeta` (76 rows) | 2.04 ms / 36.3 KiB / 33 allocs | 4.44 ms / 40.8 KiB / 33 allocs |
+| `Scan90dMediumMeta` (1,768 rows) | 5.33 ms / 64.2 KiB / 26 allocs | 8.20 ms / 89.7 KiB / 27 allocs |
+| `Scan90dDenseMeta` (344K / 530K rows) | 7.97 ms / 401 KiB / 33 allocs | 12.79 ms / 638 KiB / 35 allocs |
+| `Scan90dTimeFirstIDs` (735K / 1.06M rows) | 8.10 ms / 371 KiB / 16 allocs | 12.99 ms / 592 KiB / 17 allocs |
 | `AggregateFiltered` | 1.17 ms / 236 KiB / 81 allocs | — |
-| `AggregateTopK` (5K domains Top-50) | 4.77 ms / 824 KiB / 102 allocs | — |
+| `AggregateTopK` (5K domains Top-20) | 4.31 ms / 804 KiB / 107 allocs | — |
 | `AggregateDomain` (5K domains) | 5.47 ms / 1.13 MiB / 72 allocs | — |
 | `ExtremeDestIPTopK` (1.06M IPv6 exact Top-50) | — | 38.30 ms / 2.41 MiB / 218 allocs |
+
+### Compression Codec Comparison
+
+Same 90-day 1.06M-row dataset (`BenchmarkGateway90CodecLatency`, `mmap=false`, each database written and compacted with its own codec):
+
+| Codec | `.db` Size (Domain / Extreme) | Domain `15m` / `24h` Hit | `Read15m` Hit | `Scan90d` Dense / TimeFirst | `AggregateTopK` | Extreme `15m` Hit / `Scan90d` Dense |
+|---|---:|---:|---:|---:|---:|---:|
+| `None` (default) | 27.3 MiB / 73.6 MiB | **37.9 µs** / **263.6 µs** | **40.1 µs** | **5.51 ms** / **4.83 ms** | 3.82 ms | **41.9 µs** / **9.34 ms** |
+| `codec/s2` (`Default`) | 11.5 MiB / 37.1 MiB | 47.5 µs / 304.7 µs | 49.7 µs | 7.76 ms / 7.07 ms | **3.66 ms** | 56.1 µs / 11.31 ms |
+| `codec/zstd` (`Fastest`) | 10.1 MiB / 26.4 MiB | 86.6 µs / 563.2 µs | 86.6 µs | 9.16 ms / 8.50 ms | 4.56 ms | 69.1 µs / 13.24 ms |
+| `codec/flate` (`BestSpeed`) | **9.68 MiB** / **25.0 MiB** | 276.3 µs / 1.18 ms | 281.3 µs | 17.82 ms / 17.01 ms | 7.36 ms | 141.4 µs / 20.69 ms |
 
 ### Binary Size & `eventlog` Throughput
 
@@ -137,11 +148,14 @@ Stripped `CGO_ENABLED=0` binary size (`-trimpath -ldflags="-s -w"`, root builds 
 | `strata` + `codec/zstd` | 3.09 MiB | — |
 | `eventlog` standalone (`None`) | 1.50 MiB | -1.59 MiB |
 
-| `eventlog` Benchmark (64B payload, 4 MiB shard, `None`) | Latency | Memory / Allocs | Throughput |
-|---|---:|---:|---:|
-| `AppendFlush` (batched write) | 45.0 ns/event | 0 allocs/op | 1,423 MB/s |
-| `ScanRecent` (recent 200, ~1.5 KiB frames) | 14.8 µs | 345 B / 6 allocs | — |
-| `ScanRecent` (full 4 MiB shard, ~1.5 KiB frames) | 1.40 ms | 344 B / 6 allocs | ~2.9 GB/s |
+`eventlog` across codecs (`BenchmarkEventlogCodecs`, structured 69B JSON payloads, 4 MiB raw equivalent, 20 records/frame):
+
+| Codec | Disk Size | `AppendFlush` (256-rec batch) | `Scan` Recent 200 | `Scan` All |
+|---|---:|---:|---:|---:|
+| `None` (default) | 4.00 MiB | **52.9 ns/event** (1,304 MB/s, 0 allocs) | **15.6 µs** (297 B / 5 allocs) | **1.56 ms** |
+| `codec/s2` (`Default`) | 1.13 MiB | 71.2 ns/event (970 MB/s, 0 allocs) | 21.9 µs (297 B / 5 allocs) | 2.53 ms |
+| `codec/zstd` (`Fastest`) | **582 KiB** | 243.6 ns/event (283 MB/s, 0 allocs) | 57.1 µs (302 B / 5 allocs) | 11.15 ms |
+| `codec/flate` (`BestSpeed`) | 805 KiB | 303.9 ns/event (227 MB/s, 1 alloc) | 87.1 µs (544 B / 15 allocs) | 17.90 ms |
 
 Under 8-way mixed concurrency saturation (`mmap=true`), `SummaryOnly` stays at `p99 <= 183 µs` and bounded small-page `Read` stays at `p99 <= 424 µs` (`<= 303 µs` under `MemoryConstrained`).
 
