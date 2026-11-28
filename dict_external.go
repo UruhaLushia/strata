@@ -287,12 +287,16 @@ func (e *dictExtDim) matchPrefixSST(prefix string, extra map[uint32]string, dst 
 	return dst, nil
 }
 
-func (e *dictExtDim) matchScanFwd(op TagOp, target string, extra map[uint32]string, dst []uint32) ([]uint32, error) {
+func (e *dictExtDim) matchScanFwd(op TagOp, target string, extra map[uint32]string, dst []uint32, slot *querySlot) ([]uint32, error) {
 	if e == nil || len(e.fwdPages) == 0 {
 		return dst, nil
 	}
-	slot := querySlot{codecs: e.view.codecs}
-	defer slot.close()
+	var local querySlot
+	if slot == nil {
+		local.codecs = e.view.codecs
+		slot = &local
+		defer local.close()
+	}
 	plainPtr := getDecodeScratch()
 	defer func() {
 		putDecodeScratch(plainPtr, *plainPtr)
@@ -301,7 +305,7 @@ func (e *dictExtDim) matchScanFwd(op TagOp, target string, extra map[uint32]stri
 		if pDesc.length == 0 {
 			continue
 		}
-		plain, err := e.readPageInto(e.fwdStartOff, pDesc, plainPtr, &slot)
+		plain, err := e.readPageInto(e.fwdStartOff, pDesc, plainPtr, slot)
 		if err != nil {
 			return nil, err
 		}

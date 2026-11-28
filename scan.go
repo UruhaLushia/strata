@@ -203,7 +203,7 @@ func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summar
 			return err
 		}
 		isRange, rangeLo, rows := cursor.next(total, rowIdxBuf)
-		if err := fillBatchFromStreamCache(&cache, isRange, rangeLo, rows, total, arity, dimMask&^constMask, metricMask, slot); err != nil {
+		if err := fillBatch(&cache, nil, isRange, rangeLo, rows, total, arity, dimMask&^constMask, metricMask, slot); err != nil {
 			return err
 		}
 		for dim := range arity {
@@ -226,7 +226,7 @@ func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summar
 			}
 			n := min(batchSize, total-start)
 			isRange, rangeLo, rows := cursor.next(n, rowIdxBuf)
-			fillBatchFromCols(&cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
+			_ = fillBatch(nil, &cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
 			if err := yieldScanBatch(fn, makeScanBatch(meta, summary, &db.dict, series, arity, n, slot)); err != nil {
 				return err
 			}
@@ -258,7 +258,7 @@ func scanStreamBlock(ctx context.Context, view columnarBlockView, summary Summar
 				return err
 			}
 			cnt := min(batchSize, n-off)
-			fillBatchFromCols(&cols, true, off, nil, cnt, arity, dimMask, metricMask, slot)
+			_ = fillBatch(nil, &cols, true, off, nil, cnt, arity, dimMask, metricMask, slot)
 			if err := yieldScanBatch(fn, makeScanBatch(meta, summary, &db.dict, series, arity, cnt, slot)); err != nil {
 				return err
 			}
@@ -286,7 +286,7 @@ func scanDecodedColsBlock(ctx context.Context, count int, cols *[streamColumnCou
 		}
 		n := min(batchSize, total-start)
 		isRange, rangeLo, rows := cursor.next(n, rowIdxBuf)
-		fillBatchFromCols(cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
+		_ = fillBatch(nil, cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
 		if err := yieldScanBatch(fn, makeScanBatch(meta, summary, d, series, arity, n, slot)); err != nil {
 			return err
 		}

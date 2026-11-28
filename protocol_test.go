@@ -26,13 +26,6 @@ import (
 	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
-func requireOK(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestQuerySlotDecodeRetainsLargerScratch(t *testing.T) {
 	z := zstd.New(zstd.Fastest)
 	enc, err := z.NewEncoder(64 << 10)
@@ -663,7 +656,7 @@ func TestRejectLegacyFormats(t *testing.T) {
 	wrappedRow := append([]byte{blockTagRawSmall}, legacyRow...)
 	_, err = decodeBlock(wrappedRow, 0, nil)
 	check(err, "invalid block marker")
-	slot := newQuerySlot()
+	slot := &querySlot{}
 	defer slot.close()
 	_, _, err = decodeSmallBlockCols(wrappedRow, 0, slot)
 	check(err, "invalid small column block")
@@ -879,7 +872,6 @@ func TestAutoCompactResetWatermarks(t *testing.T) {
 	for _, late := range []bool{true, false} {
 		now := time.Date(2026, 6, 11, 10, 15, 15, 0, time.UTC)
 		db, s := testDB(t, &now, Options{})
-		defer db.Close()
 		if late {
 			appendValue(t, s, now.Add(-5*time.Minute), 1)
 			requireOK(t, s.ResetAll())
@@ -895,6 +887,7 @@ func TestAutoCompactResetWatermarks(t *testing.T) {
 		if db.head.gen != gen {
 			t.Fatalf("autoCompact spun on a blocked reset (late write=%t)", late)
 		}
+		requireOK(t, db.Close())
 	}
 }
 

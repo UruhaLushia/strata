@@ -192,14 +192,6 @@ func resolveBatchCol(cache *blockColCache, cols *[streamColumnCount]decodedCol, 
 	return cols[idx], nil
 }
 
-func fillBatchFromStreamCache(cache *blockColCache, isRange bool, rangeLo int, rows []int32, n, arity int, dimMask, metricMask uint8, slot *querySlot) error {
-	return fillBatch(cache, nil, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
-}
-
-func fillBatchFromCols(cols *[streamColumnCount]decodedCol, isRange bool, rangeLo int, rows []int32, n, arity int, dimMask, metricMask uint8, slot *querySlot) {
-	_ = fillBatch(nil, cols, isRange, rangeLo, rows, n, arity, dimMask, metricMask, slot)
-}
-
 func fillBatch(cache *blockColCache, cols *[streamColumnCount]decodedCol, isRange bool, rangeLo int, rows []int32, n, arity int, dimMask, metricMask uint8, slot *querySlot) error {
 	slot.ensureBatch(n, arity)
 	for dim := range arity {

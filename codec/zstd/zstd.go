@@ -11,6 +11,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// Level selects a Zstandard compression preset.
 type Level uint8
 
 const (
@@ -20,7 +21,7 @@ const (
 	Best
 )
 
-// New returns a Zstandard codec using level.
+// New returns a Zstandard codec for level; invalid levels fail in NewEncoder with codec.ErrUnsupportedCodec.
 func New(level Level) codec.Codec { return algorithm(level) }
 
 type algorithm Level

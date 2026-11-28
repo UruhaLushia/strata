@@ -103,7 +103,7 @@ func TestReadPaginationCursorZeroDiskSkipAndCompactShift(t *testing.T) {
 				tags = append(tags, tag)
 				rows[i] = Row{Tags: []string{tag, net}, Values: [4]int64{1}}
 			}
-			mustTestOK(t, s.Append(base.Add(time.Duration(m)*time.Minute), Summary{Values: [4]int64{7}}, rows...))
+			requireOK(t, s.Append(base.Add(time.Duration(m)*time.Minute), Summary{Values: [4]int64{7}}, rows...))
 		}
 		return tags
 	}
@@ -115,12 +115,12 @@ func TestReadPaginationCursorZeroDiskSkipAndCompactShift(t *testing.T) {
 	read := func(q ReadRequest) *PageResult {
 		t.Helper()
 		page, err := c.Read(ctx, s.id, q)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		return page
 	}
 	base := clock.Add(-2 * time.Hour)
 	want := seed(s, base)
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	for _, limit := range []int{-1, 51} {
 		if _, err := c.Read(ctx, s.id, ReadRequest{AllTime: true, Limit: limit}); !errors.Is(err, ErrPageLimitExceeded) {
 			t.Fatalf("limit=%d err=%v", limit, err)
@@ -139,7 +139,7 @@ func TestReadPaginationCursorZeroDiskSkipAndCompactShift(t *testing.T) {
 			got = append(got, row.Tags[0])
 		}
 		cursor, err := ParseCursor(page.NextCursor.String())
-		mustTestOK(t, err)
+		requireOK(t, err)
 		page.Release()
 		req.Cursor = cursor
 		if i == 0 {
@@ -176,7 +176,7 @@ func TestReadPaginationCursorZeroDiskSkipAndCompactShift(t *testing.T) {
 	db.view = nil
 	page, err := c.Read(ctx, s.id, ReadRequest{From: base, To: req.To.Add(time.Minute), Offset: len(want), Limit: 5, PreferFine: true})
 	db.view = savedView
-	mustTestOK(t, err)
+	requireOK(t, err)
 	if len(page.Rows) != 1 || page.HasMore || page.Rows[0].Values[0] != 9 {
 		t.Fatalf("zero-disk offset skip page=%+v", page)
 	}
@@ -186,11 +186,11 @@ func TestReadPaginationCursorZeroDiskSkipAndCompactShift(t *testing.T) {
 	shiftDB, shift := testDB(t, &clock, Options{})
 	defer shiftDB.Close()
 	seed(shift, day)
-	mustTestOK(t, shift.Append(day.Add(24*time.Hour), Summary{Values: [4]int64{50}}, Row{Tags: []string{"nextday", "tcp"}, Values: [4]int64{50}}))
+	requireOK(t, shift.Append(day.Add(24*time.Hour), Summary{Values: [4]int64{50}}, Row{Tags: []string{"nextday", "tcp"}, Values: [4]int64{50}}))
 	readShift := func(req ReadRequest) *PageResult {
 		t.Helper()
 		p, err := shift.Read(ctx, req)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		return p
 	}
 	window := ReadRequest{From: day, To: day.Add(25 * time.Hour), Limit: 5}
@@ -206,7 +206,7 @@ func TestReadPaginationCursorZeroDiskSkipAndCompactShift(t *testing.T) {
 	}
 
 	clock = day.Add(20 * 24 * time.Hour)
-	mustTestOK(t, shiftDB.Compact())
+	requireOK(t, shiftDB.Compact())
 	for _, cursor := range []Cursor{sameStart, midDay} {
 		window.Cursor = cursor
 		p := readShift(window)
@@ -235,7 +235,7 @@ func TestLightReadLaneIsolationAndFallback(t *testing.T) {
 	for i := range 70 {
 		seed(180-i, 2)
 	}
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 
 	recent := ReadRequest{From: now.Add(-15 * time.Minute), To: now, Limit: 200}
 	big := ReadRequest{From: now.Add(-35 * time.Minute), To: now.Add(-25 * time.Minute), Limit: 50}
@@ -256,7 +256,7 @@ func TestLightReadLaneIsolationAndFallback(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 		defer cancel()
 		p, err := s.Read(ctx, req)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		defer p.Release()
 		if len(p.Rows) != want {
 			t.Fatalf("Read rows=%d want=%d", len(p.Rows), want)

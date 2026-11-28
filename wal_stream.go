@@ -74,20 +74,27 @@ func scanWALFrameMetas(f *osFile, start, end int64) ([]walFrameMeta, error) {
 		switch m.typ {
 		case frameDelta:
 			minTS, maxTS, cnt, err := scanDeltaBounds(payloadBuf)
-			if err == nil && cnt > 0 {
+			if err != nil {
+				return nil, err
+			}
+			if cnt > 0 {
 				m.minTS, m.maxTS, m.hasTS = minTS, maxTS, true
 			}
 		case frameReset:
-			if x, err := decodeReset(payloadBuf); err == nil {
-				m.minTS, m.maxTS, m.hasTS = x.from, x.to, true
-				m.series = x.series
-				m.resetOldEpoch = x.oldEpoch
+			x, err := decodeReset(payloadBuf)
+			if err != nil {
+				return nil, err
 			}
+			m.minTS, m.maxTS, m.hasTS = x.from, x.to, true
+			m.series = x.series
+			m.resetOldEpoch = x.oldEpoch
 		case frameKVBatch:
-			if rev, _, err := decodeKVBatch(payloadBuf); err == nil {
-				m.kvRev = rev
-				m.hasTS = true
+			rev, _, err := decodeKVBatch(payloadBuf)
+			if err != nil {
+				return nil, err
 			}
+			m.kvRev = rev
+			m.hasTS = true
 		}
 		metas = append(metas, m)
 		pos = nextPos

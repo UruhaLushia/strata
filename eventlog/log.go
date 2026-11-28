@@ -296,15 +296,16 @@ func (l *Log) flush(closing bool) error {
 	committed, err := l.writeBatch(raw, count)
 
 	l.mu.Lock()
-	if !committed {
+	switch {
+	case !committed:
 		// Keep the detached records before appends accepted during the write.
 		if l.count != 0 {
 			raw = append(raw, l.pending[frameHeaderSize:]...)
 		}
 		l.spare, l.pending, l.count = l.pending[:0], raw, count+l.count
-	} else if l.pending == nil {
+	case l.pending == nil:
 		l.pending = raw[:0]
-	} else {
+	default:
 		l.spare = raw[:0]
 	}
 	l.inFlightBytes, l.inFlightCount = 0, 0

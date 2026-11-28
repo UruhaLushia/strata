@@ -14,6 +14,13 @@ import (
 	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
+func requireOK(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func encodeBlockLevel(b sealedBlock, level zstd.Level) ([]byte, error) {
 	enc, err := zstd.New(level).NewEncoder(128 << 10)
 	if err != nil {

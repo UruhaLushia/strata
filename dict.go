@@ -309,13 +309,14 @@ func (d *dictionary) internAfterLookup(series uint16, dimIdx uint8, value string
 	if err := dim.appendValue(id, value); err != nil {
 		return 0, false, err
 	}
-	if dim.sorted != nil {
+	switch {
+	case dim.sorted != nil:
 		if dim.nextID > dim.sortedNextID && dim.nextID-dim.sortedNextID >= dictSortedMergeThreshold {
 			dim.mergeTailIntoSorted()
 		}
-	} else if dim.count > dictMapThreshold {
+	case dim.count > dictMapThreshold:
 		dim.buildSorted()
-	} else if dim.byKey != nil {
+	case dim.byKey != nil:
 		dim.byKey[value] = id
 	}
 	return id, true, nil

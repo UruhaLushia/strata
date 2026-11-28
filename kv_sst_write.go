@@ -168,8 +168,8 @@ func writeKVSections(f *osFile, pos int64, blocks []kvSSTBlock, catalog []byte, 
 		}
 		_, _ = blockHash.Write(b.raw)
 		rawAllLen += uint32(len(b.raw))
-		out := binary.AppendUvarint(index, uint64(len(b.first)))
-		index = append(out, b.first...)
+		index = binary.AppendUvarint(index, uint64(len(b.first)))
+		index = append(index, b.first...)
 		index = binary.AppendUvarint(index, uint64(len(b.last)))
 		index = append(index, b.last...)
 		index = binary.LittleEndian.AppendUint64(index, b.maxRev)

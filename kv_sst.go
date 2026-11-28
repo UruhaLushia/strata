@@ -106,7 +106,8 @@ func decodeKVBlock(plain []byte) ([]kvSSTEntry, error) {
 		if err != nil {
 			return nil, err
 		}
-		key := append(append([]byte(nil), prev[:shared]...), make([]byte, suffixLen)...)
+		key := make([]byte, shared+suffixLen)
+		copy(key, prev[:shared])
 		if _, err = r.Read(key[shared:]); err != nil {
 			return nil, err
 		}

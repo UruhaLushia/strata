@@ -181,13 +181,13 @@ func (s *dictDimSnap) matchPrefixIDs(prefix string, dst []uint32, slot *querySlo
 	return dst, nil
 }
 
-func (s *dictDimSnap) matchScanIDs(op TagOp, target string, dst []uint32) ([]uint32, error) {
+func (s *dictDimSnap) matchScanIDs(op TagOp, target string, dst []uint32, slot *querySlot) ([]uint32, error) {
 	if s.count == 0 && len(s.extra) == 0 {
 		return dst, nil
 	}
 	if s.ext != nil {
 		var err error
-		dst, err = s.ext.matchScanFwd(op, target, s.extra, dst)
+		dst, err = s.ext.matchScanFwd(op, target, s.extra, dst, slot)
 		if err != nil {
 			return nil, err
 		}

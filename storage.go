@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 )
 
+// Open opens or creates a Strata database at path.
 func Open(path string, opts Options) (*DB, error) {
 	opts, policy := defaultOptions(opts)
 	codecs, err := newCodecTable(opts)

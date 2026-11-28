@@ -269,7 +269,7 @@ func validateSections(f *osFile, s superblock) ([]optionalSection, error) {
 		if d.kind <= 6 {
 			continue
 		}
-		if d.offset < dataStart || d.length > uint64(^uint64(0))-d.offset {
+		if d.offset < dataStart || d.length > ^uint64(0)-d.offset {
 			return nil, errors.New("strata: invalid section bounds")
 		}
 		raw := make([]byte, d.length)

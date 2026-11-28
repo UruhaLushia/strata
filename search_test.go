@@ -404,10 +404,10 @@ func TestInvertedSearchEqualsFullScanFuzz(t *testing.T) {
 				Tags:   []string{"host-" + strconv.Itoa(j), "app-" + strconv.Itoa(i%3), "192.0.2." + strconv.Itoa(i%8), "2001:db8::" + strconv.Itoa(j)},
 				Values: v,
 			}
-			mustTestOK(t, s.Append(base.Add(time.Duration(i)*time.Hour), Summary{Values: v}, row))
+			requireOK(t, s.Append(base.Add(time.Duration(i)*time.Hour), Summary{Values: v}, row))
 		}
 		if i == 19 {
-			mustTestOK(t, db.Compact())
+			requireOK(t, db.Compact())
 			if db.head.sections[secTSInvert].length == 0 {
 				t.Fatal("sealed fixture has no inverted index")
 			}
@@ -417,7 +417,7 @@ func TestInvertedSearchEqualsFullScanFuzz(t *testing.T) {
 	collect := func(q ScanQuery) []Row {
 		t.Helper()
 		var rows []Row
-		mustTestOK(t, s.Scan(t.Context(), q, func(b ScanBatch) error {
+		requireOK(t, s.Scan(t.Context(), q, func(b ScanBatch) error {
 			for i := range b.Len() {
 				rows = append(rows, b.CloneRow(i))
 			}
@@ -463,7 +463,7 @@ func TestInvertedSearchEqualsFullScanFuzz(t *testing.T) {
 			From: q.From, To: q.To, AllTime: q.AllTime, Filters: q.Filters, PreferFine: q.PreferFine,
 			RequireExact: q.RequireExact,
 		})
-		mustTestOK(t, err)
+		requireOK(t, err)
 		got := res.Summary
 		res.Release()
 		sameRows := slices.EqualFunc(gotRows, wantRows, func(a, b Row) bool {
@@ -485,13 +485,13 @@ func TestScanProjectionsAndEarlyStop(t *testing.T) {
 	for i := range rows {
 		rows[i] = Row{Tags: []string{"d-" + strconv.Itoa(i), "tcp"}, Values: [4]int64{1, int64(i + 1), 3, 4}, Mask: 0x0f}
 	}
-	mustTestOK(t, s.Append(now.Add(-time.Hour), Summary{}, rows...))
-	mustTestOK(t, db.Compact())
+	requireOK(t, s.Append(now.Add(-time.Hour), Summary{}, rows...))
+	requireOK(t, db.Compact())
 
 	q := ScanQuery{AllTime: true, ProjectDims: 1, ProjectMetrics: 2, BatchSize: 64}
 	total := 0
 	var first Row
-	mustTestOK(t, c.Scan(t.Context(), s.id, q, func(b ScanBatch) error {
+	requireOK(t, c.Scan(t.Context(), s.id, q, func(b ScanBatch) error {
 		if b.Len() > q.BatchSize {
 			t.Fatalf("batch length=%d", b.Len())
 		}
@@ -514,7 +514,7 @@ func TestScanProjectionsAndEarlyStop(t *testing.T) {
 
 	seen := 0
 	for b, err := range c.ScanSeq(t.Context(), s.id, q) {
-		mustTestOK(t, err)
+		requireOK(t, err)
 		seen += b.Len()
 		break
 	}
@@ -550,7 +550,7 @@ func TestAdaptiveInvert5Modes(t *testing.T) {
 		}
 		var ids []uint32
 		var skipped bool
-		mustTestOK(t, decodeInvertChunkScan(record, map[uint64]struct{}{key: {}},
+		requireOK(t, decodeInvertChunkScan(record, map[uint64]struct{}{key: {}},
 			func(_ uint64, id uint32) { ids = append(ids, id) }, func(uint64) { skipped = true }))
 		if skipped != dense || !slices.Equal(ids, tc.ids) {
 			t.Fatalf("mode %d round trip ids=%v dense=%v", tc.mode, ids, skipped)
@@ -573,9 +573,9 @@ func TestAdaptiveInvert5Modes(t *testing.T) {
 		if m%25 == 0 || m == 71 {
 			rows = append(rows, Row{Tags: []string{"sparse"}, Values: [4]int64{1}})
 		}
-		mustTestOK(t, s.Append(base.Add(time.Duration(m)*time.Minute), Summary{}, rows...))
+		requireOK(t, s.Append(base.Add(time.Duration(m)*time.Minute), Summary{}, rows...))
 	}
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	for tag, want := range map[string]int64{"dense": 72, "single": 1, "contig": 20, "sparse": 4, "absent": 0} {
 		q := AggregateQuery{From: base, To: base.Add(2 * time.Hour), Filters: []Filter{{Dim: 0, Op: TagEq, Values: []string{tag}}}}
 		if got := queryAggSum(t, s, q); got != want {
@@ -591,7 +591,7 @@ func TestExternalDictThreeTierPriority(t *testing.T) {
 	s := mustSeries(t, db, 22, SeriesConfig{Arity: 1})
 	base := now.Add(-6 * time.Hour)
 	seedHighCardMinute(t, s, base, 17000, func(i int) []string { return []string{fmt.Sprintf("m-ext-%05d", i)} })
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	seedHighCardMinute(t, s, base.Add(time.Hour), 100, func(i int) []string { return []string{fmt.Sprintf("b-tail-%03d", i)} })
 	dim := db.dict.dims[dictDimKey{series: s.id, dim: 0}]
 	if dim == nil || dim.ext == nil || dim.tailBase != 17001 {
@@ -612,7 +612,7 @@ func TestExternalDictThreeTierPriority(t *testing.T) {
 		}
 	}
 	res, err := s.Aggregate(t.Context(), AggregateQuery{From: base, To: now, GroupDims: []int{0}, TopK: 5})
-	mustTestOK(t, err)
+	requireOK(t, err)
 	defer res.Release()
 	var tags []string
 	for _, row := range res.Groups[0] {
@@ -635,10 +635,10 @@ func TestEmptyTagFilteringAndWideCursorPagination(t *testing.T) {
 		for i, tag := range tags {
 			rows[i] = Row{Tags: []string{tag, "d"}, Values: [4]int64{values[i]}}
 		}
-		mustTestOK(t, s.AppendSync(ts, Summary{}, rows...))
+		requireOK(t, s.AppendSync(ts, Summary{}, rows...))
 	}
 	add(base, []string{"", "foo", "bar"}, []int64{10, 20, 40})
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	add(now, []string{"", "foo", "baz"}, []int64{5, 15, 25})
 
 	ctx, end := t.Context(), now.Add(time.Minute)
@@ -655,12 +655,12 @@ func TestEmptyTagFilteringAndWideCursorPagination(t *testing.T) {
 		filters := []Filter{{Dim: 0, Op: TagEq, Values: tc.values, Negate: tc.negate}}
 		agg := queryAggSum(t, s, AggregateQuery{From: base, To: end, Filters: filters})
 		count, sum, err := scanCountSumErr(ctx, s, ScanQuery{From: base, To: end, Filters: filters})
-		mustTestOK(t, err)
+		requireOK(t, err)
 		if agg != tc.sum || count != tc.count || sum != tc.sum {
 			t.Fatalf("filters=%+v Aggregate=%d Scan=(%d,%d) want=(%d,%d)", filters, agg, count, sum, tc.count, tc.sum)
 		}
 		page, err := s.Read(ctx, ReadRequest{From: base, To: end, Filters: filters, Limit: 20})
-		mustTestOK(t, err)
+		requireOK(t, err)
 		var readSum int64
 		for _, row := range page.Rows {
 			readSum += row.Values[0]
@@ -676,7 +676,7 @@ func TestEmptyTagFilteringAndWideCursorPagination(t *testing.T) {
 	var values []int64
 	for i := range 3 {
 		page, err := s.Read(ctx, q)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		for _, row := range page.Rows {
 			values = append(values, row.Values[0])
 		}
@@ -687,7 +687,7 @@ func TestEmptyTagFilteringAndWideCursorPagination(t *testing.T) {
 		page.Release()
 		if i < 2 {
 			q.Cursor, err = ParseCursor(next.String())
-			mustTestOK(t, err)
+			requireOK(t, err)
 			if q.Cursor.IsZero() {
 				t.Fatalf("wide page %d lost its cursor", i)
 			}

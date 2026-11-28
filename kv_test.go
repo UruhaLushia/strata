@@ -17,13 +17,6 @@ import (
 	"github.com/UruhaLushia/strata/codec/zstd"
 )
 
-func mustTestOK(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestKVRegionsLazyAllocationAndIsolation(t *testing.T) {
 	now := time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
 	db, series := testDB(t, &now, Options{})
@@ -38,8 +31,8 @@ func TestKVRegionsLazyAllocationAndIsolation(t *testing.T) {
 	}
 	checkUnallocated()
 	assertKV(t, lazy, "k", nil, false)
-	mustTestOK(t, lazy.Delete("k"))
-	mustTestOK(t, lazy.Clear())
+	requireOK(t, lazy.Delete("k"))
+	requireOK(t, lazy.Clear())
 	checkUnallocated()
 
 	failure := errors.New("sync failure")
@@ -55,7 +48,7 @@ func TestKVRegionsLazyAllocationAndIsolation(t *testing.T) {
 	db.syncHook = nil
 
 	seq := db.allocatedSeq
-	mustTestOK(t, lazy.Put("k", []byte("left")))
+	requireOK(t, lazy.Put("k", []byte("left")))
 	if db.allocatedSeq != seq+1 || db.kvCatalog["lazy"] == 0 {
 		t.Fatalf("first Put must allocate in one WAL frame, frames=%d", db.allocatedSeq-seq)
 	}
@@ -63,10 +56,10 @@ func TestKVRegionsLazyAllocationAndIsolation(t *testing.T) {
 	if ok, err := other.PutIfAbsent("k", []byte("right")); err != nil || !ok || db.allocatedSeq != seq+2 || db.kvCatalog["other"] == 0 {
 		t.Fatalf("first PutIfAbsent ok=%v err=%v frames=%d", ok, err, db.allocatedSeq-seq-1)
 	}
-	mustTestOK(t, lazy.Clear())
+	requireOK(t, lazy.Clear())
 	assertKV(t, lazy, "k", nil, false)
 	appendValue(t, series, now.Add(-time.Minute), 7)
-	mustTestOK(t, series.ResetAll())
+	requireOK(t, series.ResetAll())
 	assertKV(t, other, "k", []byte("right"), true)
 
 	ro := reopenTestDB(t, nil, db.path, Options{ReadOnly: true})
@@ -120,20 +113,20 @@ func TestKVBatchAtomicityStickyErrorsAndDurability(t *testing.T) {
 	assertKV(t, left, "k", nil, false)
 	assertKV(t, right, "k", nil, false)
 	seq := db.allocatedSeq
-	mustTestOK(t, batch().Commit())
+	requireOK(t, batch().Commit())
 	if db.allocatedSeq != seq+1 {
 		t.Fatalf("cross-region batch frames=%d", db.allocatedSeq-seq)
 	}
 	assertKV(t, left, "k", value, true)
 	assertKV(t, right, "k", value, true)
 
-	mustTestOK(t, left.NewBatch().Put("drop", value).Clear().Commit())
-	mustTestOK(t, right.NewBatch().Put("drop", value).Clear().Commit())
+	requireOK(t, left.NewBatch().Put("drop", value).Clear().Commit())
+	requireOK(t, right.NewBatch().Put("drop", value).Clear().Commit())
 	assertKV(t, left, "drop", nil, false)
 	assertKV(t, right, "drop", nil, false)
-	mustTestOK(t, left.Put("keep", value))
+	requireOK(t, left.Put("keep", value))
 	appendValue(t, series, now.Add(-2*time.Hour), 1)
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	if db.head.sections[secKVSSTIndex].length == 0 || db.head.sections[secTSInvert].length == 0 {
 		t.Fatal("expected both KV index and TS inversion sections")
 	}
@@ -163,13 +156,13 @@ func TestKVMixedTSCompactAndReaderRefresh(t *testing.T) {
 
 			r := mustRegion(t, writer, "later")
 			appendValue(t, series, now.Add(-2*time.Hour), 3)
-			mustTestOK(t, r.Put("k", []byte("v")))
+			requireOK(t, r.Put("k", []byte("v")))
 			writer.compactHook = func() {
 				appendValue(t, series, now.Add(-time.Minute), 4)
-				mustTestOK(t, r.Put("hot", []byte("tail")))
+				requireOK(t, r.Put("hot", []byte("tail")))
 			}
-			mustTestOK(t, writer.Compact())
-			mustTestOK(t, reader.Refresh())
+			requireOK(t, writer.Compact())
+			requireOK(t, reader.Refresh())
 			assertKV(t, later, "k", []byte("v"), true)
 			assertKV(t, later, "hot", []byte("tail"), true)
 			assertTSSum(t, mustSeries(t, reader, series.id, series.cfg), now.Add(-3*time.Hour), now, 7)
@@ -221,8 +214,8 @@ func TestKVTTLAndCASStateMachine(t *testing.T) {
 			t.Fatalf("ttl=%v err=%v", ttl, err)
 		}
 	}
-	mustTestOK(t, r.PutTTL("tmp", v, time.Minute))
-	mustTestOK(t, r.PutTTL("max", v, time.Duration(math.MaxInt64)))
+	requireOK(t, r.PutTTL("tmp", v, time.Minute))
+	requireOK(t, r.PutTTL("max", v, time.Duration(math.MaxInt64)))
 	if expires := db.kvOverlay[kvKey{region: db.kvCatalog["cas"], key: "max"}].expiresAtUnixNano; expires != math.MaxInt64 {
 		t.Fatalf("maximum TTL expiration=%d want=%d", expires, int64(math.MaxInt64))
 	}
@@ -233,7 +226,7 @@ func TestKVTTLAndCASStateMachine(t *testing.T) {
 	if ok, err := r.PutIfAbsent("tmp", v); err != nil || !ok {
 		t.Fatalf("PutIfAbsent after expiry ok=%v err=%v", ok, err)
 	}
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	assertKV(t, r, "max", v, true)
 	opts := db.opts
 	opts.ReadOnly = true
@@ -258,16 +251,16 @@ func TestKVScanScanSeqAndLargeBlobs(t *testing.T) {
 	defer db.Close()
 	r, other := mustRegion(t, db, "items"), mustRegion(t, db, "other")
 	blob := bytes.Repeat([]byte("large-value-"), 4000)
-	mustTestOK(t, db.NewBatch().In(r).
+	requireOK(t, db.NewBatch().In(r).
 		Put("a/1", []byte("sst")).Put("a/2", nil).Put("a/3", nil).Put("a/4", nil).
 		Put("a/5", blob).Put("\xff\xff/1", nil).
 		In(other).Put("a/0", []byte("foreign")).Commit())
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	blobSection := db.head.sections[secKVLargeBlobs]
 	if blobSection.kind != secKVLargeBlobs || blobSection.length == 0 {
 		t.Fatalf("missing large blob section: %+v", blobSection)
 	}
-	mustTestOK(t, r.NewBatch().Put("a/2", []byte("overlay")).Put("a/2b", nil).
+	requireOK(t, r.NewBatch().Put("a/2", []byte("overlay")).Put("a/2b", nil).
 		Delete("a/3").PutTTL("a/4", nil, time.Minute).Commit())
 	now = now.Add(2 * time.Minute)
 
@@ -277,7 +270,7 @@ func TestKVScanScanSeqAndLargeBlobs(t *testing.T) {
 		t.Helper()
 		var keys []string
 		for item, err := range region.ScanSeq(ctx, q) {
-			mustTestOK(t, err)
+			requireOK(t, err)
 			keys = append(keys, item.Key)
 			if visit != nil {
 				visit(item)
@@ -331,7 +324,7 @@ func TestKVScanScanSeqAndLargeBlobs(t *testing.T) {
 		}
 	}
 	for item, err := range r.ScanSeq(ctx, prefix) {
-		mustTestOK(t, err)
+		requireOK(t, err)
 		if item.Key != want[0] {
 			t.Fatalf("first ScanSeq key=%q want=%q", item.Key, want[0])
 		}
@@ -350,12 +343,12 @@ func TestKVScanScanSeqAndLargeBlobs(t *testing.T) {
 	// The callback writes to the same region while iterating its snapshot.
 	if got := scanKeys(r, prefix, func(it KVItem) {
 		if it.Key == "a/1" {
-			mustTestOK(t, r.NewBatch().Put("a/0", nil).Delete("a/2").Commit())
+			requireOK(t, r.NewBatch().Put("a/0", nil).Delete("a/2").Commit())
 		}
 	}); !slices.Equal(got, want) {
 		t.Fatalf("snapshot keys=%v want=%v", got, want)
 	}
-	mustTestOK(t, db.Close())
+	requireOK(t, db.Close())
 	for _, mmap := range []bool{false, true} {
 		ro := reopenTestDB(t, nil, db.path, Options{Now: db.opts.Now, ReadOnly: true, UseMmap: mmap})
 		defer ro.Close()
@@ -376,15 +369,15 @@ func TestKVSectionPassthrough(t *testing.T) {
 			t.Fatal("empty KV is not eligible for passthrough")
 		}
 		r := mustRegion(t, db, "catalog")
-		mustTestOK(t, r.NewBatch().Put("a", nil).Clear().Commit())
-		mustTestOK(t, db.Compact())
+		requireOK(t, r.NewBatch().Put("a", nil).Clear().Commit())
+		requireOK(t, db.Compact())
 		saved := db.head
 		if saved.sections[secKVSSTBlocks].length != 0 || saved.sections[secKVLargeBlobs].length != 0 ||
 			saved.sections[secKVSSTIndex].length == 0 || !canPassthroughKV(saved, saved.sealedKVRev, db.codecs.target) {
 			t.Fatalf("invalid catalog-only sections: %+v", saved.sections[:3])
 		}
 		appendValue(t, s, now.Add(-time.Hour), 1)
-		mustTestOK(t, db.Compact())
+		requireOK(t, db.Compact())
 		if db.head.gen != saved.gen+1 || !slices.Equal(db.head.sections[:3], saved.sections[:3]) {
 			t.Fatalf("passthrough changed catalog-only sections: %+v", db.head.sections[:3])
 		}
@@ -400,8 +393,8 @@ func TestKVSectionPassthrough(t *testing.T) {
 		blob := make([]byte, 80<<10)
 		rng := rand.NewChaCha8([32]byte{1})
 		_, _ = rng.Read(blob)
-		mustTestOK(t, r.NewBatch().Put("big", blob).Put("delete", nil).In(other).Put("clear", nil).Commit())
-		mustTestOK(t, db.Compact())
+		requireOK(t, r.NewBatch().Put("big", blob).Put("delete", nil).In(other).Put("clear", nil).Commit())
+		requireOK(t, db.Compact())
 		saved := db.head
 		if saved.sections[secKVLargeBlobs].length <= 64<<10 || !canPassthroughKV(saved, saved.sealedKVRev, db.codecs.target) {
 			t.Fatalf("invalid passthrough fixture: %+v", saved.sections[:3])
@@ -409,9 +402,9 @@ func TestKVSectionPassthrough(t *testing.T) {
 
 		appendValue(t, s, now.Add(-2*time.Hour), 42)
 		db.compactHook = func() {
-			mustTestOK(t, r.NewBatch().Put("hot", nil).Delete("delete").In(other).Clear().Commit())
+			requireOK(t, r.NewBatch().Put("hot", nil).Delete("delete").In(other).Clear().Commit())
 		}
-		mustTestOK(t, db.Compact())
+		requireOK(t, db.Compact())
 		db.compactHook = nil
 		if db.head.gen != saved.gen+1 || db.head.sealedKVRev != saved.sealedKVRev ||
 			!slices.Equal(db.head.sections[:3], saved.sections[:3]) {
@@ -422,7 +415,7 @@ func TestKVSectionPassthrough(t *testing.T) {
 		assertKV(t, other, "clear", nil, false)
 
 		dst, err := openData(filepath.Join(t.TempDir(), "bad.tmp"), false)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		defer dst.Close()
 		bad := db.head
 		bad.sections[secKVLargeBlobs].crc ^= 1
@@ -430,7 +423,7 @@ func TestKVSectionPassthrough(t *testing.T) {
 			t.Fatal("copied KV section with corrupt CRC")
 		}
 
-		mustTestOK(t, db.Compact())
+		requireOK(t, db.Compact())
 		if db.head.sealedKVRev <= saved.sealedKVRev || db.head.sections[secKVSSTBlocks] == saved.sections[secKVSSTBlocks] {
 			t.Fatalf("KV update did not rewrite sealed blocks: revision=%d", db.head.sealedKVRev)
 		}
@@ -448,8 +441,8 @@ func TestKVSectionPassthrough(t *testing.T) {
 		db, _ := testDB(t, &now, Options{})
 		defer func() { _ = db.Close() }()
 		r := mustRegion(t, db, "sess")
-		mustTestOK(t, r.NewBatch().Put("keep", nil).PutTTL("temp", nil, 2*time.Minute).Commit())
-		mustTestOK(t, db.Compact())
+		requireOK(t, r.NewBatch().Put("keep", nil).PutTTL("temp", nil, 2*time.Minute).Commit())
+		requireOK(t, db.Compact())
 		db = reopenTestDB(t, db, db.path, db.opts)
 		check := func(wantFlags uint8, wantCopy bool) {
 			t.Helper()
@@ -461,19 +454,19 @@ func TestKVSectionPassthrough(t *testing.T) {
 		check(kvFlagTTLChecked|kvFlagHasLiveTTL, false)
 		assertKV(t, mustRegion(t, db, "sess"), "temp", nil, true)
 		now = now.Add(5 * time.Minute)
-		mustTestOK(t, db.Compact())
+		requireOK(t, db.Compact())
 		check(kvFlagTTLChecked, true)
 		r = mustRegion(t, db, "sess")
 		assertKV(t, r, "temp", nil, false)
 		assertKV(t, r, "keep", nil, true)
 
-		mustTestOK(t, db.Close())
+		requireOK(t, db.Close())
 		patchSuperblocks(t, db.path, func(_ *osFile, sb *superblock) {
 			sb.sections[secKVSSTIndex].flags = 0
 		})
 		db = reopenTestDB(t, nil, db.path, db.opts)
 		check(0, false)
-		mustTestOK(t, db.Compact())
+		requireOK(t, db.Compact())
 		check(kvFlagTTLChecked, true)
 		assertKV(t, mustRegion(t, db, "sess"), "keep", nil, true)
 	})
@@ -484,8 +477,8 @@ func TestKVSSTIndexCompressionAndCodecError(t *testing.T) {
 	db, s := testDB(t, &now, Options{Codec: zstd.New(zstd.Fastest)})
 	defer func() { _ = db.Close() }()
 	r := mustRegion(t, db, "idx")
-	mustTestOK(t, r.Put("a", []byte("1")))
-	mustTestOK(t, db.Compact())
+	requireOK(t, r.Put("a", []byte("1")))
+	requireOK(t, db.Compact())
 	idx := db.head.sections[secKVSSTIndex]
 	if idx.kind != secKVSSTIndex || idx.count != 1 || idx.codec != 0 || idx.length != uint64(idx.rawLen) {
 		t.Fatalf("tiny index should stay raw: %+v", idx)
@@ -502,15 +495,15 @@ func TestKVSSTIndexCompressionAndCodecError(t *testing.T) {
 		for i := base; i < base+250; i++ {
 			b.Put(key(i), value(i))
 		}
-		mustTestOK(t, b.Commit())
+		requireOK(t, b.Commit())
 	}
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	idx = db.head.sections[secKVSSTIndex]
 	if idx.count < 10 || idx.codec != 1 || idx.length == 0 || idx.length >= uint64(idx.rawLen) {
 		t.Fatalf("multi-block index should be compressed: %+v", idx)
 	}
 	appendValue(t, s, now.Add(-2*time.Hour), 77)
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 	if got := db.head.sections[secKVSSTIndex]; got != idx {
 		t.Fatalf("passthrough changed compressed index: %+v", got)
 	}
@@ -521,7 +514,7 @@ func TestKVSSTIndexCompressionAndCodecError(t *testing.T) {
 	for _, i := range []int{0, 123, 500, 999} {
 		assertKV(t, r, key(i), value(i), true)
 	}
-	mustTestOK(t, db.Close())
+	requireOK(t, db.Close())
 	patchSuperblocks(t, db.path, func(_ *osFile, head *superblock) {
 		head.sections[secKVSSTIndex].codec = 9
 		head.gen++

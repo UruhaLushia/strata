@@ -2,19 +2,19 @@
 
 [English](README.md) | 简体中文
 
-一个纯 Go（`CGO_ENABLED=0`）实现的**极轻量、内存有界的存储引擎**。
+一个纯 Go（`CGO_ENABLED=0`）实现的极轻量、内存有界存储引擎。
 
-## 定位与适用边界
+## 概览
 
-根包在单个文件内存储固定结构的时序数据和事务键值数据，具备小体积、可控内存上限与标签过滤下推能力。
+Strata 在单个文件内存储固定结构的时序数据与事务键值数据，面向小体积、可控内存上限与标签下推查询。
 
-- **固定遥测 Schema**：每条序列固定支持最多 8 个字符串标签维度（`Arity: 1..8`）与 4 个 `int64` 指标（`OpSum`、`OpMin`、`OpMax`、`OpLast`）。
-- **内置多级汇总**：自动按 `1m` / `1h` / `1d` 降采样并按层级过期，内置本地时区按小时聚合（`RollupLocalHours`）。
-- **标签检索**：`STR2` 列式分块、5 模式自适应倒排索引、内联与外置分页混合词典、内置下推过滤（`TagEq`、`TagPrefix`、`TagSuffix`、`TagContains`、`TagCIDR`），以及防止首屏小页被重查询阻塞的 1 槽有界轻读通道。
-- **同文件事务 KV**：在同一单文件内提供纯字节事务 KV 分区（`Region`、`Batch`、`Scan`、`ScanSeq`），支持 TTL、CAS 与快照无锁流式扫描。
-- **内存优先与可插拔压缩**：提供 `MemoryBalanced` / `MemoryConstrained` 双档预算、零指针（`noscan`）索引结构、显式 `Client.Reclaim()`（Unix 下触发 `MADV_DONTNEED`），并通过 `strata/codec` 支持可插拔压缩（默认不压缩、零外部压缩依赖；按需导入 `codec/zstd`、`codec/s2`、`codec/flate` 或自定义实现）。
+- **固定结构时序**：每条序列支持最多 8 维字符串标签（`Arity: 1..8`）与 4 个 `int64` 指标（`OpSum`、`OpMin`、`OpMax`、`OpLast`），内置 `1m` / `1h` / `1d` 自动汇总、分层过期与本地时区按小时聚合（`RollupLocalHours`）。
+- **标签下推检索**：`STR2` 列式分块、自适应倒排索引、内联与外置分页混合词典、下推过滤（`TagEq`、`TagPrefix`、`TagSuffix`、`TagContains`、`TagCIDR`），以及防止近期小页被重查询阻塞的 1 槽轻读通道。
+- **同文件事务 KV**：单文件内提供纯字节事务 KV 分区（`Region`、`Batch`、`Scan`、`ScanSeq`），支持 TTL、CAS 与无锁快照流式扫描。
+- **内存优先**：提供 `MemoryBalanced` / `MemoryConstrained` 双档预算、零指针（`noscan`）索引结构与显式 `Client.Reclaim()`（Unix 下触发 `MADV_DONTNEED`）。
+- **可插拔压缩与可选事件日志**：默认不压缩，通过 `strata/codec` 按需启用 `codec/s2`、`codec/zstd`、`codec/flate` 或自定义实现，并提供零耦合的 `strata/eventlog` 子包；仅导入 `strata` 或 `eventlog` 时不会链接外部压缩库。
 
-v0.2.0 根包使用 `UNIDBv02` 文件格式，打开 v0.1.0 数据库会报错。
+> v0.2.0 使用 `UNIDBv02` 文件格式；打开 v0.1.0 数据库会返回错误。
 
 ## 快速上手
 
@@ -67,11 +67,9 @@ _ = reg.Put("theme", []byte("dark"))
 client.Reclaim()
 ```
 
-## 可选事件历史
+## 可选事件日志（`strata/eventlog`）
 
-按需导入 `github.com/UruhaLushia/strata/eventlog`，在本地保留有界的结构化事件历史。根包与 `eventlog` 双向零依赖，未导入时不产生额外开销；同样通过 `Options.Codec` 支持可选压缩（默认不压缩、无常驻块目录）。
-
-`Open` 返回 `(*eventlog.Log, error)`。`Append`、`Flush()`、`Sync()` 和 `Close()` 均返回 `error`。`Scan` 按追加顺序倒序扫描，限制扫描范围并返回 `(eventlog.ScanResult, error)`。
+按需导入 `github.com/UruhaLushia/strata/eventlog` 以保留独立的本地有界结构化事件历史。它与根包双向零依赖，默认不压缩且无常驻块目录，可通过 `Options.Codec` 按需启用压缩。
 
 ```go
 log, err := eventlog.Open("events", eventlog.Options{})
@@ -98,18 +96,16 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 
 ## 基准测试
 
-90 天网关数据集：**1,060,830 行**、7 维标签 + 4 指标（`OpSum/OpMin/OpMax/OpLast`）、**22,406 个封存块**（`1m`/`1h`/`1d`）+ 2,000 KV。环境：Linux amd64（`Intel i5-9300H`，Go 1.27，除注明外为 `mmap=false`）。
+90 天网关数据集：**1,060,830 行**、7 维标签 + 4 指标、**22,406 个封存块**（`1m`/`1h`/`1d`）+ 2,000 KV。环境：Linux amd64（`Intel i5-9300H`，Go 1.27；`go.mod` 要求 Go 1.26+；除注明外为 `mmap=false`）。
 
-### 文件体积与常驻内存
+### 体积、内存与查询延迟（`codec/zstd`，`zstd.Fastest`）
 
 | 数据集 | `.db` 大小 | 打开态 `HeapAlloc` | `Reclaim` 后 `RssAnon`（`mmap=true`） | 增量 `Compact` |
 |---|---:|---:|---:|---:|
-| 常规网关（5K 域名、2K IP） | 10.06 MiB | 2.20 MiB | 13.48 MiB | 172–176 ms |
-| 极端高基数（106 万唯一 IPv6） | 26.36 MiB | 2.31 MiB | 14.42 MiB | 446–462 ms |
+| 常规网关（5K 域名、2K IP） | 10.1 MiB | 2.20 MiB | 13.48 MiB | 172–176 ms |
+| 极端高基数（106 万唯一 IPv6） | 26.4 MiB | 2.31 MiB | 14.42 MiB | 446–462 ms |
 
-### 查询延迟与分配（`codec/zstd`，`zstd.Fastest`）
-
-| 基准项 | 常规网关 | 极端高基数（106 万 IPv6） |
+| 基准项（`BenchmarkGateway90*`） | 常规网关 | 极端高基数（106 万 IPv6） |
 |---|---:|---:|
 | `SummaryOnly`（90 天零盘读） | 36.9 µs / 881 B / 7 allocs | 36.9 µs / 881 B / 7 allocs |
 | `ReadLast15mPage200` | 41.3 µs / 8.6 KiB / 13 allocs | 68.4 µs / 15.5 KiB / 214 allocs |
@@ -125,30 +121,24 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 | `AggregateDomain`（5K 域名） | 5.47 ms / 1.13 MiB / 72 allocs | — |
 | `ExtremeDestIPTopK`（106 万 IPv6 精确 Top-50） | — | 38.30 ms / 2.41 MiB / 218 allocs |
 
-### 压缩算法基准对照
+8 并发重查询饱和压测下（`mmap=true`），`SummaryOnly` 稳定在 `p99 <= 183 µs`，有界小页 `Read` 稳定在 `p99 <= 424 µs`（`MemoryConstrained` 下 `<= 303 µs`）。
 
-同一 90 天 106 万行数据集（`BenchmarkGateway90CodecLatency`，`mmap=false`，各组合均按对应算法真实写入并压实）：
+### 压缩算法对照
 
-| 压缩算法 | `.db` 大小（常规 / 极端） | 常规 `15m` / `24h` 命中 | `Read15m` 命中 | `Scan90d` 密集 / 全扫 | `AggregateTopK` | 极端 `15m` 命中 / `Scan90d` 密集 |
-|---|---:|---:|---:|---:|---:|---:|
-| `None`（默认） | 27.3 MiB / 73.6 MiB | **37.9 µs** / **263.6 µs** | **40.1 µs** | **5.51 ms** / **4.83 ms** | 3.82 ms | **41.9 µs** / **9.34 ms** |
-| `codec/s2`（`Default`） | 11.5 MiB / 37.1 MiB | 47.5 µs / 304.7 µs | 49.7 µs | 7.76 ms / 7.07 ms | **3.66 ms** | 56.1 µs / 11.31 ms |
-| `codec/zstd`（`Fastest`） | 10.1 MiB / 26.4 MiB | 86.6 µs / 563.2 µs | 86.6 µs | 9.16 ms / 8.50 ms | 4.56 ms | 69.1 µs / 13.24 ms |
-| `codec/flate`（`BestSpeed`） | **9.68 MiB** / **25.0 MiB** | 276.3 µs / 1.18 ms | 281.3 µs | 17.82 ms / 17.01 ms | 7.36 ms | 141.4 µs / 20.69 ms |
+同一 90 天 106 万行数据集按各算法独立写入压实的对比（`BenchmarkGateway90CodecLatency`；二进制体积为 `CGO_ENABLED=0 -trimpath -ldflags="-s -w"` 且含 `OpenClient` + `Compact`）：
 
-### 编译体积与 `eventlog` 吞吐
+| 压缩算法 | 二进制体积 | `.db` 大小（常规 / 极端） | 常规 `15m` / `24h` 命中 | `Scan90d` 密集（常规 / 极端） | `AggregateTopK` |
+|---|---:|---:|---:|---:|---:|
+| `None`（默认） | **2.14 MiB** | 27.3 / 73.6 MiB | **37.9 µs** / **263.6 µs** | **5.51 ms** / **9.34 ms** | 3.82 ms |
+| `codec/s2`（`Default`） | 2.75 MiB | 11.5 / 37.1 MiB | 47.5 µs / 304.7 µs | 7.76 ms / 11.31 ms | **3.66 ms** |
+| `codec/zstd`（`Fastest`） | 3.09 MiB | 10.1 / 26.4 MiB | 86.6 µs / 563.2 µs | 9.16 ms / 13.24 ms | 4.56 ms |
+| `codec/flate`（`BestSpeed`） | 2.44 MiB | **9.68 / 25.0 MiB** | 276.3 µs / 1.18 ms | 17.82 ms / 20.69 ms | 7.36 ms |
 
-纯 Go 裁剪编译体积（`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`，根包测试含 `OpenClient` + `Compact`）：
+四种算法下常规冷键未命中均稳定在 `1.65–1.76 µs`，`Scan90d/TimeFirst` 排序一致（`4.83 / 7.07 / 8.50 / 17.01 ms`）。因本表各行在独立压实轮次下测得，与上方完整 `BenchmarkGateway90Day` 基准存在正常轮次波动。
 
-| 编译组合 | 二进制大小 | 相对 `zstd` 缩减 |
-|---|---:|---:|
-| `strata`（`None`，默认） | 2.14 MiB | -976 KiB |
-| `strata` + `codec/flate`（标准库） | 2.44 MiB | -672 KiB |
-| `strata` + `codec/s2` | 2.75 MiB | -356 KiB |
-| `strata` + `codec/zstd` | 3.09 MiB | — |
-| 单用 `eventlog`（`None`） | 1.50 MiB | -1.59 MiB |
+### 事件日志（`BenchmarkEventlogCodecs`）
 
-`eventlog` 四算法对照（`BenchmarkEventlogCodecs`，69B 结构化 JSON 载荷，等价 4 MiB 原始数据，每帧 20 条）：
+69B 结构化 JSON 载荷（等价 4 MiB 原始数据，每帧 20 条；单用 `eventlog` 无压缩裁剪二进制体积为 `1.50 MiB`）：
 
 | 压缩算法 | 盘上体积 | `AppendFlush`（256 条批） | `Scan` 近 200 条 | `Scan` 全量 |
 |---|---:|---:|---:|---:|
@@ -156,8 +146,6 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 | `codec/s2`（`Default`） | 1.13 MiB | 71.2 ns/event（970 MB/s，0 allocs） | 21.9 µs（297 B / 5 allocs） | 2.53 ms |
 | `codec/zstd`（`Fastest`） | **582 KiB** | 243.6 ns/event（283 MB/s，0 allocs） | 57.1 µs（302 B / 5 allocs） | 11.15 ms |
 | `codec/flate`（`BestSpeed`） | 805 KiB | 303.9 ns/event（227 MB/s，1 alloc） | 87.1 µs（544 B / 15 allocs） | 17.90 ms |
-
-8 并发重查询饱和压测下（`mmap=true`），`SummaryOnly` 稳定在 `p99 <= 183 µs`，有界小页 `Read` 稳定在 `p99 <= 424 µs`（`MemoryConstrained` 下 `<= 303 µs`）。
 
 ## 运行测试
 

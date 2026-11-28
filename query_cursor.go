@@ -224,7 +224,8 @@ func (c *blockCursor) candidateCoversUntil(from, to int64) bool {
 
 func (c *blockCursor) nextCandidate(cursor int64) int64 {
 	var sealedNext int64
-	if c.src.candIdx != nil {
+	switch {
+	case c.src.candIdx != nil:
 		c.advanceCand(cursor)
 		for i := c.ci; i < len(c.src.candIdx); i++ {
 			if s := c.src.sealed[c.src.candIdx[i]].start; s > cursor {
@@ -232,7 +233,7 @@ func (c *blockCursor) nextCandidate(cursor int64) int64 {
 				break
 			}
 		}
-	} else if c.src.candBits == nil {
+	case c.src.candBits == nil:
 		c.advanceIdx(cursor)
 		for i := c.si; i < len(c.src.idx); i++ {
 			b := &c.src.sealed[c.src.idx[i]]
@@ -241,7 +242,7 @@ func (c *blockCursor) nextCandidate(cursor int64) int64 {
 				break
 			}
 		}
-	} else {
+	default:
 		c.advanceIdx(cursor)
 		if c.nextCandPos < c.si {
 			c.nextCandPos = c.si

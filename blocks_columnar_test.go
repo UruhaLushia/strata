@@ -37,12 +37,12 @@ func TestColumnarBlockRoundTripModes(t *testing.T) {
 		}
 		for level := zstd.Fastest; level <= zstd.Best; level++ {
 			raw, err := encodeBlockLevel(want, level)
-			mustTestOK(t, err)
+			requireOK(t, err)
 			if isStreamBlock(raw) != (len(rows) >= 256) {
 				t.Fatalf("unexpected block envelope for %d rows", len(rows))
 			}
 			got, err := decodeBlock(raw, codec.IDZstd, codecs)
-			mustTestOK(t, err)
+			requireOK(t, err)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("round trip changed %d-row block at compression level %d", len(rows), level)
 			}
@@ -56,16 +56,16 @@ func TestAggregateMixedSmallAndStreamBlocks(t *testing.T) {
 	defer db.Close()
 	base := now.Add(-2 * time.Minute)
 	first, last := [4]int64{3, 9, 2, 7}, [4]int64{4, 1, 8, 2}
-	mustTestOK(t, s.Append(base, Summary{Values: first}, Row{Tags: []string{"shared", "x"}, Values: first}))
+	requireOK(t, s.Append(base, Summary{Values: first}, Row{Tags: []string{"shared", "x"}, Values: first}))
 	rows := make([]Row, 300)
 	rows[0] = Row{Tags: []string{"shared", "x"}, Values: last}
 	for i := 1; i < len(rows); i++ {
 		rows[i] = Row{Tags: []string{"large-" + strconv.Itoa(i), "x"}, Values: [4]int64{1}}
 	}
-	mustTestOK(t, s.Append(base.Add(time.Minute), Summary{Values: last}, rows...))
-	mustTestOK(t, db.Compact())
+	requireOK(t, s.Append(base.Add(time.Minute), Summary{Values: last}, rows...))
+	requireOK(t, db.Compact())
 	res, err := s.Aggregate(t.Context(), AggregateQuery{From: base, To: now, GroupDims: []int{0}, PreferFine: true})
-	mustTestOK(t, err)
+	requireOK(t, err)
 	defer res.Release()
 	want := GroupRow{Tag: "shared", Summary: Summary{Values: [4]int64{7, 1, 8, 2}, Mask: 0x0f}}
 	if len(res.Groups) != 1 || len(res.Groups[0]) != len(rows) || !slices.Contains(res.Groups[0], want) {
@@ -80,9 +80,9 @@ func TestColumnarFilterPushdownAndAdaptiveSelection(t *testing.T) {
 		rows[i] = idRow{tags: [8]uint32{uint32(i/2 + 1), uint32(i%10 + 1), 1, uint32(i%2 + 1)}, initMask: 1}
 	}
 	raw, err := encodeBlockLevel(sealedBlock{rows: rows}, zstd.Fastest)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	view, err := parseColumnarBlock(raw, codec.IDZstd)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	slot := &querySlot{codecs: codecs}
 	defer slot.close()
 	eq := func(dim int, id uint32) compiledFilter {
@@ -102,7 +102,7 @@ func TestColumnarFilterPushdownAndAdaptiveSelection(t *testing.T) {
 		{"full match", []compiledFilter{{dim: 3, ids: []uint32{1, 2}, small: [8]uint32{1, 2}, smallLen: 2}}, selRange, 600},
 	} {
 		sel, err := filterStreamView(view, tc.filters, true, slot)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		if sel.count() != tc.count || sel.mode != tc.mode {
 			t.Fatalf("%s selection mode=%d count=%d", tc.name, sel.mode, sel.count())
 		}
@@ -186,14 +186,14 @@ func TestColumnarCacheRawAccountingAndArenaGrowth(t *testing.T) {
 	const rows, mask = 256, 3
 	factory := zstd.New(zstd.Fastest)
 	enc, err := factory.NewEncoder(64 << 10)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	defer enc.Close()
 	raw, values := make([]byte, rows), make([]byte, rows)
 	for i := range raw {
 		raw[i], values[i] = byte(i), byte(i%7+1)
 	}
 	packed, err := enc.Encode(nil, values)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	view := columnarBlockView{count: rows, codecID: codec.IDZstd, plain: append(raw, packed...)}
 	view.descs[0] = columnStreamDesc{mode: modeU8, width: 1, flags: streamFlagRaw, length: rows, rawLen: rows}
 	view.descs[1] = columnStreamDesc{mode: modeU8, width: 1, offset: rows, length: uint32(len(packed)), rawLen: rows}
@@ -203,7 +203,7 @@ func TestColumnarCacheRawAccountingAndArenaGrowth(t *testing.T) {
 	if streamRowBytes(view, mask) != 1 || cache.uncachedRowBytes(mask) != 1 || cache.packRowBytes(mask, false) != 2 {
 		t.Fatal("raw stream must be charged for gathering only")
 	}
-	mustTestOK(t, cache.loadAll(mask))
+	requireOK(t, cache.loadAll(mask))
 	if cache.arenaUsed != rows || cache.cachedOffs[0] != -1 || cache.cachedOffs[1] != 0 {
 		t.Fatalf("cached offsets = %v, arenaUsed = %d", cache.cachedOffs, cache.arenaUsed)
 	}
@@ -229,7 +229,7 @@ func TestColumnarCacheRawAccountingAndArenaGrowth(t *testing.T) {
 		}
 	}
 	cols, err := cache.packChunk(mask, false, 0, []int32{13, 2}, 2)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	if !slices.Equal(cols[0].data, []byte{raw[13], raw[2]}) || !slices.Equal(cols[1].data, []byte{values[13], values[2]}) {
 		t.Fatal("gathered columns lost row order")
 	}
@@ -253,7 +253,7 @@ func TestAppendPageConstantTags(t *testing.T) {
 	}
 	cols[12] = decodedCol{mode: modeConst, val: 1}
 	page := PageResult{Rows: make([]PageRow, 0, 2), tagBuf: make([]string, 0, 4)}
-	mustTestOK(t, appendPageFromCols(&cols, SegmentMeta{}, d, series, 2, false, 0, []int32{1, 3}, 2, &page))
+	requireOK(t, appendPageFromCols(&cols, SegmentMeta{}, d, series, 2, false, 0, []int32{1, 3}, 2, &page))
 	for i, row := range page.Rows {
 		if !slices.Equal(row.Tags, []string{"", "fixed"}) || row.Values[0] != int64(20+i*20) || row.Mask != 1 {
 			t.Fatalf("row %d = %+v", i, row)
@@ -273,7 +273,7 @@ func TestAppendPageConstantTags(t *testing.T) {
 		tailBase: 8, ext: &dictExtDim{baseNextID: 8, fwdPages: []dictPageDesc{{length: 1}}},
 	}
 	page.Rows, page.tagBuf = page.Rows[:0], page.tagBuf[:0]
-	mustTestOK(t, appendPageFromCols(&cols, SegmentMeta{}, d, series, 2, true, 0, nil, 0, &page))
+	requireOK(t, appendPageFromCols(&cols, SegmentMeta{}, d, series, 2, true, 0, nil, 0, &page))
 	if err := appendPageFromCols(&cols, SegmentMeta{}, d, series, 2, true, 0, nil, 1, &page); err == nil {
 		t.Fatal("constant tag resolution swallowed an unreadable dictionary page")
 	}
@@ -325,7 +325,7 @@ func TestSoAScanBatchAndColCacheSelectivityFallback(t *testing.T) {
 	}
 	view.descs[12] = columnStreamDesc{mode: modeConst, value: 0x0f}
 	const colMask = 3 | 0x1f<<8
-	slot := newQuerySlot()
+	slot := &querySlot{}
 	defer slot.close()
 	for _, count := range []int{2499, 2500} {
 		cache := newBlockColCache(view, colMask, 1, 512<<10, slot)
@@ -356,12 +356,12 @@ func TestSoAScanBatchAndColCacheSelectivityFallback(t *testing.T) {
 			rows[i] = row
 			mergeSummary(&sum, Summary{Values: row.Values, Mask: row.Mask}, ops, uint64(i+1), uint64(i))
 		}
-		mustTestOK(t, s.Append(now.Add(time.Duration(minute-5)*time.Minute), sum, rows...))
+		requireOK(t, s.Append(now.Add(time.Duration(minute-5)*time.Minute), sum, rows...))
 		if minute == 1 {
-			mustTestOK(t, db.Compact())
+			requireOK(t, db.Compact())
 		}
 	}
-	mustTestOK(t, db.Close())
+	requireOK(t, db.Close())
 
 	run := func(opts Options, filters []Filter) (Summary, []GroupRow, []Row) {
 		opts.Now, opts.ReadOnly = db.opts.Now, true
@@ -370,10 +370,10 @@ func TestSoAScanBatchAndColCacheSelectivityFallback(t *testing.T) {
 		s := mustSeries(t, reader, 1, cfg)
 		q := AggregateQuery{AllTime: true, Filters: filters, GroupDims: []int{0}}
 		agg, err := s.Aggregate(t.Context(), q)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		defer agg.Release()
 		var rows []Row
-		mustTestOK(t, s.Scan(t.Context(), ScanQuery{
+		requireOK(t, s.Scan(t.Context(), ScanQuery{
 			AllTime: true, Filters: filters, BatchSize: 128, ProjectDims: 0x05, ProjectMetrics: 0x0a,
 		}, func(b ScanBatch) error {
 			for i := range b.Len() {
@@ -425,8 +425,8 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 			Values: [4]int64{int64(1 + i%97 + int(next()%19)), int64(1000 - i), int64(2000 + i), int64(next())},
 		}
 	}
-	mustTestOK(t, s.AppendSync(ts, Summary{}, rows...))
-	mustTestOK(t, db.Compact())
+	requireOK(t, s.AppendSync(ts, Summary{}, rows...))
+	requireOK(t, db.Compact())
 	db = reopenTestDB(t, db, db.path, db.opts)
 	s = mustSeries(t, db, s.id, s.cfg)
 	i := slices.IndexFunc(db.sealed, func(m sealedMeta) bool {
@@ -437,13 +437,13 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 	}
 	m := db.sealed[i]
 	raw, err := sectionBlock(db.data, db.head.sections[secTSBlocks], m.offset, m.length, nil)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	view, err := parseColumnarBlock(raw, codec.IDZstd)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	if !view.unsorted {
 		t.Fatal("raw dim 0 lost its unsorted flag")
 	}
-	slot := newQuerySlot()
+	slot := &querySlot{}
 	defer slot.close()
 	for _, idx := range []int{0, 1, 11} {
 		d := view.descs[idx]
@@ -451,13 +451,13 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 			t.Fatalf("stream %d did not store raw bytes: %+v", idx, d)
 		}
 		col, err := decodeStreamColInto(view, idx, slot)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		if len(col.data) == 0 || &col.data[0] != &view.plain[d.offset] {
 			t.Fatalf("stream %d copied its payload", idx)
 		}
 	}
 	decoded, err := decodeBlock(raw, codec.IDZstd, db.codecs)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	const target = 271
 	if len(decoded.rows) != len(rows) || decoded.rows[target].values != rows[target].Values {
 		t.Fatal("raw block round trip changed rows or order")
@@ -478,7 +478,7 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 	want := rows[target]
 	filters := []Filter{{Dim: 0, Op: TagEq, Values: want.Tags[:1]}, {Dim: 1, Op: TagEq, Values: want.Tags[1:]}}
 	result, err := s.Aggregate(t.Context(), AggregateQuery{From: ts, To: ts.Add(time.Minute), Filters: filters, PreferFine: true})
-	mustTestOK(t, err)
+	requireOK(t, err)
 	defer result.Release()
 	if result.Summary.Values != want.Values {
 		t.Fatalf("unsorted raw lookup=%v want=%v", result.Summary.Values, want.Values)
@@ -501,7 +501,7 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 		}()
 		for i, want := range wantRows {
 			page, err := s.Read(ctx, q)
-			mustTestOK(t, err)
+			requireOK(t, err)
 			defer page.Release()
 			if len(page.Rows) != 1 || page.HasMore != (i == 0) || page.NextCursor.IsZero() != (i == 1) ||
 				page.Rows[0].Values != want.Values || !slices.Equal(page.Rows[0].Tags, want.Tags) {
@@ -511,7 +511,7 @@ func TestColumnarStreamsRawFallback(t *testing.T) {
 		}
 	}()
 	var scanned []Row
-	mustTestOK(t, s.Scan(t.Context(), ScanQuery{From: q.From, To: q.To, Filters: q.Filters, PreferFine: true}, func(b ScanBatch) error {
+	requireOK(t, s.Scan(t.Context(), ScanQuery{From: q.From, To: q.To, Filters: q.Filters, PreferFine: true}, func(b ScanBatch) error {
 		for i := range b.Len() {
 			scanned = append(scanned, b.CloneRow(i))
 		}

@@ -2,19 +2,19 @@
 
 English | [简体中文](README_zh.md)
 
-An **ultralight, memory-bounded storage engine** in pure Go (`CGO_ENABLED=0`).
+An ultralight, memory-bounded storage engine in pure Go (`CGO_ENABLED=0`).
 
-## Scope
+## Overview
 
-The root package stores fixed-schema time series and transactional key-value data in one file, with a small footprint, bounded memory, and tag filters pushed down into queries.
+Strata stores fixed-schema time series and transactional key-value data in a single file, built for small footprints, bounded memory, and pushdown tag queries.
 
-- **Fixed schema**: Up to 8 string tag dimensions (`Arity: 1..8`) + 4 `int64` metrics (`OpSum`, `OpMin`, `OpMax`, `OpLast`) per series.
-- **Built-in rollups**: Automatic `1m` / `1h` / `1d` downsampling with per-tier retention and local-hour rollup (`RollupLocalHours`).
-- **Tag search**: Columnar `STR2` blocks, 5-mode adaptive inverted indexes, hybrid inline/disk-paged dictionaries, pushdown filters (`TagEq`, `TagPrefix`, `TagSuffix`, `TagContains`, `TagCIDR`), and a 1-slot bounded light-read lane for recent small pages.
-- **Co-located KV**: Pure-byte transactional KV regions (`Region`, `Batch`, `Scan`, `ScanSeq`) with TTL, CAS, and lock-free streaming scans inside the same file.
-- **Memory-first & pluggable compression**: `MemoryBalanced` / `MemoryConstrained` profiles, pointer-free (`noscan`) indexes, explicit `Client.Reclaim()` (`MADV_DONTNEED` on Unix), and pluggable compression via `strata/codec` (uncompressed by default with zero external compression dependencies; opt-in `codec/zstd`, `codec/s2`, `codec/flate`, or custom codecs).
+- **Fixed-schema time series**: Up to 8 string tag dimensions (`Arity: 1..8`) and 4 `int64` metrics (`OpSum`, `OpMin`, `OpMax`, `OpLast`), with automatic `1m` / `1h` / `1d` rollups, per-tier retention, and local-hour grouping (`RollupLocalHours`).
+- **Pushdown tag search**: Columnar `STR2` blocks, adaptive inverted indexes, hybrid inline/paged dictionaries, `TagEq` / `TagPrefix` / `TagSuffix` / `TagContains` / `TagCIDR` filters, and a 1-slot light-read lane for recent small pages.
+- **Co-located transactional KV**: Byte-oriented KV regions (`Region`, `Batch`, `Scan`, `ScanSeq`) with TTL, CAS, and lock-free streaming scans inside the same file.
+- **Memory-first execution**: `MemoryBalanced` / `MemoryConstrained` profiles, pointer-free (`noscan`) indexes, and explicit `Client.Reclaim()` (`MADV_DONTNEED` on Unix).
+- **Pluggable compression & optional event log**: Uncompressed by default via `strata/codec` (opt-in `codec/s2`, `codec/zstd`, `codec/flate`, or custom codecs) and a decoupled `strata/eventlog` subpackage. Importing only `strata` or `eventlog` links no external compression library.
 
-The v0.2.0 root package uses the `UNIDBv02` file format. Opening a v0.1.0 database returns an error.
+> v0.2.0 uses the `UNIDBv02` file format; opening a v0.1.0 database returns an error.
 
 ## Quick Start
 
@@ -67,11 +67,9 @@ _ = reg.Put("theme", []byte("dark"))
 client.Reclaim()
 ```
 
-## Optional event history
+## Optional Event Log (`strata/eventlog`)
 
-Import `github.com/UruhaLushia/strata/eventlog` to keep a bounded local history of structured events. The root package and `eventlog` do not import each other, so omitting `eventlog` adds zero overhead. Compression is optional via `Options.Codec` (default uncompressed, zero resident block directory).
-
-`Open` returns `(*eventlog.Log, error)`. `Append`, `Flush()`, `Sync()`, and `Close()` each return `error`. `Scan` visits a bounded set of records in reverse append order and returns `(eventlog.ScanResult, error)`.
+Import `github.com/UruhaLushia/strata/eventlog` for a standalone, bounded local history of structured events. It shares no imports with the root package, defaults to uncompressed storage with no resident block directory, and supports optional compression via `Options.Codec`.
 
 ```go
 log, err := eventlog.Open("events", eventlog.Options{})
@@ -98,18 +96,16 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 
 ## Benchmarks
 
-90-day gateway dataset: **1,060,830 rows**, 7 tag dims + 4 metrics (`OpSum/OpMin/OpMax/OpLast`), **22,406 sealed blocks** (`1m`/`1h`/`1d`) + 2,000 KV entries on Linux amd64 (`Intel i5-9300H`, Go 1.27, `mmap=false` unless noted).
+90-day gateway dataset: **1,060,830 rows**, 7 tag dims + 4 metrics, **22,406 sealed blocks** (`1m`/`1h`/`1d`) + 2,000 KV entries on Linux amd64 (`Intel i5-9300H`, Go 1.27; `go.mod` requires Go 1.26+; `mmap=false` unless noted).
 
-### Footprint & Idle Memory
+### Footprint & Query Latency (`codec/zstd`, `zstd.Fastest`)
 
 | Dataset | `.db` Size | Open `HeapAlloc` | Post-Reclaim `RssAnon` (`mmap=true`) | Incremental `Compact` |
 |---|---:|---:|---:|---:|
-| Realistic (5K domains, 2K IPs) | 10.06 MiB | 2.20 MiB | 13.48 MiB | 172–176 ms |
-| Extreme (1.06M unique IPv6) | 26.36 MiB | 2.31 MiB | 14.42 MiB | 446–462 ms |
+| Realistic (5K domains, 2K IPs) | 10.1 MiB | 2.20 MiB | 13.48 MiB | 172–176 ms |
+| Extreme (1.06M unique IPv6) | 26.4 MiB | 2.31 MiB | 14.42 MiB | 446–462 ms |
 
-### Query Latency & Allocations (`codec/zstd`, `zstd.Fastest`)
-
-| Benchmark | Realistic | Extreme (1.06M IPv6) |
+| Benchmark (`BenchmarkGateway90*`) | Realistic | Extreme (1.06M IPv6) |
 |---|---:|---:|
 | `SummaryOnly` (90d zero-disk) | 36.9 µs / 881 B / 7 allocs | 36.9 µs / 881 B / 7 allocs |
 | `ReadLast15mPage200` | 41.3 µs / 8.6 KiB / 13 allocs | 68.4 µs / 15.5 KiB / 214 allocs |
@@ -125,30 +121,24 @@ if _, err := log.Scan(context.Background(), eventlog.ScanOptions{MaxRecords: 10}
 | `AggregateDomain` (5K domains) | 5.47 ms / 1.13 MiB / 72 allocs | — |
 | `ExtremeDestIPTopK` (1.06M IPv6 exact Top-50) | — | 38.30 ms / 2.41 MiB / 218 allocs |
 
-### Compression Codec Comparison
+Under 8-way mixed concurrency saturation (`mmap=true`), `SummaryOnly` holds `p99 <= 183 µs` and bounded small-page `Read` holds `p99 <= 424 µs` (`<= 303 µs` under `MemoryConstrained`).
 
-Same 90-day 1.06M-row dataset (`BenchmarkGateway90CodecLatency`, `mmap=false`, each database written and compacted with its own codec):
+### Compression Codecs
 
-| Codec | `.db` Size (Domain / Extreme) | Domain `15m` / `24h` Hit | `Read15m` Hit | `Scan90d` Dense / TimeFirst | `AggregateTopK` | Extreme `15m` Hit / `Scan90d` Dense |
-|---|---:|---:|---:|---:|---:|---:|
-| `None` (default) | 27.3 MiB / 73.6 MiB | **37.9 µs** / **263.6 µs** | **40.1 µs** | **5.51 ms** / **4.83 ms** | 3.82 ms | **41.9 µs** / **9.34 ms** |
-| `codec/s2` (`Default`) | 11.5 MiB / 37.1 MiB | 47.5 µs / 304.7 µs | 49.7 µs | 7.76 ms / 7.07 ms | **3.66 ms** | 56.1 µs / 11.31 ms |
-| `codec/zstd` (`Fastest`) | 10.1 MiB / 26.4 MiB | 86.6 µs / 563.2 µs | 86.6 µs | 9.16 ms / 8.50 ms | 4.56 ms | 69.1 µs / 13.24 ms |
-| `codec/flate` (`BestSpeed`) | **9.68 MiB** / **25.0 MiB** | 276.3 µs / 1.18 ms | 281.3 µs | 17.82 ms / 17.01 ms | 7.36 ms | 141.4 µs / 20.69 ms |
+Standalone per-codec comparison on the same 90-day 1.06M-row dataset (`BenchmarkGateway90CodecLatency`; binary sizes are stripped `CGO_ENABLED=0` builds with `OpenClient` + `Compact`):
 
-### Binary Size & `eventlog` Throughput
+| Codec | Binary | `.db` Size (Realistic / Extreme) | Domain `15m` / `24h` Hit | `Scan90d` Dense (Realistic / Extreme) | `AggregateTopK` |
+|---|---:|---:|---:|---:|---:|
+| `None` (default) | **2.14 MiB** | 27.3 / 73.6 MiB | **37.9 µs** / **263.6 µs** | **5.51 ms** / **9.34 ms** | 3.82 ms |
+| `codec/s2` (`Default`) | 2.75 MiB | 11.5 / 37.1 MiB | 47.5 µs / 304.7 µs | 7.76 ms / 11.31 ms | **3.66 ms** |
+| `codec/zstd` (`Fastest`) | 3.09 MiB | 10.1 / 26.4 MiB | 86.6 µs / 563.2 µs | 9.16 ms / 13.24 ms | 4.56 ms |
+| `codec/flate` (`BestSpeed`) | 2.44 MiB | **9.68 / 25.0 MiB** | 276.3 µs / 1.18 ms | 17.82 ms / 20.69 ms | 7.36 ms |
 
-Stripped `CGO_ENABLED=0` binary size (`-trimpath -ldflags="-s -w"`, root builds include `OpenClient` + `Compact`):
+Cold-key miss stays at `1.65–1.76 µs` across all four codecs; `Scan90d/TimeFirst` follows the same ordering (`4.83 / 7.07 / 8.50 / 17.01 ms`). Values differ slightly from the full `BenchmarkGateway90Day` table above because each codec row runs against its own freshly compacted database in a separate pass.
 
-| Build | Binary Size | Savings vs `zstd` |
-|---|---:|---:|
-| `strata` (`None`, default) | 2.14 MiB | -976 KiB |
-| `strata` + `codec/flate` (stdlib) | 2.44 MiB | -672 KiB |
-| `strata` + `codec/s2` | 2.75 MiB | -356 KiB |
-| `strata` + `codec/zstd` | 3.09 MiB | — |
-| `eventlog` standalone (`None`) | 1.50 MiB | -1.59 MiB |
+### Event Log (`BenchmarkEventlogCodecs`)
 
-`eventlog` across codecs (`BenchmarkEventlogCodecs`, structured 69B JSON payloads, 4 MiB raw equivalent, 20 records/frame):
+Structured 69B JSON payloads (4 MiB raw equivalent, 20 records/frame; standalone `eventlog` binary with `None` is `1.50 MiB`):
 
 | Codec | Disk Size | `AppendFlush` (256-rec batch) | `Scan` Recent 200 | `Scan` All |
 |---|---:|---:|---:|---:|
@@ -156,8 +146,6 @@ Stripped `CGO_ENABLED=0` binary size (`-trimpath -ldflags="-s -w"`, root builds 
 | `codec/s2` (`Default`) | 1.13 MiB | 71.2 ns/event (970 MB/s, 0 allocs) | 21.9 µs (297 B / 5 allocs) | 2.53 ms |
 | `codec/zstd` (`Fastest`) | **582 KiB** | 243.6 ns/event (283 MB/s, 0 allocs) | 57.1 µs (302 B / 5 allocs) | 11.15 ms |
 | `codec/flate` (`BestSpeed`) | 805 KiB | 303.9 ns/event (227 MB/s, 1 alloc) | 87.1 µs (544 B / 15 allocs) | 17.90 ms |
-
-Under 8-way mixed concurrency saturation (`mmap=true`), `SummaryOnly` stays at `p99 <= 183 µs` and bounded small-page `Read` stays at `p99 <= 424 µs` (`<= 303 µs` under `MemoryConstrained`).
 
 ## Testing
 

@@ -43,7 +43,7 @@ func TestInvertVarintValidation(t *testing.T) {
 	plain = invertTestRecord(plain, 3, invertModeDeltaVarint, 3, 7, 2, 128)
 	plain = invertTestRecord(plain, 4, invertModeRLE, 2, 4, 2, 3, 1)
 	var got []uint32
-	mustTestOK(t, decodeInvertChunkSorted(plain, 0, []uint32{3, 4}, func(_ uint64, id uint32) {
+	requireOK(t, decodeInvertChunkSorted(plain, 0, []uint32{3, 4}, func(_ uint64, id uint32) {
 		got = append(got, id)
 	}, nil))
 	if !slices.Equal(got, []uint32{7, 9, 137, 4, 5, 9}) {

@@ -11,6 +11,10 @@ func (db *DB) autoCompact() {
 		return
 	}
 	metas, err := scanWALFrameMetas(db.data, int64(db.head.walOffset), db.walPos)
+	if err != nil {
+		db.mu.RUnlock()
+		return
+	}
 	nowSec := db.opts.Now().Unix()
 	var size int64
 	resetReady := false
@@ -36,19 +40,17 @@ func (db *DB) autoCompact() {
 			}
 		}
 	}
-	if err == nil {
-		_, _, _, sealedSeq, _, _ := computeCompactWatermarks(metas, db.head, db.appendSeq, nowSec)
-		for _, m := range metas {
-			if m.seq <= db.head.sealedWalSeq {
-				continue
-			}
-			if m.seq > sealedSeq {
-				break
-			}
-			size += frameHeader + int64(m.length)
-			if m.typ == frameReset {
-				resetReady = true
-			}
+	_, _, _, sealedSeq, _, _ := computeCompactWatermarks(metas, db.head, db.appendSeq, nowSec)
+	for _, m := range metas {
+		if m.seq <= db.head.sealedWalSeq {
+			continue
+		}
+		if m.seq > sealedSeq {
+			break
+		}
+		size += frameHeader + int64(m.length)
+		if m.typ == frameReset {
+			resetReady = true
 		}
 	}
 	db.mu.RUnlock()

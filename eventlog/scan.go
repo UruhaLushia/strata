@@ -20,7 +20,7 @@ type ScanResult struct {
 	BytesRead    int64 // Whole frame bytes read, including headers and trailers.
 	Stopped      bool
 	LimitReached bool
-	Truncated    bool
+	Truncated    bool // Stopped early because older shards were evicted past retention limits during Scan.
 }
 
 const scanWindowBytes = 64 << 10
@@ -117,8 +117,7 @@ func (l *Log) Scan(ctx context.Context, opts ScanOptions, fn func(Record) error)
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		if opts.MaxRecords > 0 && result.Records == opts.MaxRecords ||
-			opts.MaxBytes > 0 && opts.MaxBytes-result.BytesRead < minStoredFrameSize {
+		if scanLimitReached(opts, result) {
 			result.LimitReached = true
 			return result, nil
 		}
@@ -136,6 +135,11 @@ func (l *Log) Scan(ctx context.Context, opts ScanOptions, fn func(Record) error)
 		}
 	}
 	return result, ctx.Err()
+}
+
+func scanLimitReached(opts ScanOptions, r ScanResult) bool {
+	return opts.MaxRecords > 0 && r.Records == opts.MaxRecords ||
+		opts.MaxBytes > 0 && opts.MaxBytes-r.BytesRead < minStoredFrameSize
 }
 
 func (l *Log) published(id uint64) bool {
@@ -166,8 +170,7 @@ func (l *Log) scanShard(ctx context.Context, f *os.File, s shard, opts ScanOptio
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if opts.MaxRecords > 0 && r.Records == opts.MaxRecords ||
-			opts.MaxBytes > 0 && opts.MaxBytes-r.BytesRead < minStoredFrameSize {
+		if scanLimitReached(opts, *r) {
 			r.LimitReached = true
 			return nil
 		}

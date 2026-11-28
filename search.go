@@ -286,7 +286,7 @@ func matchingTagIDsSnap(d dictionary, series uint16, f Filter, slot *querySlot) 
 			}
 		default:
 			var err error
-			ids, err = dimSnap.matchScanIDs(f.Op, value, ids)
+			ids, err = dimSnap.matchScanIDs(f.Op, value, ids, slot)
 			if err != nil {
 				return nil, err
 			}

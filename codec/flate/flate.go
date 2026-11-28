@@ -9,7 +9,7 @@ import (
 	"github.com/UruhaLushia/strata/codec"
 )
 
-// New returns a raw DEFLATE codec using a standard compress/flate level.
+// New returns a raw DEFLATE codec using a compress/flate level; invalid levels fail in NewEncoder with a compress/flate error.
 func New(level int) codec.Codec { return algorithm(level) }
 
 type algorithm int

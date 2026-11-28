@@ -2,7 +2,8 @@ package strata
 
 import (
 	"bytes"
-	"sort"
+	"cmp"
+	"slices"
 )
 
 func (db *DB) kvEntriesLocked(maxRev uint64) (map[string]kvSSTEntry, error) {
@@ -63,8 +64,11 @@ func (db *DB) buildKVBlocks(maxRev uint64) ([]kvSSTBlock, error) {
 	for _, e := range entries {
 		list = append(list, e)
 	}
-	sort.Slice(list, func(i, j int) bool {
-		return bytes.Compare(physicalKVKey(list[i].region, list[i].key), physicalKVKey(list[j].region, list[j].key)) < 0
+	slices.SortFunc(list, func(a, b kvSSTEntry) int {
+		if a.region != b.region {
+			return cmp.Compare(a.region, b.region)
+		}
+		return bytes.Compare(a.key, b.key)
 	})
 	var out []kvSSTBlock
 	for len(list) > 0 {

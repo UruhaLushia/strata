@@ -50,11 +50,13 @@ type MemoryBudget struct {
 }
 
 type Options struct {
-	ReadOnly        bool
-	UseMmap         bool
-	MemoryProfile   MemoryProfile
-	MemoryBudget    MemoryBudget
-	Codec           codec.Codec
+	ReadOnly      bool
+	UseMmap       bool
+	MemoryProfile MemoryProfile
+	MemoryBudget  MemoryBudget
+	// Codec selects compression for newly written sections; nil stores them raw.
+	Codec codec.Codec
+	// Codecs lists additional codecs accepted when reading existing sections.
 	Codecs          []codec.Codec
 	WALCompactBytes int64
 	FlushInterval   time.Duration

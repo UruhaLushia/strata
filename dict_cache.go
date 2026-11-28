@@ -97,8 +97,8 @@ func (c *dictPageCache) clear() {
 	c.mu.Unlock()
 }
 
-// dictHotSlot is a 16-byte pointer-free (noscan) open-addressing slot referencing
-// key bytes stored inside dictHotCache.ring.
+// dictHotSlot is a pointer-free (noscan) open-addressing slot referencing key
+// bytes stored inside dictHotCache.ring.
 type dictHotSlot struct {
 	hash uint64
 	id   uint32

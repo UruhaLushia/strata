@@ -141,31 +141,39 @@ func TestRoundTripAndScanLimits(t *testing.T) {
 
 func TestScanShardSnapshot(t *testing.T) {
 	callbackErr := errors.New("callback failed")
-	for _, n := range []int{4, 5} {
-		l, err := Open(t.TempDir(), Options{MaxRecordBytes: 8, MaxBatchBytes: 64,
-			ShardMaxBytes: fileHeaderSize + minRawFrameSize + 8})
-		check(t, err)
-		defer l.Close()
-		var want []int64
-		for i := 1; i <= n; i++ {
-			put(t, l, int64(i))
-			want = append(want, int64(n-i+1))
-		}
-		if got := timestamps(t, l); len(l.shards) != n || !slices.Equal(got, want) {
-			t.Fatalf("%d shards: got %v in %d shards, want %v", n, got, len(l.shards), want)
-		}
-		for _, cbErr := range []error{ErrStopScan, errors.Join(errors.New("wrapped"), ErrStopScan), callbackErr} {
-			result, err := l.Scan(t.Context(), ScanOptions{}, func(Record) error { return cbErr })
-			stopped := cbErr != callbackErr
-			if stopped {
-				check(t, err)
-			} else {
-				wantError(t, err, callbackErr)
+	for _, tc := range []struct {
+		name string
+		n    int
+	}{
+		{"4Shards", 4},
+		{"5Shards", 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l, err := Open(t.TempDir(), Options{MaxRecordBytes: 8, MaxBatchBytes: 64,
+				ShardMaxBytes: fileHeaderSize + minRawFrameSize + 8})
+			check(t, err)
+			defer l.Close()
+			var want []int64
+			for i := 1; i <= tc.n; i++ {
+				put(t, l, int64(i))
+				want = append(want, int64(tc.n-i+1))
 			}
-			if result.Stopped != stopped || result.Records != 1 || result.LimitReached || result.Truncated {
-				t.Fatalf("%d shards, callback error %v: %+v", n, cbErr, result)
+			if got := timestamps(t, l); len(l.shards) != tc.n || !slices.Equal(got, want) {
+				t.Fatalf("%d shards: got %v in %d shards, want %v", tc.n, got, len(l.shards), want)
 			}
-		}
+			for _, cbErr := range []error{ErrStopScan, errors.Join(errors.New("wrapped"), ErrStopScan), callbackErr} {
+				result, err := l.Scan(t.Context(), ScanOptions{}, func(Record) error { return cbErr })
+				stopped := cbErr != callbackErr
+				if stopped {
+					check(t, err)
+				} else {
+					wantError(t, err, callbackErr)
+				}
+				if result.Stopped != stopped || result.Records != 1 || result.LimitReached || result.Truncated {
+					t.Fatalf("%d shards, callback error %v: %+v", tc.n, cbErr, result)
+				}
+			}
+		})
 	}
 }
 
@@ -237,13 +245,11 @@ func TestCodecRoundTrip(t *testing.T) {
 					t.Fatalf("scan with %d stored bytes: %+v, remaining records = %d", budget.bytes, r, next)
 				}
 			}
-			for range cap(l.scanSem) {
-				slot := <-l.scanSem
-				l.scanSem <- slot
-				if slot != nil && (cap(slot.raw) > scanWindowBytes || tc.c == nil && slot.raw != nil) {
+			forEachScanSlot(t, l, func(slot *scanSlot) {
+				if cap(slot.raw) > scanWindowBytes || tc.c == nil && slot.raw != nil {
 					t.Fatal("scan slot retained unexpected decompression memory")
 				}
-			}
+			})
 		})
 	}
 	t.Run("Tiny", func(t *testing.T) {
@@ -403,16 +409,11 @@ func TestScanWindows(t *testing.T) {
 					t.Fatalf("budget %d: %+v", budget, r)
 				}
 			}
-			if len(l.scanSem) != cap(l.scanSem) {
-				t.Fatal("Scan did not return its slot")
-			}
-			for range cap(l.scanSem) {
-				slot := <-l.scanSem
-				l.scanSem <- slot
-				if slot != nil && (cap(slot.buf) > scanWindowBytes || cap(slot.offsets) > 1024) {
+			forEachScanSlot(t, l, func(slot *scanSlot) {
+				if cap(slot.buf) > scanWindowBytes || cap(slot.offsets) > 1024 {
 					t.Fatal("Scan retained an oversized buffer")
 				}
-			}
+			})
 			check(t, l.Close())
 			if len(l.scanSem) != 0 {
 				t.Fatal("Close did not release scan slots")
@@ -928,5 +929,24 @@ func await(t *testing.T, signal <-chan struct{}) {
 	case <-signal:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for scan or close")
+	}
+}
+
+func forEachScanSlot(t *testing.T, l *Log, fn func(*scanSlot)) {
+	t.Helper()
+	if len(l.scanSem) != cap(l.scanSem) {
+		t.Fatal("Scan did not return its slot")
+	}
+	slots := make([]*scanSlot, cap(l.scanSem))
+	for i := range slots {
+		slots[i] = <-l.scanSem
+	}
+	for _, slot := range slots {
+		l.scanSem <- slot
+	}
+	for _, slot := range slots {
+		if slot != nil {
+			fn(slot)
+		}
 	}
 }

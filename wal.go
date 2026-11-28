@@ -286,6 +286,7 @@ func scanWAL(f *osFile, start int64, truncate bool, apply func(walFrame) error) 
 	pos := start
 	var max uint64
 	var head [frameHeader]byte
+	var payloadBuf []byte
 	for pos+frameHeader <= size {
 		if _, err = f.ReadAt(head[:], pos); err != nil {
 			break
@@ -294,16 +295,20 @@ func scanWAL(f *osFile, start int64, truncate bool, apply func(walFrame) error) 
 		if !ok {
 			break
 		}
-		payload := make([]byte, ln)
+		if cap(payloadBuf) < int(ln) {
+			payloadBuf = make([]byte, ln)
+		} else {
+			payloadBuf = payloadBuf[:ln]
+		}
 		if ln > 0 {
-			if _, err = f.ReadAt(payload, pos+frameHeader); err != nil {
+			if _, err = f.ReadAt(payloadBuf, pos+frameHeader); err != nil {
 				break
 			}
 		}
-		if crc32.Update(crc32.Update(0, castagnoli, head[12:]), castagnoli, payload) != wantCRC {
+		if crc32.Update(crc32.Update(0, castagnoli, head[12:]), castagnoli, payloadBuf) != wantCRC {
 			break
 		}
-		fr := walFrame{typ: typ, seq: seq, payload: payload}
+		fr := walFrame{typ: typ, seq: seq, payload: payloadBuf}
 		if fr.seq > max {
 			max = fr.seq
 		}

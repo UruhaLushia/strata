@@ -14,12 +14,12 @@ func TestClientLifecycleAndOwnership(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client.db")
 	opts := Options{Now: func() time.Time { return now }}
 	c, err := OpenClient(path, ClientOptions{DB: opts, DefaultWindow: time.Hour})
-	mustTestOK(t, err)
+	requireOK(t, err)
 	defer c.Close()
 	db := c.DB()
 	cfg := SeriesConfig{Arity: 2}
 	s, err := c.RegisterSeries(1, cfg)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	if cached, err := c.Series(1, cfg); err != nil || cached != s {
 		t.Fatalf("cached series=%v err=%v", cached, err)
 	}
@@ -41,8 +41,8 @@ func TestClientLifecycleAndOwnership(t *testing.T) {
 	if !errors.Is(err, sentinel) || captured == nil || captured.Groups != nil || captured.Segments != nil {
 		t.Fatalf("WithAggregate callback err=%v released result=%+v", err, captured)
 	}
-	mustTestOK(t, c.Close())
-	mustTestOK(t, c.Close())
+	requireOK(t, c.Close())
+	requireOK(t, c.Close())
 	if c.DB() != nil || !db.closed {
 		t.Fatal("closing owned client did not close its DB")
 	}
@@ -58,12 +58,12 @@ func TestClientLifecycleAndOwnership(t *testing.T) {
 	defer db.Close()
 	borrowed := NewClient(db, ClientOptions{DefaultWindow: time.Hour})
 	res, err := borrowed.Aggregate(t.Context(), 1, AggregateQuery{})
-	mustTestOK(t, err)
+	requireOK(t, err)
 	if res.Summary.Values[0] != 10 {
 		t.Fatalf("borrowed client failed to resolve persisted series: %+v", res.Summary)
 	}
 	res.Release()
-	mustTestOK(t, borrowed.Close())
+	requireOK(t, borrowed.Close())
 	assertTSSum(t, mustSeries(t, db, 1, cfg), now.Add(-time.Hour), now, 10)
 }
 
@@ -135,7 +135,7 @@ func TestWindowGuardrails4Levels(t *testing.T) {
 		{AggregateQuery{AllTime: true}, 50},
 	} {
 		res, err := c.Aggregate(ctx, s.id, tc.q)
-		mustTestOK(t, err)
+		requireOK(t, err)
 		got := res.Summary.Values[0]
 		res.Release()
 		if got != tc.want {
@@ -163,14 +163,14 @@ func TestMemoryProfileBudgetAndCtxCancel(t *testing.T) {
 	db, s := testDB(t, &now, Options{MemoryProfile: MemoryConstrained})
 	defer db.Close()
 	appendValue(t, s, now.Add(-time.Hour), 1)
-	mustTestOK(t, db.Compact())
+	requireOK(t, db.Compact())
 
 	db.querySem <- struct{}{}
 	defer func() { <-db.querySem }()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	res, err := s.Aggregate(ctx, AggregateQuery{AllTime: true})
-	mustTestOK(t, err)
+	requireOK(t, err)
 	res.Release()
 	canceled, stop := context.WithCancel(t.Context())
 	stop()
@@ -197,13 +197,13 @@ func TestClientDictStats(t *testing.T) {
 		return []string{[]string{"alpha", "beta"}[i], "x"}
 	})
 	got, err := c.DictStats(s.id)
-	mustTestOK(t, err)
+	requireOK(t, err)
 	want, err := s.DictStats()
-	mustTestOK(t, err)
+	requireOK(t, err)
 	if len(got) != 2 || !slices.Equal(got, want) || got[0].MaxID != 2 || got[0].LiveCount != 2 || got[1].MaxID != 1 {
 		t.Fatalf("Client.DictStats=%+v Series.DictStats=%+v", got, want)
 	}
-	mustTestOK(t, c.Close())
+	requireOK(t, c.Close())
 	if _, err := c.DictStats(s.id); !errors.Is(err, errClientClosed) {
 		t.Fatalf("closed DictStats err=%v", err)
 	}

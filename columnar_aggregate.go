@@ -93,7 +93,7 @@ func aggregateEncodedBlock(block sealedBlock, slotIdx, arity int, filters []comp
 		if packErr != nil {
 			return Summary{}, false, packErr
 		}
-		aggregatePackedCols(&cols, n, slotIdx, start, arity, filters != nil, groups, groupDims, ops, &summary, &prevOrder)
+		aggregateRangeCols(&cols, 0, n, slotIdx, start, arity, filters != nil, groups, groupDims, ops, &summary, &prevOrder)
 	}
 	if filters == nil {
 		summary = block.summary
@@ -169,10 +169,6 @@ func aggregateSmallEncodedBlock(raw []byte, id uint8, blockSummary Summary, slot
 		summary = blockSummary
 	}
 	return summary, true, nil
-}
-
-func aggregatePackedCols(cols *[streamColumnCount]decodedCol, n, slotIdx, orderOffset, arity int, filtered bool, groups []aggregateGroups, groupDims []int, ops [4]MetricOp, summary *Summary, prevOrder *uint64) {
-	aggregateRangeCols(cols, 0, n, slotIdx, orderOffset, arity, filtered, groups, groupDims, ops, summary, prevOrder)
 }
 
 func aggregateRangeCols(cols *[streamColumnCount]decodedCol, lo, hi, slotIdx, orderOffset, arity int, filtered bool, groups []aggregateGroups, groupDims []int, ops [4]MetricOp, summary *Summary, prevOrder *uint64) {

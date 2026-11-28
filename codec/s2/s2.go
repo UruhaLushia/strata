@@ -6,6 +6,7 @@ import (
 	"github.com/klauspost/compress/s2"
 )
 
+// Level selects an S2 compression preset.
 type Level uint8
 
 const (
@@ -14,7 +15,7 @@ const (
 	Best
 )
 
-// New returns an S2 codec using level.
+// New returns an S2 codec for level; invalid levels fail in NewEncoder with codec.ErrUnsupportedCodec.
 func New(level Level) codec.Codec { return algorithm(level) }
 
 type algorithm Level

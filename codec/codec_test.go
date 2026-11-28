@@ -150,6 +150,27 @@ func TestPackageBoundaries(t *testing.T) {
 	}
 }
 
+func TestInvalidLevels(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		c    codec.Codec
+		want error
+	}{
+		{"zstd", zstd.New(99), codec.ErrUnsupportedCodec},
+		{"s2", s2.New(99), codec.ErrUnsupportedCodec},
+		{"flate", flate.New(99), nil},
+	} {
+		enc, err := tc.c.NewEncoder(0)
+		if err == nil {
+			_ = enc.Close()
+			t.Fatalf("%s: expected error for invalid level", tc.name)
+		}
+		if tc.want != nil && !errors.Is(err, tc.want) {
+			t.Fatalf("%s: error = %v, want %v", tc.name, err, tc.want)
+		}
+	}
+}
+
 func check(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {

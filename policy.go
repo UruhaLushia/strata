@@ -129,10 +129,6 @@ type querySlot struct {
 	tagErr     atomic.Pointer[error]
 }
 
-func newQuerySlot() *querySlot {
-	return &querySlot{}
-}
-
 func (s *querySlot) decodeInto(id uint8, raw, dst []byte, maxRaw int) ([]byte, error) {
 	if s.dec == nil || s.decID != id {
 		if s.dec != nil {
